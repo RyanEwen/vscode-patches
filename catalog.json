@@ -1,0 +1,1498 @@
+{
+  "updated": "2026-09-09",
+  "fixes": [
+    {
+      "id": "client-tool-input-schema",
+      "target": "workbench",
+      "title": "a client tool runs with empty input when its arguments never streamed",
+      "line": 61,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "session-list",
+      "target": "workbench",
+      "title": "sessions never list in remote windows",
+      "line": 81,
+      "references": [
+        330979,
+        331349
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331349"
+      ]
+    },
+    {
+      "id": "session-list-remote-project-root",
+      "target": "workbench",
+      "title": "a legacy session whose project root is on the remote is dropped from the list",
+      "line": 133,
+      "references": [
+        334145
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334145"
+      ]
+    },
+    {
+      "id": "embedded-attachment-content-type",
+      "target": "workbench",
+      "title": "a pasted image renders as a broken thumbnail",
+      "line": 153,
+      "references": [
+        331569
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331569"
+      ]
+    },
+    {
+      "id": "client-tool-buffer",
+      "target": "agenthost",
+      "title": "a client tool result is dropped when it arrives before the SDK asks for it",
+      "line": 182,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-error",
+      "target": "agenthost",
+      "title": "a client tool error reaches the model as an empty result",
+      "line": 204,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "replay-args",
+      "target": "agenthost",
+      "title": "client tool MCP handler forwards tool name and args",
+      "line": 229,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "replay-route",
+      "target": "agenthost",
+      "title": "client tool wiring routes through the replay-aware awaiter",
+      "line": 247,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "replay-turnid",
+      "target": "agenthost",
+      "title": "session stashes the active turn id",
+      "line": 256,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "replay-seen",
+      "target": "agenthost",
+      "title": "session records which tool calls actually streamed, and under which turn",
+      "line": 266,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "replay-drive",
+      "target": "agenthost",
+      "title": "drive execution for a replayed (never-streamed) client tool call",
+      "line": 282,
+      "references": [
+        318456
+      ],
+      "prs": []
+    },
+    {
+      "id": "steering-pending",
+      "target": "agenthost",
+      "title": "the pipeline only receives the steering id, not the message",
+      "line": 332,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-buffer",
+      "target": "agenthost",
+      "title": "a steering message is forgotten once it is queued",
+      "line": 341,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-hold",
+      "target": "agenthost",
+      "title": "the pending bubble is cleared when the queue hands the message over",
+      "line": 362,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-promote",
+      "target": "agenthost",
+      "title": "a steering message never becomes its own turn",
+      "line": 372,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-drain",
+      "target": "agenthost",
+      "title": "a steering message the SDK never echoes leaves its bubble behind on abort",
+      "line": 415,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-single-trigger",
+      "target": "agenthost",
+      "title": "a client tool executes off the streamed ready rather than the runtime invocation",
+      "line": 431,
+      "references": [
+        330933
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/330933"
+      ]
+    },
+    {
+      "id": "session-chip-list-scope",
+      "target": "agenthost",
+      "title": "the session list re-derives the chip from the branch for inactive sessions",
+      "line": 449,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "slash-resolve-harness",
+      "target": "workbench",
+      "title": "a message containing a slash command never submits in a remote window",
+      "line": 487,
+      "references": [
+        331138,
+        331145
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331145"
+      ]
+    },
+    {
+      "id": "slash-resolve-prompts",
+      "target": "workbench",
+      "title": "the prompts service resolver rejects on an unreadable slash command",
+      "line": 516,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "slash-consumer-sessions",
+      "target": "workbench",
+      "title": "the session send path dereferences a prompt file that may be absent",
+      "line": 536,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "slash-consumer-widget",
+      "target": "workbench",
+      "title": "the chat widget dereferences a prompt file that may be absent",
+      "line": 552,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "slash-consumer-widget-header",
+      "target": "workbench",
+      "title": "the chat widget applies header metadata from an absent prompt file",
+      "line": 569,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-owner-recency",
+      "target": "agenthost",
+      "title": "a tool call is stamped with a client that has gone away",
+      "line": 579,
+      "references": [
+        331300
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331300"
+      ]
+    },
+    {
+      "id": "native-model-vision",
+      "target": "agenthost",
+      "title": "a pasted image is labelled unsupported though the model receives it",
+      "line": 603,
+      "references": [
+        331396
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331396"
+      ]
+    },
+    {
+      "id": "consumed-message-not-removed",
+      "target": "workbench",
+      "title": "a queued message the host consumed is retired as cancelled",
+      "line": 618,
+      "references": [
+        331408,
+        332461
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331408"
+      ]
+    },
+    {
+      "id": "consumed-message-settles-sent",
+      "target": "workbench",
+      "title": "a consumed queued message never resolves its send promise",
+      "line": 644,
+      "references": [
+        331408,
+        332461
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331408"
+      ]
+    },
+    {
+      "id": "consumed-message-sync-reconcile",
+      "target": "workbench",
+      "title": "reconciliation cancels the consumed message and settles nothing",
+      "line": 685,
+      "references": [
+        334002,
+        331408
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334002",
+        "https://github.com/microsoft/vscode/pull/331408"
+      ]
+    },
+    {
+      "id": "consumed-message-sync-arg",
+      "target": "workbench",
+      "title": "reconciliation is not told which message the host consumed",
+      "line": 720,
+      "references": [
+        331408
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331408"
+      ]
+    },
+    {
+      "id": "steer-preempt-not-error",
+      "target": "agenthost",
+      "title": "a turn interrupted by a steer renders as failed",
+      "line": 739,
+      "references": [
+        330785
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/330785"
+      ]
+    },
+    {
+      "id": "toolcall-progress-emit",
+      "target": "agenthost",
+      "title": "a long tool call reports nothing while it runs",
+      "line": 770,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "toolcall-progress-reduce",
+      "target": "workbench",
+      "title": "the client has nowhere to record tool call progress",
+      "line": 804,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "toolcall-progress-reduce-host",
+      "target": "agenthost",
+      "title": "the agent host does not know the progress action either",
+      "line": 818,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "toolcall-progress-render",
+      "target": "workbench",
+      "title": "a running tool call renders no progress",
+      "line": 832,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "session-delete",
+      "target": "agenthost",
+      "title": "deleting a Claude session does not delete the transcript",
+      "line": 852,
+      "references": [
+        330698
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/330698"
+      ]
+    },
+    {
+      "id": "remote-window-authority-init",
+      "target": "workbench",
+      "title": "the in-window agent host claims to be local in a remote window",
+      "line": 884,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "remote-window-authority-fs",
+      "target": "workbench",
+      "title": "the agent host filesystem registers under the local authority",
+      "line": 903,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "remote-window-authority-session",
+      "target": "workbench",
+      "title": "the session handler is told the host is local",
+      "line": 914,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "remote-window-authority-map",
+      "target": "workbench",
+      "title": "agent host file paths are handed to the client unmapped",
+      "line": 926,
+      "references": [
+        332791
+      ],
+      "prs": []
+    },
+    {
+      "id": "workspace-folder-uses-real-remote",
+      "target": "workbench",
+      "title": "opening a session folder yields a window that can resolve nothing",
+      "line": 951,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "session-workspace-folder-real-remote",
+      "target": "workbench",
+      "title": "a session workspace keeps the agent host authority its folders cannot resolve",
+      "line": 993,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "subagent-completion-when-idle",
+      "target": "agenthost",
+      "title": "a background subagent that finishes after its turn stays running",
+      "line": 1029,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "sdk-initiated-turn",
+      "target": "agenthost",
+      "title": "the SDK starts a turn the host never queued, so everything in it is discarded",
+      "line": 1055,
+      "references": [
+        332073
+      ],
+      "prs": []
+    },
+    {
+      "id": "subagent-inactive-resume",
+      "target": "agenthost",
+      "title": "a running subagent produces output that is discarded once its chat has no active turn",
+      "line": 1115,
+      "references": [
+        332073
+      ],
+      "prs": []
+    },
+    {
+      "id": "replay-user-prompt-only",
+      "target": "agenthost",
+      "title": "restored messages show context the user never typed",
+      "line": 1152,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "local-command-output-visible",
+      "target": "agenthost",
+      "title": "a local slash command runs, produces output, and the turn renders empty",
+      "line": 1170,
+      "references": [
+        334575
+      ],
+      "prs": []
+    },
+    {
+      "id": "agenthost-require-global",
+      "target": "agenthost",
+      "title": "the bundle is ESM, so later entries have no require for node builtins",
+      "line": 1210,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "resume-missing-conversation-starts-fresh",
+      "target": "agenthost",
+      "title": "cancelling a skill-subagent turn bricks a new chat permanently",
+      "line": 1227,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "result-error-subtypes-surface",
+      "target": "agenthost",
+      "title": "hitting a turn, budget or retry cap renders as a successful empty turn",
+      "line": 1288,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "result-usage-any-subtype",
+      "target": "agenthost",
+      "title": "a turn that stops at a cap reports none of the tokens it spent",
+      "line": 1328,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "toolcall-hidden-respects-liveness",
+      "target": "workbench",
+      "title": "a tool card is hidden when its call completes, even when its work is still running",
+      "line": 1344,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "claude-turn-reports-activity",
+      "target": "agenthost",
+      "title": "the Claude provider never reports chat activity, so a silent turn looks dead",
+      "line": 1382,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "activity-clears-when-the-turn-results",
+      "target": "agenthost",
+      "title": "the liveness row needs a real end signal, not an empty queue",
+      "line": 1461,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "turn-prune-anchor-missing-is-loud",
+      "target": "agenthost",
+      "title": "restoring a checkpoint at a turn with no database row silently prunes nothing",
+      "line": 1480,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "router-drop-is-loud",
+      "target": "agenthost",
+      "title": "every SDK message with no resolvable turn id is discarded with no log at all",
+      "line": 1519,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "slash-command-single-block",
+      "target": "agenthost",
+      "title": "a slash command is never expanded because the host appends context as a second block",
+      "line": 1548,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "session-chip-scope-v2",
+      "target": "agenthost",
+      "title": "the session list chip counts the whole branch, not the session",
+      "line": 1587,
+      "references": [
+        331345
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/331345"
+      ]
+    },
+    {
+      "id": "session-scope-counts-other-sessions-work",
+      "target": "agenthost",
+      "title": "a session is credited with every uncommitted change in the folder",
+      "line": 1613,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "keyed-item-transient-empty",
+      "target": "workbench",
+      "title": "a momentarily empty collection tears down live keyed items",
+      "line": 1666,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-stale-self-abort",
+      "target": "workbench",
+      "title": "a client tool abandons itself when only its label changes",
+      "line": 1689,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "cold-chat-customizations",
+      "target": "agenthost",
+      "title": "a restored session has no slash commands until its next message",
+      "line": 1720,
+      "references": [
+        332047
+      ],
+      "prs": []
+    },
+    {
+      "id": "subagent-spawn-turn",
+      "target": "agenthost",
+      "title": "a spawned subagent does not record the turn that spawned it",
+      "line": 1765,
+      "references": [
+        332075
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/332075"
+      ]
+    },
+    {
+      "id": "subagent-resume-anchor",
+      "target": "agenthost",
+      "title": "nothing records the turn a parent will resume into after a subagent",
+      "line": 1784,
+      "references": [
+        332075
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/332075"
+      ]
+    },
+    {
+      "id": "subagent-resumed-output",
+      "target": "agenthost",
+      "title": "everything the parent says after a background subagent finishes is dropped",
+      "line": 1799,
+      "references": [
+        332075
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/332075"
+      ]
+    },
+    {
+      "id": "optimistic-turn-start-masks-streaming",
+      "target": "workbench",
+      "title": "responses appear only when the turn ends, never streaming",
+      "line": 1823,
+      "references": [
+        332087
+      ],
+      "prs": []
+    },
+    {
+      "id": "chat-turnstarted-idempotent",
+      "target": "workbench",
+      "title": "a replayed turn start keeps rebuilding the turn empty, so the response never streams",
+      "line": 1855,
+      "references": [
+        332087
+      ],
+      "prs": []
+    },
+    {
+      "id": "truncation-retire-stranded",
+      "target": "workbench",
+      "title": "a stranded optimistic truncation is replayed forever and blanks the transcript",
+      "line": 1903,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "plugin-read-surface-errors",
+      "target": "agenthost",
+      "title": "a filesystem the host cannot address looks exactly like an absent file",
+      "line": 1978,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-no-host-confirm",
+      "target": "agenthost",
+      "title": "a client tool the workbench already confirmed is confirmed again by the host",
+      "line": 2045,
+      "references": [
+        330683,
+        334037
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334037",
+        "https://github.com/microsoft/vscode/pull/330683"
+      ]
+    },
+    {
+      "id": "client-tool-ownerless-fail-map-start",
+      "target": "agenthost",
+      "title": "the stream mapper does not record that a client tool call has no owner",
+      "line": 2097,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "nested-subagent-spawn-recorded",
+      "target": "agenthost",
+      "title": "a subagent spawned by another subagent never gets a chat, so its work never renders",
+      "line": 2138,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-ownerless-fail-map-stop",
+      "target": "agenthost",
+      "title": "a client tool call no window can run is never failed",
+      "line": 2164,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-ownerless-fail-subagent",
+      "target": "agenthost",
+      "title": "a subagent client tool call no window can run is never failed",
+      "line": 2198,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-ownerless-fail-session",
+      "target": "agenthost",
+      "title": "the SDK handler for a failed client tool call still parks forever",
+      "line": 2234,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-ownerless-fail-permission",
+      "target": "agenthost",
+      "title": "the SDK still asks permission for a client tool call already failed",
+      "line": 2284,
+      "references": [
+        334037
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334037"
+      ]
+    },
+    {
+      "id": "remote-working-directory-actions",
+      "target": "agenthost",
+      "title": "adding or removing a workspace folder from a container window is rejected by the host",
+      "line": 2320,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "remote-folders-at-session-create",
+      "target": "workbench",
+      "title": "a session created from the chat handler in a container window gets no working directories at all",
+      "line": 2375,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "subagent-observation-lifetime",
+      "target": "workbench",
+      "title": "a subagent turn hangs forever when its chat outlives the turn that spawned it",
+      "line": 2429,
+      "references": [
+        333931
+      ],
+      "prs": []
+    },
+    {
+      "id": "steer-keeps-tool-attribution",
+      "target": "agenthost",
+      "title": "a tool still running when a steer lands never completes",
+      "line": 2513,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "skill-subagent-result-visible",
+      "target": "agenthost",
+      "title": "a skill that runs in a subagent works for minutes and the turn renders empty",
+      "line": 2575,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "queue-settles-by-correlation",
+      "target": "agenthost",
+      "title": "the queue drifts because one result settles one entry, however many it consumed",
+      "line": 2656,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "clearpending-spares-background-subagent",
+      "target": "agenthost",
+      "title": "a background subagent loses its tool attribution at every parent turn end",
+      "line": 2710,
+      "references": [
+        334559
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334559"
+      ]
+    },
+    {
+      "id": "reap-orphaned-session-data",
+      "target": "agenthost",
+      "title": "a pruned external session leaves its data directory behind forever",
+      "line": 2738,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "peer-chat-unavailable-subagent",
+      "target": "agenthost",
+      "title": "one unresolvable subagent chat rejects every turn the session will ever start",
+      "line": 2777,
+      "references": [
+        334312
+      ],
+      "prs": []
+    },
+    {
+      "id": "denied-subagent-no-phantom-chat",
+      "target": "agenthost",
+      "title": "a denied Agent call is still recorded as a subagent, creating a chat that can never exist",
+      "line": 2809,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "codex-progress-not-output-host",
+      "target": "agenthost",
+      "title": "MCP progress narration is persisted as the tool result",
+      "line": 2830,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "codex-progress-not-output-client",
+      "target": "workbench",
+      "title": "a running MCP call shows no progress, and a stale one becomes its past-tense label",
+      "line": 2888,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "subscribe-cancelled-not-missing",
+      "target": "agenthost",
+      "title": "a client cancelling a subscribe is reported as a missing resource, at error level",
+      "line": 2970,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "client-tool-handler-never-throws",
+      "target": "agenthost",
+      "title": "a rejected client-tool wait escapes the MCP handler as a bare \"Canceled\"",
+      "line": 3042,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "pending-register-shares-deferred",
+      "target": "agenthost",
+      "title": "a second wait on one pending request cancels the first waiter",
+      "line": 3095,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "register-and-fire-reuses-parked",
+      "target": "agenthost",
+      "title": "a duplicate tool_use_id orphans the first request, which then never settles",
+      "line": 3137,
+      "references": [
+        334146
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334146"
+      ]
+    },
+    {
+      "id": "steering-list-reduce-set",
+      "target": "workbench",
+      "title": "a second steering message evicts the first from the sidebar",
+      "line": 3162,
+      "references": [
+        334743
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334743"
+      ]
+    },
+    {
+      "id": "steering-list-reduce-remove",
+      "target": "workbench",
+      "title": "removing one steering message must not drop the others",
+      "line": 3193,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-list-turnstarted",
+      "target": "workbench",
+      "title": "a steering message auto-started as a turn must leave the list",
+      "line": 3212,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-list-merge",
+      "target": "workbench",
+      "title": "the per-chat projection drops the steering list",
+      "line": 3232,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-list-projection",
+      "target": "workbench",
+      "title": "only one steering bubble is projected into the chat model",
+      "line": 3246,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "steering-list-removal-detect",
+      "target": "workbench",
+      "title": "the sidebar retires the previous steering bubble whenever the id changes",
+      "line": 3259,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "activity-row-survives-content",
+      "target": "workbench",
+      "title": "the liveness row disappears the moment a turn produces anything",
+      "line": 3277,
+      "references": [
+        334742
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334742"
+      ]
+    },
+    {
+      "id": "chat-input-default-permission-mode",
+      "target": "workbench",
+      "title": "every new chat-input session starts on Default approvals",
+      "line": 3307,
+      "references": [
+        334814,
+        334087
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/334814",
+        "https://github.com/microsoft/vscode/pull/334087"
+      ]
+    },
+    {
+      "id": "replay-keeps-local-command-output",
+      "target": "agenthost",
+      "title": "a slash command's output is dropped on replay, so a restart empties the turn",
+      "line": 3345,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "discovery-suppression-loud",
+      "target": "agenthost",
+      "title": "discovery suppresses two thirds of sessions and never says which are which",
+      "line": 3382,
+      "references": [],
+      "prs": []
+    },
+    {
+      "id": "stale-peer-chat-backing-ignored",
+      "target": "agenthost",
+      "title": "a session that once had a peer chat is hidden from the list forever",
+      "line": 3411,
+      "references": [],
+      "prs": []
+    }
+  ],
+  "prs": [
+    {
+      "headRefName": "fix/model-management-host-labels",
+      "headRefOid": "f09f9c0b7efa7f116cc57e9e3c5151d95f7c5eb0",
+      "number": 335363,
+      "state": "OPEN",
+      "title": "Preserve agent host identity in Manage Language Models",
+      "url": "https://github.com/microsoft/vscode/pull/335363",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/panel-remembers-approvals",
+      "headRefOid": "bb6a2fc5b494ab3ba9a30f8f3e25c783d2b68e2d",
+      "number": 334814,
+      "state": "OPEN",
+      "title": "Seed new chat-input sessions from the remembered session-config picks",
+      "url": "https://github.com/microsoft/vscode/pull/334814",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/steering-messages-are-a-list",
+      "headRefOid": "8f3a91b4598d6f8f9e06d6572add12d2493308aa",
+      "number": 334743,
+      "state": "OPEN",
+      "title": "Keep every pending steering message instead of only the last",
+      "url": "https://github.com/microsoft/vscode/pull/334743",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-reports-chat-activity",
+      "headRefOid": "b2569ed68394ef1c57747ba3a64217de543f369b",
+      "number": 334742,
+      "state": "OPEN",
+      "title": "Report chat activity from the Claude agent session",
+      "url": "https://github.com/microsoft/vscode/pull/334742",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/clear-pending-spares-background-subagents",
+      "headRefOid": "7347a6c60fc101a7fa04a3c758cb1f5dff055da3",
+      "number": 334559,
+      "state": "OPEN",
+      "title": "Spare a background subagent's in-flight tool call from the turn-end wipe",
+      "url": "https://github.com/microsoft/vscode/pull/334559",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/denied-subagent-no-phantom-chat",
+      "headRefOid": "19ab57cd67cdefe3f2d3f6e3d1e48bece9d62d02",
+      "number": 334549,
+      "state": "OPEN",
+      "title": "Do not mark a denied subagent tool call as a subagent",
+      "url": "https://github.com/microsoft/vscode/pull/334549",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/browser-tool-empty-error",
+      "headRefOid": "0bd0bfbd9a83fbca86ec667383df997282b4cbaf",
+      "number": 334311,
+      "state": "MERGED",
+      "title": "Report a browser tool failure with an empty message as a failure",
+      "url": "https://github.com/microsoft/vscode/pull/334311",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "feat/client-tool-admission",
+      "headRefOid": "9db6d1870dd2e3298146b8148bfe461c751ffec2",
+      "number": 334146,
+      "state": "OPEN",
+      "title": "Admit a client tool call once, instead of racing two triggers",
+      "url": "https://github.com/microsoft/vscode/pull/334146",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/single-point-uri-conversion",
+      "headRefOid": "c943139badaac17ea42c24612c42d35ca0f1b36b",
+      "number": 334145,
+      "state": "OPEN",
+      "title": "Brand the agent host URI namespaces and convert the project root at the boundary",
+      "url": "https://github.com/microsoft/vscode/pull/334145",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/hydrate-replay-attribution",
+      "headRefOid": "db2a348f54c99ae6fd08f2adaebd7c65899999a9",
+      "number": 334136,
+      "state": "OPEN",
+      "title": "Hydrate replay attribution into a resumed session",
+      "url": "https://github.com/microsoft/vscode/pull/334136",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/subagent-client-tool-routing",
+      "headRefOid": "d6965ef6d09c3ef7e28f5eca2a01ce10eedd6ba6",
+      "number": 334132,
+      "state": "OPEN",
+      "title": "Keep a primed subagent spawn alive past the next turn",
+      "url": "https://github.com/microsoft/vscode/pull/334132",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/copilot-tool-progress",
+      "headRefOid": "3f9a954792bf2dca868e9315a34a2db0ed2a6832",
+      "number": 334131,
+      "state": "OPEN",
+      "title": "Surface Copilot tool progress instead of discarding it",
+      "url": "https://github.com/microsoft/vscode/pull/334131",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/close-abandoned-turns",
+      "headRefOid": "d24c72b21c08945cb9d5b150d0084c41e6822507",
+      "number": 334127,
+      "state": "OPEN",
+      "title": "Close abandoned turns deterministically",
+      "url": "https://github.com/microsoft/vscode/pull/334127",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "feat/default-agent-permission-mode",
+      "headRefOid": "0381acc3a76a3402909c98829086a2ce2b6f9cb2",
+      "number": 334087,
+      "state": "OPEN",
+      "title": "Add a setting for the permission mode new Claude sessions start in",
+      "url": "https://github.com/microsoft/vscode/pull/334087",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/subagent-observation-lifetime",
+      "headRefOid": "b4245e55c7f5d483a7a682968abec028883ea934",
+      "number": 334072,
+      "state": "OPEN",
+      "title": "Keep observing a subagent whose chat outlives its spawning turn",
+      "url": "https://github.com/microsoft/vscode/pull/334072",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/distinguish-cancelled-subscribe",
+      "headRefOid": "18cf909f1fe691c9ff71d8c2b9161272bcfd7526",
+      "number": 334066,
+      "state": "OPEN",
+      "title": "Report a cancelled subscribe as cancelled, not as a missing resource",
+      "url": "https://github.com/microsoft/vscode/pull/334066",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/codex-progress-not-output",
+      "headRefOid": "65c23c13239c0cee0382945719a41a0ad509187b",
+      "number": 334053,
+      "state": "MERGED",
+      "title": "Keep Codex MCP tool progress out of the tool result",
+      "url": "https://github.com/microsoft/vscode/pull/334053",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/mark-interrupted-turn-on-restore",
+      "headRefOid": "f78cd4a433d79b13c4aa24b5060e5b899b91e883",
+      "number": 334049,
+      "state": "OPEN",
+      "title": "Mark a turn interrupted by a host crash on restore",
+      "url": "https://github.com/microsoft/vscode/pull/334049",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/remote-folders-at-session-create",
+      "headRefOid": "689b7ccb00d3116a7d67a876098c993170fb1c29",
+      "number": 334048,
+      "state": "OPEN",
+      "title": "Keep remote workspace folders when creating a session through the handler",
+      "url": "https://github.com/microsoft/vscode/pull/334048",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/replay-attribution-index",
+      "headRefOid": "4cca9568a8da5a304ed807ee11b639baa68ac1c2",
+      "number": 334047,
+      "state": "OPEN",
+      "title": "Expose the Claude replay attribution index",
+      "url": "https://github.com/microsoft/vscode/pull/334047",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/fail-ownerless-client-tools",
+      "headRefOid": "7b40b4f2a6828ee03de84c610ffc8646d34e9fbc",
+      "number": 334044,
+      "state": "OPEN",
+      "title": "Fail Claude client tool calls that no connected client provides",
+      "url": "https://github.com/microsoft/vscode/pull/334044",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/retire-stranded-truncation",
+      "headRefOid": "cbc300ec8f6236ee6b868720ef9baf846d1de75e",
+      "number": 334040,
+      "state": "OPEN",
+      "title": "Retire a stranded optimistic chat truncation once the host has applied it",
+      "url": "https://github.com/microsoft/vscode/pull/334040",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/client-tool-handler-never-throws",
+      "headRefOid": "f733a2bd102e87195a7dd68c283f9f9738d0051a",
+      "number": 334038,
+      "state": "OPEN",
+      "title": "Answer client-tool handler rejections as tool errors",
+      "url": "https://github.com/microsoft/vscode/pull/334038",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/client-tools-skip-host-confirmation",
+      "headRefOid": "687dc8345d11961baab26b17b2ace76b6dcb28c5",
+      "number": 334037,
+      "state": "OPEN",
+      "title": "Let the workbench own confirmation for Claude client tools",
+      "url": "https://github.com/microsoft/vscode/pull/334037",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/surface-missing-provider-errors",
+      "headRefOid": "7ae56009363a9da421666440ff32b2fb87ffbca3",
+      "number": 334034,
+      "state": "OPEN",
+      "title": "Surface unreadable files in plugin discovery instead of treating them as absent",
+      "url": "https://github.com/microsoft/vscode/pull/334034",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/idempotent-chat-reducer",
+      "headRefOid": "bdad2c57ebee8c17b80f9798d6f6514354a747a5",
+      "number": 334011,
+      "state": "OPEN",
+      "title": "Make the chat/turnStarted reducer idempotent",
+      "url": "https://github.com/microsoft/vscode/pull/334011",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/reap-orphaned-session-data",
+      "headRefOid": "a484c066a2b7fafcd3273cd08386ba548e3e4c9a",
+      "number": 334010,
+      "state": "OPEN",
+      "title": "Reclaim orphaned agent session data directories",
+      "url": "https://github.com/microsoft/vscode/pull/334010",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/keep-tool-attribution-across-steer",
+      "headRefOid": "1693c62d581870be197cf9937cabdabbb7043ada",
+      "number": 334008,
+      "state": "OPEN",
+      "title": "Keep tool attribution across a steering preempt",
+      "url": "https://github.com/microsoft/vscode/pull/334008",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/remote-working-directory-actions",
+      "headRefOid": "639569396423d5b33c2ad99b15b7f3804746651d",
+      "number": 334005,
+      "state": "OPEN",
+      "title": "Accept remote workspace folders in working-directory actions",
+      "url": "https://github.com/microsoft/vscode/pull/334005",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/settle-removed-pending-requests",
+      "headRefOid": "b71a273f5d8cdd67e3b3b920dcd974321194782a",
+      "number": 334002,
+      "state": "OPEN",
+      "title": "Settle the promise of a pending request the remote reconcile dropped",
+      "url": "https://github.com/microsoft/vscode/pull/334002",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-steering-idempotent-injection",
+      "headRefOid": "84870a06f220e042b10595860e4da2132035955b",
+      "number": 333919,
+      "state": "OPEN",
+      "title": "Ignore a steering message that is re-delivered while still in flight",
+      "url": "https://github.com/microsoft/vscode/pull/333919",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/host-local-customization-roots",
+      "headRefOid": "82db55c2d659fa136c80ba503dfde3e45e75ac67",
+      "number": 333683,
+      "state": "CLOSED",
+      "title": "agentHost: watch customizations on the host's own filesystem",
+      "url": "https://github.com/microsoft/vscode/pull/333683",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/optimistic-turn-start-masks-streaming",
+      "headRefOid": "d2560176e587c295b4c5650270b9e95ecd9df83f",
+      "number": 332122,
+      "state": "OPEN",
+      "title": "agentHost: retire the optimistic turn start on the first backend action",
+      "url": "https://github.com/microsoft/vscode/pull/332122",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/subagent-resumed-output",
+      "headRefOid": "6171f7c74369c841ff4d3fbb89685c2457446fdf",
+      "number": 332075,
+      "state": "OPEN",
+      "title": "agentHost: keep the parent output after a background subagent settles",
+      "url": "https://github.com/microsoft/vscode/pull/332075",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/cold-chat-customizations",
+      "headRefOid": "96dadb80faf6b71791a1335830cd168682b40976",
+      "number": 332055,
+      "state": "OPEN",
+      "title": "agentHost: resolve Claude customizations for a chat that is not resident",
+      "url": "https://github.com/microsoft/vscode/pull/332055",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/replay-user-prompt-only",
+      "headRefOid": "afbd7f82c12f26189129b8732ed1bf3f3032ad64",
+      "number": 331885,
+      "state": "OPEN",
+      "title": "Replay the user's prompt without the host's added context",
+      "url": "https://github.com/microsoft/vscode/pull/331885",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/subagent-completion-when-idle",
+      "headRefOid": "63e05d449c96833f83496c465d110ed3e6510f98",
+      "number": 331872,
+      "state": "OPEN",
+      "title": "Complete a background subagent that settles after its turn",
+      "url": "https://github.com/microsoft/vscode/pull/331872",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/agent-host-uri-in-remote-window",
+      "headRefOid": "4fffd39ddbedad53d77bf0c38d935131d0ce23fd",
+      "number": 331871,
+      "state": "OPEN",
+      "title": "Resolve agent host file paths against the window's remote",
+      "url": "https://github.com/microsoft/vscode/pull/331871",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/embedded-attachment-missing-content-type",
+      "headRefOid": "94655798aedb452a2895ea55633278113317913b",
+      "number": 331569,
+      "state": "OPEN",
+      "title": "Render an embedded attachment that has no content type",
+      "url": "https://github.com/microsoft/vscode/pull/331569",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/project-customizations-remote-namespace",
+      "headRefOid": "705a508f040539f39e7f40f6dac8df77c766ac68",
+      "number": 331527,
+      "state": "CLOSED",
+      "title": "Read project customizations on the host's own filesystem",
+      "url": "https://github.com/microsoft/vscode/pull/331527",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/consumed-queued-message-not-cancelled",
+      "headRefOid": "1906d14196020d071456a432b5640e9d32d48a7e",
+      "number": 331408,
+      "state": "OPEN",
+      "title": "Tell the caller a consumed queued message was sent",
+      "url": "https://github.com/microsoft/vscode/pull/331408",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/native-claude-models-report-vision",
+      "headRefOid": "c6ea144e185565896af46d386efc3f49ec232a20",
+      "number": 331396,
+      "state": "OPEN",
+      "title": "Report vision support for natively served Claude models",
+      "url": "https://github.com/microsoft/vscode/pull/331396",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/remote-session-list-namespace",
+      "headRefOid": "3126fc81733e6636973b105262d77935a6d407b2",
+      "number": 331349,
+      "state": "OPEN",
+      "title": "Match a remote host's working directories against the window's folder",
+      "url": "https://github.com/microsoft/vscode/pull/331349",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/session-chip-not-branch-divergence",
+      "headRefOid": "a0a685b004d219a4eb98be7993c4810b360febb8",
+      "number": 331345,
+      "state": "OPEN",
+      "title": "Count the session's changes, not the branch's divergence",
+      "url": "https://github.com/microsoft/vscode/pull/331345",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/turn-scoped-response-completion",
+      "headRefOid": "df5bc1552234b762e5f4e61cf00a3792ca8b756d",
+      "number": 331310,
+      "state": "CLOSED",
+      "title": "Complete the response for the turn that ended",
+      "url": "https://github.com/microsoft/vscode/pull/331310",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/client-tool-owner-after-reconnect",
+      "headRefOid": "50a270cd573c76beeefcc56cb4e132a44f18c793",
+      "number": 331300,
+      "state": "OPEN",
+      "title": "Resolve a client tool to the client that is still there",
+      "url": "https://github.com/microsoft/vscode/pull/331300",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/slash-command-discovery-only-skill",
+      "headRefOid": "15664b25e1f4b491397be224fc10c9dce865e550",
+      "number": 331145,
+      "state": "CLOSED",
+      "title": "Resolve a slash command whose content cannot be read",
+      "url": "https://github.com/microsoft/vscode/pull/331145",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/session-changes-baseline",
+      "headRefOid": "216ccc9916b8a44a632aaebf70c0c98eada103b3",
+      "number": 330942,
+      "state": "CLOSED",
+      "title": "Anchor branch changes on the session baseline checkpoint",
+      "url": "https://github.com/microsoft/vscode/pull/330942",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/client-tool-single-trigger",
+      "headRefOid": "f8ce489ae988782973a4347a9c36352c381cf575",
+      "number": 330933,
+      "state": "CLOSED",
+      "title": "Proposal: execute a client tool on the runtime's invocation",
+      "url": "https://github.com/microsoft/vscode/pull/330933",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-steering-own-turn",
+      "headRefOid": "b77eb1cae09a4a26292c1664865122270788116f",
+      "number": 330785,
+      "state": "OPEN",
+      "title": "Surface a Claude steering message as its own turn",
+      "url": "https://github.com/microsoft/vscode/pull/330785",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/steering-message-visible",
+      "headRefOid": "4acec061b86817839ee857a8db3919a376c7db78",
+      "number": 330781,
+      "state": "CLOSED",
+      "title": "Keep a Claude steering message on screen",
+      "url": "https://github.com/microsoft/vscode/pull/330781",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/subscribe-registration-race",
+      "headRefOid": "a5227b6acc55ce8b957a72239d31246913c68914",
+      "number": 330775,
+      "state": "CLOSED",
+      "title": "Register a subscription before awaiting its snapshot",
+      "url": "https://github.com/microsoft/vscode/pull/330775",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-replayed-client-tool-execution",
+      "headRefOid": "1fe9d0ef9f0ed3ca4de7e133ff5f82eb417b9dc1",
+      "number": 330746,
+      "state": "CLOSED",
+      "title": "Execute a client tool the SDK replays from the transcript",
+      "url": "https://github.com/microsoft/vscode/pull/330746",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-client-tool-result-race",
+      "headRefOid": "1e1850635dec095d05f27111562b817e7d5ab52d",
+      "number": 330730,
+      "state": "OPEN",
+      "title": "Buffer a client tool result that arrives before the SDK asks for it",
+      "url": "https://github.com/microsoft/vscode/pull/330730",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-client-tool-error-content",
+      "headRefOid": "9c59614693e0711c4283f64cb55381ee271d9ccb",
+      "number": 330709,
+      "state": "OPEN",
+      "title": "Surface a client tool's error when it returns no content",
+      "url": "https://github.com/microsoft/vscode/pull/330709",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/browser-tool-failure-reporting",
+      "headRefOid": "c517c08be6a59ce6037da6cb390e28044b7b9c81",
+      "number": 330707,
+      "state": "MERGED",
+      "title": "Do not present a failed tool call as a successful one",
+      "url": "https://github.com/microsoft/vscode/pull/330707",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/claude-dispose-chat-deletes-transcript",
+      "headRefOid": "8784f4ac211d9cb27c1a1f86b004246c224b92ad",
+      "number": 330698,
+      "state": "OPEN",
+      "title": "Delete the Claude transcript when a chat is disposed",
+      "url": "https://github.com/microsoft/vscode/pull/330698",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/browser-page-link-missing-id",
+      "headRefOid": "ea26f0227721e74e18aadd36ad4b435d0f7b4d5c",
+      "number": 330684,
+      "state": "OPEN",
+      "title": "Validate client tool input against the tool's schema",
+      "url": "https://github.com/microsoft/vscode/pull/330684",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/duplicate-client-tool-invocation",
+      "headRefOid": "731cca613e0c597a96d65430e5c2ffb229a96ea5",
+      "number": 330683,
+      "state": "CLOSED",
+      "title": "Do not run a client tool twice when a tool call is readied twice",
+      "url": "https://github.com/microsoft/vscode/pull/330683",
+      "repo": "microsoft/vscode"
+    },
+    {
+      "headRefName": "fix/idempotent-chat-reducer",
+      "headRefOid": "e800f25242d5fbb0ea9179651b1124614c9d0615",
+      "number": 433,
+      "state": "OPEN",
+      "title": "chat: make the turnStarted reducer case idempotent",
+      "url": "https://github.com/microsoft/agent-host-protocol/pull/433",
+      "repo": "microsoft/agent-host-protocol"
+    },
+    {
+      "headRefName": "feat/tool-call-progress",
+      "headRefOid": "5918544c95fcc95eb80acf9ef1071340a028da05",
+      "number": 405,
+      "state": "OPEN",
+      "title": "chat: report progress for a running tool call",
+      "url": "https://github.com/microsoft/agent-host-protocol/pull/405",
+      "repo": "microsoft/agent-host-protocol"
+    }
+  ]
+}

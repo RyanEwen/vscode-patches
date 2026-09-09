@@ -1,0 +1,311 @@
+From 93344fb7b750f5c52bd95e570754cb90e47ed2a8 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 14:35:47 -0400
+Subject: [PATCH 1/3] Do not present a failed tool call as a successful one
+
+Two ways a failed browser tool still read as success.
+
+`ChatToolInvocation.didExecuteTool` only replaced the past-tense message
+when the result carried one of its own, so a tool that failed kept the
+message prepared before it ran. A screenshot that failed with "No browser
+page found" still rendered as "Captured browser screenshot". Drop the
+prepared message on failure and let the error stand on its own.
+
+`invokeFunctionResultToToolResult` recorded an evaluated-code error only
+in `toolResultDetails.isError`, so the tool call itself was still
+reported as successful. Set `toolResultError` as well.
+---
+ .../tools/browserToolHelpers.ts               |  4 ++++
+ .../chatProgressTypes/chatToolInvocation.ts   |  5 +++++
+ .../chat/test/common/model/chatModel.test.ts  | 21 +++++++++++++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+index 8974c358f4fc0..18617fb8ad8b3 100644
+--- a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
++++ b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+@@ -180,6 +180,10 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult,
+ 	content.push({ kind: 'text', value: result.summary });
+ 	return {
+ 		content,
++		// The evaluated code reported an error, so the call failed. Without this
++		// only `toolResultDetails.isError` is set, which leaves the tool call
++		// itself reported as a success.
++		...(result.error ? { toolResultError: result.error } : {}),
+ 		...(code ? {
+ 			toolResultDetails: {
+ 				input: code,
+diff --git a/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts b/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
+index 13aa48ff30369..31bb4ece43b3a 100644
+--- a/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
++++ b/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
+@@ -366,6 +366,11 @@ export class ChatToolInvocation implements IChatToolInvocation {
+ 		}
+ 		if (result?.toolResultMessage) {
+ 			this.pastTenseMessage = result.toolResultMessage;
++		} else if (result?.toolResultError) {
++			// The past-tense message was prepared before the tool ran and states
++			// what it would have done, so keeping it on a failure reads as though
++			// the work succeeded. Drop it and let the error stand on its own.
++			this.pastTenseMessage = undefined;
+ 		} else if (this._progress.get().message) {
+ 			this.pastTenseMessage = this._progress.get().message;
+ 		}
+diff --git a/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts b/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
+index e6e923ef695b6..d9d8aefcf01dc 100644
+--- a/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
+@@ -1755,6 +1755,27 @@ suite('ChatResponseModel', () => {
+ 		assert.strictEqual(completedNotifications, 1);
+ 	});
+ 
++	test('a failed tool drops the past-tense message prepared before it ran; a successful one keeps it', async () => {
++		const make = () => new ChatToolInvocation({ invocationMessage: 'Capturing browser screenshot', pastTenseMessage: 'Captured browser screenshot' }, {
++			id: 'screenshotPage',
++			modelDescription: 'Capture a browser screenshot',
++			displayName: 'Screenshot Page',
++			source: ToolDataSource.Internal,
++		}, 'tool-call-1', undefined, {}, {});
++
++		// The prepared message states what the tool would have done, so a failure
++		// must not keep it: it would read as though the screenshot was captured.
++		const failed = make();
++		await failed.didExecuteTool({ content: [], toolResultError: 'No browser page found' }, true);
++		const succeeded = make();
++		await succeeded.didExecuteTool({ content: [] }, true);
++
++		assert.deepStrictEqual({ failed: failed.pastTenseMessage, succeeded: succeeded.pastTenseMessage }, {
++			failed: undefined,
++			succeeded: 'Captured browser screenshot',
++		});
++	});
++
+ 	test('hasActiveRequest reflects last request isIncomplete', async () => {
+ 		const model = testDisposables.add(instantiationService.createInstance(ChatModel, undefined, { initialLocation: ChatAgentLocation.Chat, canUseTools: true }));
+ 
+
+From dd4ee3114c438fd5b198a98f5627361e31b64522 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 17:01:55 -0400
+Subject: [PATCH 2/3] Condense comments per review
+
+---
+ .../browserView/electron-browser/tools/browserToolHelpers.ts  | 3 ---
+ .../chat/common/model/chatProgressTypes/chatToolInvocation.ts | 4 +---
+ .../contrib/chat/test/common/model/chatModel.test.ts          | 2 --
+ 3 files changed, 1 insertion(+), 8 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+index 18617fb8ad8b3..2e72b160e83f3 100644
+--- a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
++++ b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+@@ -180,9 +180,6 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult,
+ 	content.push({ kind: 'text', value: result.summary });
+ 	return {
+ 		content,
+-		// The evaluated code reported an error, so the call failed. Without this
+-		// only `toolResultDetails.isError` is set, which leaves the tool call
+-		// itself reported as a success.
+ 		...(result.error ? { toolResultError: result.error } : {}),
+ 		...(code ? {
+ 			toolResultDetails: {
+diff --git a/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts b/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
+index 31bb4ece43b3a..753b185208b20 100644
+--- a/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
++++ b/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
+@@ -367,9 +367,7 @@ export class ChatToolInvocation implements IChatToolInvocation {
+ 		if (result?.toolResultMessage) {
+ 			this.pastTenseMessage = result.toolResultMessage;
+ 		} else if (result?.toolResultError) {
+-			// The past-tense message was prepared before the tool ran and states
+-			// what it would have done, so keeping it on a failure reads as though
+-			// the work succeeded. Drop it and let the error stand on its own.
++			// The prepared message states what the tool would have done; on failure it would read as success.
+ 			this.pastTenseMessage = undefined;
+ 		} else if (this._progress.get().message) {
+ 			this.pastTenseMessage = this._progress.get().message;
+diff --git a/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts b/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
+index d9d8aefcf01dc..aeb5ad72f15bd 100644
+--- a/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
+@@ -1763,8 +1763,6 @@ suite('ChatResponseModel', () => {
+ 			source: ToolDataSource.Internal,
+ 		}, 'tool-call-1', undefined, {}, {});
+ 
+-		// The prepared message states what the tool would have done, so a failure
+-		// must not keep it: it would read as though the screenshot was captured.
+ 		const failed = make();
+ 		await failed.didExecuteTool({ content: [], toolResultError: 'No browser page found' }, true);
+ 		const succeeded = make();
+
+From c517c08be6a59ce6037da6cb390e28044b7b9c81 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 15:07:17 -0400
+Subject: [PATCH 3/3] Name the failure instead of dropping the label
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review feedback: the codebase sets a past-tense message for a failed tool
+call rather than clearing it — the codex mapper does it per result, and the
+agent host does it for client tool calls that outlive their client. Doing it
+in ChatToolInvocation changed the past-tense behavior of every tool that
+reports an error in order to fix browser ones.
+
+The browser helpers now supply the failure label alongside the error, so the
+shared model is untouched. These tools declare only an invocationMessage and
+no pastTenseMessage, which is why a failed call reused the present-tense one
+and read as a success.
+
+The error check is on presence rather than truthiness, so an empty message
+from `throw ''` or `new Error()` still reports a failure.
+
+Coverage moves to browserToolHelpers, which nothing exercised before.
+---
+ .../tools/browserToolHelpers.ts               | 16 ++++++-
+ .../tools/browserToolHelpers.test.ts          | 42 +++++++++++++++++++
+ .../chatProgressTypes/chatToolInvocation.ts   |  3 --
+ .../chat/test/common/model/chatModel.test.ts  | 19 ---------
+ 4 files changed, 56 insertions(+), 24 deletions(-)
+ create mode 100644 src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts
+
+diff --git a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+index 2e72b160e83f3..a23348dbf1878 100644
+--- a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
++++ b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+@@ -162,6 +162,17 @@ export async function playwrightInvoke<TArgs extends unknown[], TReturn>(
+ 	}
+ }
+ 
++/**
++ * Past-tense label for a browser tool call that failed.
++ *
++ * These tools declare only an `invocationMessage`, so on completion the
++ * present-tense label is reused verbatim and a failed call reads as a
++ * successful one ("Capturing browser screenshot"). Naming the failure keeps
++ * the completed state honest, as the agent host already does for client tool
++ * calls and the codex mapper does for its own results.
++ */
++const failedMessage = localize('browser.actionFailed', "Browser action failed");
++
+ /**
+  * Convert an {@link IInvokeFunctionResult} to an {@link IToolResult},
+  * including any {@link IInvokeFunctionResult.deferredResultId}.
+@@ -180,7 +191,7 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult,
+ 	content.push({ kind: 'text', value: result.summary });
+ 	return {
+ 		content,
+-		...(result.error ? { toolResultError: result.error } : {}),
++		...(result.error !== undefined ? { toolResultError: result.error || failedMessage, toolResultMessage: failedMessage } : {}),
+ 		...(code ? {
+ 			toolResultDetails: {
+ 				input: code,
+@@ -188,7 +199,7 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult,
+ 				output: result.result || result.error
+ 					? [{ type: 'embed' as const, isText: true, value: JSON.stringify(result.result ?? result.error, null, 2) }]
+ 					: [],
+-				isError: !!result.error,
++				isError: result.error !== undefined,
+ 			},
+ 		} : {}),
+ 	};
+@@ -198,6 +209,7 @@ export function errorResult(message: string): IToolResult {
+ 	return {
+ 		content: [{ kind: 'text', value: message }],
+ 		toolResultError: message,
++		toolResultMessage: failedMessage,
+ 	};
+ }
+ 
+diff --git a/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts b/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts
+new file mode 100644
+index 0000000000000..d19e5a0a9ee5a
+--- /dev/null
++++ b/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts
+@@ -0,0 +1,42 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
++import { errorResult, invokeFunctionResultToToolResult } from '../../../electron-browser/tools/browserToolHelpers.js';
++
++suite('browserToolHelpers - failure reporting', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('a failed invocation reports the failure and names it in the completed state', () => {
++		const result = invokeFunctionResultToToolResult({ error: 'No browser page found', summary: 'Screenshot failed' });
++
++		assert.strictEqual(result.toolResultError, 'No browser page found');
++		assert.ok(result.toolResultMessage, 'a failed call must not reuse the present-tense invocation message');
++	});
++
++	test('an empty error message still reports a failure', () => {
++		// `throw ''` and `new Error()` both produce one, and a falsy check would
++		// report the call as successful.
++		const result = invokeFunctionResultToToolResult({ error: '', summary: 'Screenshot failed' });
++
++		assert.ok(result.toolResultError, 'an empty error message is still a failure');
++		assert.ok(result.toolResultMessage);
++	});
++
++	test('a successful invocation reports neither', () => {
++		const result = invokeFunctionResultToToolResult({ result: 'ok', summary: 'Captured screenshot' });
++
++		assert.strictEqual(result.toolResultError, undefined);
++		assert.strictEqual(result.toolResultMessage, undefined);
++	});
++
++	test('errorResult reports the failure and names it', () => {
++		const result = errorResult('No page ID provided.');
++
++		assert.strictEqual(result.toolResultError, 'No page ID provided.');
++		assert.ok(result.toolResultMessage);
++	});
++});
+diff --git a/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts b/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
+index 753b185208b20..13aa48ff30369 100644
+--- a/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
++++ b/src/vs/workbench/contrib/chat/common/model/chatProgressTypes/chatToolInvocation.ts
+@@ -366,9 +366,6 @@ export class ChatToolInvocation implements IChatToolInvocation {
+ 		}
+ 		if (result?.toolResultMessage) {
+ 			this.pastTenseMessage = result.toolResultMessage;
+-		} else if (result?.toolResultError) {
+-			// The prepared message states what the tool would have done; on failure it would read as success.
+-			this.pastTenseMessage = undefined;
+ 		} else if (this._progress.get().message) {
+ 			this.pastTenseMessage = this._progress.get().message;
+ 		}
+diff --git a/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts b/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
+index aeb5ad72f15bd..e6e923ef695b6 100644
+--- a/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/model/chatModel.test.ts
+@@ -1755,25 +1755,6 @@ suite('ChatResponseModel', () => {
+ 		assert.strictEqual(completedNotifications, 1);
+ 	});
+ 
+-	test('a failed tool drops the past-tense message prepared before it ran; a successful one keeps it', async () => {
+-		const make = () => new ChatToolInvocation({ invocationMessage: 'Capturing browser screenshot', pastTenseMessage: 'Captured browser screenshot' }, {
+-			id: 'screenshotPage',
+-			modelDescription: 'Capture a browser screenshot',
+-			displayName: 'Screenshot Page',
+-			source: ToolDataSource.Internal,
+-		}, 'tool-call-1', undefined, {}, {});
+-
+-		const failed = make();
+-		await failed.didExecuteTool({ content: [], toolResultError: 'No browser page found' }, true);
+-		const succeeded = make();
+-		await succeeded.didExecuteTool({ content: [] }, true);
+-
+-		assert.deepStrictEqual({ failed: failed.pastTenseMessage, succeeded: succeeded.pastTenseMessage }, {
+-			failed: undefined,
+-			succeeded: 'Captured browser screenshot',
+-		});
+-	});
+-
+ 	test('hasActiveRequest reflects last request isIncomplete', async () => {
+ 		const model = testDisposables.add(instantiationService.createInstance(ChatModel, undefined, { initialLocation: ChatAgentLocation.Chat, canUseTools: true }));
+ 

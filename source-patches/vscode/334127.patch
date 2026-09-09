@@ -1,0 +1,1628 @@
+From b4944c6bbe5993d89f61f91948f888f62a6637aa Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 17:50:06 -0400
+Subject: [PATCH 1/2] agentHost: close abandoned turns deterministically
+
+Nothing closed a turn whose producer had gone: a dropped completion left a
+tool stuck Running, a spinner that never stopped, steering refused for lack
+of an in-flight turn, and a session that could never be released. The only
+watchdog was telemetry, which reports and dispatches nothing.
+
+Implement the deterministic half of the fix.
+
+Claude now implements IAgent.getTurnDiagnosticSnapshot. The prompt queue
+reports whether a turn is still queued and whether it was already yielded to
+the SDK, the pipeline records how each turn's call settled plus a quiet-time
+figure, and the session appends the ids parked in its permission, user-input
+and client-tool registries.
+
+After agent.chats.sendMessage resolves, and on the resume path,
+AgentSideEffects checks the turn. Claude's send resolves only once the final
+result has been dispatched, so a turn that is still active at that point lost
+its completion: it is closed as complete when the provider reports the call
+resolved, or failed with a non-resumable executionAbandoned when it reports
+rejected or never started. Providers opt into that invariant with
+callSettlesWithTurn, so Copilot (whose send returns before session.idle ends
+the turn) and Codex are unaffected. A turn parked on a request the user can
+see is never closed.
+
+Two root-cause fixes keep the reaper a backstop rather than the primary path.
+A stale tool ready is now denied instead of dropped, which used to leak the
+SDK's canUseTool for any tool that reached a terminal state before its ask
+arrived, and removing an active client fails the client tool calls it left
+parked.
+
+On a terminal action, a subagent whose spawning tool call already finished
+ends with its parent. A still-running spawn is a background subagent that
+outlives its parent turn by design, so the check reads the tool call before
+the terminal action force-cancels it.
+
+Both host-synthesized terminal sites now go through one _endTurnFromHost
+helper that guards on the turn still being active and not already cancelled,
+so a user cancel racing the reaper ends the turn exactly once.
+
+There is no wall-clock or quiet-time trigger: quietMs is collected for
+diagnostics only and nothing acts on it.
+---
+ src/vs/platform/agentHost/common/agent.ts     |  20 +-
+ .../agentHost/node/agentSideEffects.ts        | 174 ++++++++++++-
+ .../agentHost/node/claude/claudeAgent.ts      |  20 +-
+ .../node/claude/claudeAgentSession.ts         |  62 ++++-
+ .../node/claude/claudePromptQueue.ts          |  21 ++
+ .../agentHost/node/claude/claudeSdkOptions.ts |   8 +-
+ .../node/claude/claudeSdkPipeline.ts          |  69 +++++-
+ .../clientTools/claudeClientToolMcpServer.ts  |   8 +-
+ .../test/node/agentSideEffects.test.ts        | 233 +++++++++++++++++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 125 +++++++++-
+ 10 files changed, 702 insertions(+), 38 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agent.ts b/src/vs/platform/agentHost/common/agent.ts
+index f4b28c2034c80..c1da1097e12ef 100644
+--- a/src/vs/platform/agentHost/common/agent.ts
++++ b/src/vs/platform/agentHost/common/agent.ts
+@@ -221,11 +221,29 @@ export type AgentProvider = string;
+ export type AgentTurnProviderCallState = 'notStarted' | 'pending' | 'resolved' | 'rejected';
+ export type AgentTurnProviderSessionState = 'active' | 'disconnecting' | 'disconnected' | 'shutdown';
+ 
++/** What kind of host round-trip a provider is parked on for a turn. */
++export type AgentTurnPendingHostRequestKind = 'permission' | 'userInput' | 'clientToolCall';
++
++/** One host round-trip a provider is still waiting on for a turn. */
++export interface IAgentTurnPendingHostRequest {
++	readonly kind: AgentTurnPendingHostRequestKind;
++	readonly id: string;
++}
++
+ export type IAgentTurnDiagnosticSnapshot = {
+ 	readonly state: 'available';
+ 	readonly providerCallState: AgentTurnProviderCallState;
+ 	readonly providerTurnStarted: boolean;
+ 	readonly providerSessionState: AgentTurnProviderSessionState;
++	/**
++	 * Whether a settled {@link providerCallState} means the turn itself is over.
++	 * Providers whose send call returns before the turn ends must leave this unset.
++	 */
++	readonly callSettlesWithTurn?: boolean;
++	/** Host round-trips the provider is parked on, when it tracks them. */
++	readonly pendingHostRequests?: readonly IAgentTurnPendingHostRequest[];
++	/** Milliseconds since the provider last produced anything for this session. */
++	readonly quietMs?: number;
+ } | {
+ 	readonly state: 'missingChat' | 'missingTurn';
+ };
+@@ -1144,7 +1162,7 @@ export interface IAgent {
+ 	truncateChat?(chat: URI, turnId: string | undefined, context?: URI | IAgentChatContext): Promise<void>;
+ 
+ 	/** Return bounded diagnostics for an in-flight turn when supported. */
+-	getTurnDiagnosticSnapshot?(chat: URI, turnId: string): IAgentTurnDiagnosticSnapshot | undefined;
++	getTurnDiagnosticSnapshot?(chat: URI, turnId: string, context?: URI | IAgentChatContext): IAgentTurnDiagnosticSnapshot | undefined;
+ 
+ 	/** Record the host-remapped turn for a completed provider model call. */
+ 	recordModelCallTurnCorrelation?(chat: URI, modelCallId: string, turnId: string): void;
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index 969e653613441..a2bf1ebe942ca 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -17,10 +17,10 @@ import { IInstantiationService } from '../../instantiation/common/instantiation.
+ import { ILogService } from '../../log/common/log.js';
+ import { IAgentHostChangesetService } from '../common/agentHostChangesetService.js';
+ import { IAgentHostCheckpointService } from '../common/agentHostCheckpointService.js';
+-import { IAgentHostChatContributions, type ISendTurnMessageOptions } from '../common/agentHostChatContributionsService.js';
++import { IAgentHostChatContributions, type ISendTurnMessageOptions, type TurnEndReason } from '../common/agentHostChatContributionsService.js';
+ import { AgentHostClientType } from '../common/agentHostClientInfo.js';
+ import { AgentHostLaunchKind, createUnknownAgentHostClientTelemetryContext, type IAgentHostClientTelemetryContext } from '../common/agentHostTelemetry.js';
+-import { AgentSession, AgentSignal, IAgent, IAgentChatContext, IAgentToolPendingConfirmationSignal, type IAgentModelCallCompletedSignal } from '../common/agent.js';
++import { AgentSession, AgentSignal, IAgent, IAgentChatContext, IAgentToolPendingConfirmationSignal, type IAgentModelCallCompletedSignal, type IAgentTurnDiagnosticSnapshot } from '../common/agent.js';
+ import { readToolCallMeta, toToolCallMeta } from '../common/meta/agentToolCallMeta.js';
+ import { isAgentMergeMessage } from '../common/meta/agentMergeMessageMeta.js';
+ 
+@@ -31,7 +31,7 @@ import { resolveChatAttachment } from '../common/state/chatAttachmentContext.js'
+ import { buildOpenSessionLinkForChatResource } from '../common/openSessionLink.js';
+ import { ToolCallContributorKind, type AgentInfo, type SessionActiveClient } from '../common/state/protocol/state.js';
+ import type { CustomizationEnablement } from '../common/state/protocol/channels-session/state.js';
+-import { ActionType, isChatAction, StateAction, type ChatToolCallCompleteAction } from '../common/state/sessionActions.js';
++import { ActionType, isChatAction, StateAction, type ChatErrorAction, type ChatToolCallCompleteAction, type ChatTurnCancelledAction, type ChatTurnCompleteAction } from '../common/state/sessionActions.js';
+ import {
+ 	buildSubagentChatUri,
+ 	createErrorResponsePart,
+@@ -807,6 +807,8 @@ export class AgentSideEffects extends Disposable {
+ 			}
+ 		}
+ 
++		// Ending a turn force-cancels its running tool calls, so read the spawns first.
++		const endingSubagents = isTerminalTurnAction(action) ? this._resolvedSubagentSpawns(sessionKey, turnId) : [];
+ 		this._stateManager.dispatchServerAction(sessionKey, action);
+ 
+ 		// Any turn-scoped action counts as activity for the hang watchdog: it is
+@@ -885,11 +887,53 @@ export class AgentSideEffects extends Disposable {
+ 				clientContext
+ 			});
+ 		}
+-		if (action.type === ActionType.ChatTurnComplete || action.type === ActionType.ChatTurnCancelled || action.type === ActionType.ChatError) {
++		if (isTerminalTurnAction(action)) {
++			this._endSubagentTurns(endingSubagents, action);
+ 			this._resumedTurnExecutions.delete(this._resumedTurnExecutionKey(sessionKey, turnId));
+ 		}
+ 	}
+ 
++	/**
++	 * Subagents of `parentChatUri` whose spawning tool call has already reached a
++	 * terminal state. A still-running spawn is a background subagent that
++	 * deliberately outlives its parent turn.
++	 */
++	private _resolvedSubagentSpawns(parentChatUri: ProtocolURI, parentTurnId: string): readonly ISubagentSessionRef[] {
++		return [...this._subagentChats.getAll(parentChatUri)].filter(subagent => !this._isSpawnLive(parentChatUri, parentTurnId, subagent.toolCallId));
++	}
++
++	/** Ends each subagent's active turn with the terminal outcome of its parent turn. */
++	private _endSubagentTurns(subagents: readonly ISubagentSessionRef[], action: IHostTerminalTurnAction): void {
++		for (const subagent of subagents) {
++			const turnId = this._stateManager.getActiveTurnId(subagent.chatUri);
++			if (turnId) {
++				this._endTurnFromHost(subagent.chatUri, retargetTerminalAction(action, turnId, this._turnDuration(subagent.turnStopWatch)));
++			}
++		}
++	}
++
++	/** Whether the parent tool call that spawned a subagent has yet to reach a terminal state. */
++	private _isSpawnLive(parentChatUri: ProtocolURI, parentTurnId: string, toolCallId: string): boolean {
++		const status = this._findToolCallStatus(parentChatUri, parentTurnId, toolCallId);
++		return status !== ToolCallStatus.Completed && status !== ToolCallStatus.Cancelled;
++	}
++
++	private _findToolCallStatus(chat: ProtocolURI, turnId: string, toolCallId: string): ToolCallStatus | undefined {
++		const state = this._stateManager.getSessionState(chat);
++		const turns = state ? [...state.turns, ...(state.activeTurn ? [state.activeTurn] : [])] : [];
++		for (let i = turns.length - 1; i >= 0; i--) {
++			if (turns[i].id !== turnId) {
++				continue;
++			}
++			for (const part of turns[i].responseParts) {
++				if (part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === toolCallId) {
++					return part.toolCall.status;
++				}
++			}
++		}
++		return undefined;
++	}
++
+ 	private _resumedTurnExecutionKey(chat: ProtocolURI, turnId: string): string {
+ 		return `${chat}\0${turnId}`;
+ 	}
+@@ -914,6 +958,28 @@ export class AgentSideEffects extends Disposable {
+ 		return this._turnTracker.turnCompleted(channel, turnId, result, failure, { isMultiRoot: folderCount > 1, folderCount });
+ 	}
+ 
++	/**
++	 * Ends a still-active turn with a host-synthesized terminal action. No-ops
++	 * when the turn already ended or a client cancellation beat the host to it.
++	 */
++	private _endTurnFromHost(channel: ProtocolURI, action: IHostTerminalTurnAction): boolean {
++		const turnId = action.turnId;
++		if (this._stateManager.getActiveTurnId(channel) !== turnId || this._cancelledTurnIds.get(channel)?.has(turnId)) {
++			return false;
++		}
++		const sessionUri = isAhpChatChannel(channel) ? parseRequiredSessionUriFromChatUri(channel) : channel;
++		const clientContext = this._turnTracker.getClientTelemetryContext(channel, turnId);
++		this._stateManager.dispatchServerAction(channel, action);
++		const reason = turnEndReasonFor(action);
++		const failure = reason.kind === 'error' ? { stage: 'provider' as const, error: reason.error } : undefined;
++		const ended = this._completeTurn(channel, turnId, turnResultFor(action), failure);
++		this._toolCallTracker.clearSession(channel);
++		if (ended) {
++			this._chatContributions.turnEnd({ session: sessionUri, channel, turnId, reason, clientContext });
++		}
++		return ended;
++	}
++
+ 	private _runTurnCompleteSideEffects(sessionKey: ProtocolURI, turnId: string | undefined, clientContext?: IAgentHostClientTelemetryContext): void {
+ 		const sessionUri = isAhpChatChannel(sessionKey) ? parseRequiredSessionUriFromChatUri(sessionKey) : sessionKey;
+ 		this._chatContributions.turnEnd({ session: sessionUri, channel: sessionKey, turnId, reason: { kind: 'success' }, clientContext });
+@@ -1097,12 +1163,11 @@ export class AgentSideEffects extends Disposable {
+ 		for (const subagent of this._subagentChats.getAll(parentChatURI)) {
+ 			const turnId = this._stateManager.getActiveTurnId(subagent.chatUri);
+ 			if (turnId) {
+-				this._stateManager.dispatchServerAction(subagent.chatUri, {
++				this._endTurnFromHost(subagent.chatUri, {
+ 					type: ActionType.ChatTurnCancelled,
+ 					turnId,
+ 					duration: this._turnDuration(subagent.turnStopWatch),
+ 				});
+-				this._completeTurn(subagent.chatUri, turnId, 'cancelled');
+ 			}
+ 			this._toolCallTracker.clearSession(subagent.chatUri);
+ 			this._turnTracker.clearSession(subagent.chatUri);
+@@ -1130,13 +1195,11 @@ export class AgentSideEffects extends Disposable {
+ 
+ 		const turnId = this._stateManager.getActiveTurnId(subagent.chatUri);
+ 		if (turnId) {
+-			this._stateManager.dispatchServerAction(subagent.chatUri, {
++			this._endTurnFromHost(subagent.chatUri, {
+ 				type: ActionType.ChatTurnComplete,
+ 				turnId,
+ 				duration: this._turnDuration(subagent.turnStopWatch),
+ 			});
+-			this._completeTurn(subagent.chatUri, turnId, 'success');
+-			this._toolCallTracker.clearSession(subagent.chatUri);
+ 		}
+ 	}
+ 
+@@ -1277,7 +1340,9 @@ export class AgentSideEffects extends Disposable {
+ 			const toolCallKey = `${sessionKey}:${e.state.toolCallId}`;
+ 			this._toolCallAgents.delete(toolCallKey);
+ 			this._managedApprovalToolCalls.delete(toolCallKey);
+-			this._logService.trace(`[AgentSideEffects] Dropping stale tool ready for ${e.state.toolCallId}: status=${toolCall.status}`);
++			this._logService.trace(`[AgentSideEffects] Denying stale tool ready for ${e.state.toolCallId}: status=${toolCall.status}`);
++			// The call already reached a terminal state, so answering it is the only way the provider unparks.
++			agent.respondToPermissionRequest(e.state.toolCallId, false);
+ 			return;
+ 		}
+ 		const contributor = e.state.contributor ?? toolCall?.contributor;
+@@ -1401,7 +1466,9 @@ export class AgentSideEffects extends Disposable {
+ 					},
+ 					clientId,
+ 					clientContext.clientType,
+-				).catch(error => {
++				).then(() => {
++					this._closeAbandonedTurn(agent, channel, URI.parse(channel), action.turnId, this._chatContext(sessionChannel, channel), execution.duration + execution.stopWatch.elapsed());
++				}).catch(error => {
+ 					if (this._resumedTurnExecutions.get(key) !== execution) {
+ 						return;
+ 					}
+@@ -1752,6 +1819,7 @@ export class AgentSideEffects extends Disposable {
+ 			}
+ 			this._turnTracker.setCurrentStage(turnChannel, turnId, 'provider');
+ 			await agent.chats.sendMessage(chatUri, contribution.message.text, resolvedWorkingDirectories, resolvedAttachments, turnId, senderClientId, clientContext.clientType, sendContext);
++			this._closeAbandonedTurn(agent, turnChannel, chatUri, turnId, sendContext, this._turnDuration(turnStopWatch));
+ 		} catch (err) {
+ 			const failure = buildTurnFailure(failureStage, err);
+ 			const error = failure.error;
+@@ -1780,6 +1848,54 @@ export class AgentSideEffects extends Disposable {
+ 		}
+ 	}
+ 
++	/**
++	 * Closes a turn whose provider call has already settled but whose terminal
++	 * signal never arrived. A call the provider still reports pending, or a turn
++	 * blocked on a request the user can see, is left untouched.
++	 */
++	private _closeAbandonedTurn(agent: IAgent, channel: ProtocolURI, chat: URI, turnId: string, context: IAgentChatContext, duration: number): void {
++		if (this._stateManager.getActiveTurnId(channel) !== turnId) {
++			return;
++		}
++		const snapshot = this._providerTurnDiagnostics(agent, chat, turnId, context);
++		if (snapshot?.state !== 'available' || !snapshot.callSettlesWithTurn || snapshot.providerCallState === 'pending') {
++			return;
++		}
++		if (snapshot.pendingHostRequests?.length || this._hasVisiblePendingRequest(channel)) {
++			return;
++		}
++		this._logService.warn(`[AgentSideEffects] Closing abandoned turn ${turnId} on ${channel}: providerCallState=${snapshot.providerCallState}, providerSessionState=${snapshot.providerSessionState}, providerTurnStarted=${snapshot.providerTurnStarted}`);
++		if (snapshot.providerCallState === 'resolved') {
++			this._endTurnFromHost(channel, { type: ActionType.ChatTurnComplete, turnId, duration });
++			return;
++		}
++		const error: ErrorInfo = { errorType: TURN_ABANDONED_ERROR_TYPE, message: 'The agent stopped without finishing this turn.' };
++		this._endTurnFromHost(channel, { type: ActionType.ChatError, turnId, duration, part: createErrorResponsePart(error) });
++	}
++
++	private _providerTurnDiagnostics(agent: IAgent, chat: URI, turnId: string, context: IAgentChatContext): IAgentTurnDiagnosticSnapshot | undefined {
++		try {
++			return agent.getTurnDiagnosticSnapshot?.(chat, turnId, context);
++		} catch (error) {
++			this._logService.error(`[AgentSideEffects] getTurnDiagnosticSnapshot failed for provider ${agent.id}`, error);
++			return undefined;
++		}
++	}
++
++	/** Whether the channel's active turn is parked on a request the user can see and answer. */
++	private _hasVisiblePendingRequest(channel: ProtocolURI): boolean {
++		const activeTurn = this._stateManager.getSessionState(channel)?.activeTurn;
++		return activeTurn?.responseParts.some(part => {
++			if (part.kind === ResponsePartKind.InputRequest) {
++				return part.response === undefined;
++			}
++			return part.kind === ResponsePartKind.ToolCall && (
++				part.toolCall.status === ToolCallStatus.PendingConfirmation
++				|| part.toolCall.status === ToolCallStatus.PendingResultConfirmation
++				|| part.toolCall.status === ToolCallStatus.AuthRequired);
++		}) === true;
++	}
++
+ 	private async _resolveChatAttachments(attachments: readonly MessageAttachment[] | undefined): Promise<readonly MessageAttachment[] | undefined> {
+ 		if (!attachments?.some(attachment => attachment.type === MessageAttachmentKind.Chat)) {
+ 			return attachments;
+@@ -1879,6 +1995,42 @@ export class AgentSideEffects extends Disposable {
+ 	}
+ }
+ 
++/** A terminal turn action the host synthesizes rather than receiving from a provider. */
++type IHostTerminalTurnAction = ChatTurnCompleteAction | ChatTurnCancelledAction | ChatErrorAction;
++
++/** Whether an action is one of the three that end a turn. */
++function isTerminalTurnAction(action: { readonly type: ActionType }): action is IHostTerminalTurnAction {
++	return action.type === ActionType.ChatTurnComplete || action.type === ActionType.ChatTurnCancelled || action.type === ActionType.ChatError;
++}
++
++/** The same terminal outcome, re-addressed to another turn. */
++function retargetTerminalAction(action: IHostTerminalTurnAction, turnId: string, duration: number): IHostTerminalTurnAction {
++	switch (action.type) {
++		case ActionType.ChatTurnComplete: return { type: ActionType.ChatTurnComplete, turnId, duration };
++		case ActionType.ChatTurnCancelled: return { type: ActionType.ChatTurnCancelled, turnId, duration };
++		default: return { type: ActionType.ChatError, turnId, duration, part: action.part };
++	}
++}
++
++function turnResultFor(action: IHostTerminalTurnAction): AgentHostTurnResult {
++	switch (action.type) {
++		case ActionType.ChatTurnComplete: return 'success';
++		case ActionType.ChatTurnCancelled: return 'cancelled';
++		default: return 'error';
++	}
++}
++
++function turnEndReasonFor(action: IHostTerminalTurnAction): TurnEndReason {
++	switch (action.type) {
++		case ActionType.ChatTurnComplete: return { kind: 'success' };
++		case ActionType.ChatTurnCancelled: return { kind: 'cancelled' };
++		default: return { kind: 'error', error: action.part.error, resumable: action.part.resumable === true };
++	}
++}
++
++/** `ErrorInfo.errorType` for a turn the host closed because its producer went away. */
++const TURN_ABANDONED_ERROR_TYPE = 'executionAbandoned';
++
+ /**
+  * Builds the {@link ErrorInfo} for a failed `sendMessage` rejection. When the
+  * rejection text carries a `VSCODE_PROXY_ERROR` marker (embedded by a model
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index dbb1d79a5b592..1679d666a88be 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -28,7 +28,7 @@ import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeMultiRoot
+ import { ClaudePermissionMode, ClaudeSessionConfigKey, narrowClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { createClaudeThinkingLevelSchema, isClaudeEffortLevel } from '../../common/claudeModelConfig.js';
+ import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
+-import { AgentChatMigrationDeferred, type AgentChatMigrationResult, AgentProvider, AgentSession, AgentSignal, CLAUDE_AGENT_PROVIDER_ID, IActiveClient, IAgent, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentChats, IAgentChatConfigCompletionsParams, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentDescriptor, IAgentDiscoveredChat, IAgentMaterializeChatEvent, IAgentModelInfo, IAgentResolveChatConfigParams, IAgentSessionProjectInfo, IAgentSpawnChatEvent, IAgentSpawnedChatParent, SubagentChatSignal, resolveAgentChatContext, resolveAgentHostCustomizations, resolveAgentHostInstructions, resolveSubagentChatParent } from '../../common/agent.js';
++import { AgentChatMigrationDeferred, type AgentChatMigrationResult, AgentProvider, AgentSession, AgentSignal, CLAUDE_AGENT_PROVIDER_ID, IActiveClient, IAgent, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentChats, IAgentChatConfigCompletionsParams, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentDescriptor, IAgentDiscoveredChat, IAgentMaterializeChatEvent, IAgentModelInfo, IAgentResolveChatConfigParams, IAgentSessionProjectInfo, IAgentSpawnChatEvent, IAgentSpawnedChatParent, SubagentChatSignal, type IAgentTurnDiagnosticSnapshot, resolveAgentChatContext, resolveAgentHostCustomizations, resolveAgentHostInstructions, resolveSubagentChatParent } from '../../common/agent.js';
+ import { ensureWorkspacelessScratchDir } from '../workspacelessScratchDir.js';
+ import { ActionType } from '../../common/state/sessionActions.js';
+ import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
+@@ -1556,7 +1556,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 			model,
+ 			options?.agent,
+ 			options?.config,
+-			new PendingRequestRegistry<CallToolResult>(),
++			new PendingRequestRegistry<CallToolResult, string | undefined>(),
+ 			this._resolvePermissionMode(options?.config),
+ 			this._instantiationService,
+ 			options?.workingDirectories?.slice(1) ?? [],
+@@ -1789,7 +1789,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 			model,
+ 			overlay.agent,
+ 			undefined,
+-			new PendingRequestRegistry<CallToolResult>(),
++			new PendingRequestRegistry<CallToolResult, string | undefined>(),
+ 			permissionMode,
+ 			this._instantiationService,
+ 			additionalDirectories,
+@@ -2442,6 +2442,19 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		});
+ 	}
+ 
++	/**
++	 * Bounded diagnostics for an in-flight turn. A subagent chat is resolved
++	 * through the spawn edge its operation context carries.
++	 */
++	getTurnDiagnosticSnapshot(chat: URI, turnId: string, context?: URI | IAgentChatContext): IAgentTurnDiagnosticSnapshot {
++		const spawnedFrom = resolveSubagentChatParent(context);
++		const target = this._findChatByUri(chat) ?? (spawnedFrom ? this._findChatByUri(spawnedFrom.chat) : undefined);
++		if (!target) {
++			return { state: 'missingChat' };
++		}
++		return target.getTurnDiagnosticSnapshot(turnId, spawnedFrom?.toolCallId) ?? { state: 'missingTurn' };
++	}
++
+ 	setServerToolHost(host: IAgentServerToolHost): void {
+ 		this._serverToolHost = host;
+ 	}
+@@ -2484,6 +2497,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 			return;
+ 		}
+ 		target.removeClientTools(clientId);
++		target.failClientToolCalls(clientId);
+ 		void this._sessionSequencer.queue(target.sessionId, async () => target.removeClientCustomizations(clientId)).catch(() => { /* chat torn down */ });
+ 	}
+ 
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 7ec7a0a50e79c..b237c789ac598 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -4,7 +4,6 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import type { McpServerConfig, OnElicitation, Options, PermissionMode, SDKUserMessage, SyncHookJSONOutput, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+ import { Sequencer } from '../../../../base/common/async.js';
+ import { CancellationError } from '../../../../base/common/errors.js';
+ import { Emitter, Event } from '../../../../base/common/event.js';
+@@ -19,7 +18,7 @@ import { IAgentConfigurationService } from '../agentConfigurationService.js';
+ import { ISyncedCustomization } from '../../common/agentPluginManager.js';
+ import { ClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { ClaudeRuntimeEffortLevel, toRuntimeEffortLevel, resolveClaudeEffort } from '../../common/claudeModelConfig.js';
+-import { AgentSignal, IAgentSessionProjectInfo } from '../../common/agent.js';
++import { AgentSignal, IAgentSessionProjectInfo, type IAgentTurnDiagnosticSnapshot, type IAgentTurnPendingHostRequest } from '../../common/agent.js';
+ import type { IAgentHostClientTelemetryContext } from '../../common/agentHostTelemetry.js';
+ import type { IAgentServerToolHost } from '../../common/agentServerTools.js';
+ import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
+@@ -34,6 +33,7 @@ import { buildClientMcpServers, buildOptions, toClaudeMcpServers, type ClaudeDen
+ import { claudeTransportForProvider, parseClaudeModelSelection, toClaudeSdkModelId } from './claudeModelSelection.js';
+ import { buildServerToolMcpServer, CLAUDE_SERVER_TOOL_MCP_SERVER_NAME, serverToolAllowList } from './claudeServerToolMcpServer.js';
+ import { convertToolCallResult } from './clientTools/claudeClientToolResult.js';
++import type { ClientToolCallRegistry } from './clientTools/claudeClientToolMcpServer.js';
+ import { readClaudePermissionMode } from './claudeSessionPermissionMode.js';
+ import { SessionClientToolsDiff } from './clientTools/claudeSessionClientToolsModel.js';
+ import { SessionClientCustomizationsDiff } from './customizations/claudeSessionClientCustomizationsModel.js';
+@@ -228,7 +228,7 @@ export class ClaudeAgentSession extends Disposable {
+ 	private _appliedMcpLaunchEnablementRevision = 0;
+ 
+ 	/** Exposed for the materializer's MCP-server build closure. */
+-	get pendingClientToolCalls(): PendingRequestRegistry<CallToolResult> { return this._pendingClientToolCalls; }
++	get pendingClientToolCalls(): ClientToolCallRegistry { return this._pendingClientToolCalls; }
+ 	/** Snapshot of permission-mode fallback used when live read is undefined. */
+ 	get permissionModeFallback(): ClaudePermissionMode { return this._permissionModeFallback; }
+ 	private _inheritedPermissionMode: ClaudePermissionMode | undefined;
+@@ -241,7 +241,7 @@ export class ClaudeAgentSession extends Disposable {
+ 		model: ModelSelection | undefined,
+ 		agent: AgentSelection | undefined,
+ 		config: Record<string, unknown> | undefined,
+-		pendingClientToolCalls: PendingRequestRegistry<CallToolResult>,
++		pendingClientToolCalls: ClientToolCallRegistry,
+ 		permissionModeFallback: ClaudePermissionMode,
+ 		instantiationService: IInstantiationService,
+ 		additionalDirectories: readonly URI[] = [],
+@@ -441,7 +441,7 @@ export class ClaudeAgentSession extends Disposable {
+ 		agent: AgentSelection | undefined,
+ 		config: Record<string, unknown> | undefined,
+ 		abortController: AbortController,
+-		private readonly _pendingClientToolCalls: PendingRequestRegistry<CallToolResult>,
++		private readonly _pendingClientToolCalls: ClientToolCallRegistry,
+ 		toolDiff: SessionClientToolsDiff,
+ 		private readonly _permissionModeFallback: ClaudePermissionMode,
+ 		additionalDirectories: readonly URI[],
+@@ -972,6 +972,43 @@ export class ClaudeAgentSession extends Disposable {
+ 	 */
+ 	get hasActiveTurn(): boolean { return this._pipeline?.hasActiveTurn ?? false; }
+ 
++	/**
++	 * Bounded liveness facts for `turnId`, or for the subagent spawned by
++	 * `subagentToolCallId` when the caller addressed a subagent chat.
++	 */
++	getTurnDiagnosticSnapshot(turnId: string, subagentToolCallId?: string): IAgentTurnDiagnosticSnapshot | undefined {
++		const pipeline = this._pipeline;
++		if (!pipeline) {
++			return undefined;
++		}
++		if (subagentToolCallId !== undefined) {
++			return this.subagents.getSpawn(subagentToolCallId)
++				? { state: 'available', providerCallState: 'pending', providerTurnStarted: true, providerSessionState: pipeline.providerSessionState }
++				: undefined;
++		}
++		const snapshot = pipeline.getTurnDiagnosticSnapshot(turnId);
++		const pendingHostRequests = this._pendingHostRequests();
++		if (snapshot.state !== 'available' || pendingHostRequests.length === 0) {
++			return snapshot;
++		}
++		return { ...snapshot, pendingHostRequests };
++	}
++
++	/** Ids the SDK is parked on inside this session's host round-trip registries. */
++	private _pendingHostRequests(): readonly IAgentTurnPendingHostRequest[] {
++		const requests: IAgentTurnPendingHostRequest[] = [];
++		for (const [id] of this._pendingPermissions.entries()) {
++			requests.push({ kind: 'permission', id });
++		}
++		for (const [id] of this._pendingUserInputs.entries()) {
++			requests.push({ kind: 'userInput', id });
++		}
++		for (const [id] of this._pendingClientToolCalls.entries()) {
++			requests.push({ kind: 'clientToolCall', id });
++		}
++		return requests;
++	}
++
+ 	/** Pre-materialize model selection accessor (read by materializer to build Options). */
+ 	get provisionalModel(): ModelSelection | undefined { return this._provisionalModel; }
+ 
+@@ -1366,6 +1403,21 @@ export class ClaudeAgentSession extends Disposable {
+ 		this.toolDiff.model.removeClient(clientId);
+ 	}
+ 
++	/**
++	 * Fail every client-tool call parked for `clientId` so the SDK unblocks
++	 * when the client that owed the result goes away.
++	 */
++	failClientToolCalls(clientId: string): number {
++		const failed = this._pendingClientToolCalls.respondWhere(owner => owner === clientId, {
++			content: [{ type: 'text', text: `Client tool call abandoned: client ${clientId} is no longer connected to this session.` }],
++			isError: true,
++		});
++		if (failed > 0) {
++			this._logService.warn(`[Claude:${this.sessionId}] failed ${failed} parked client tool call(s) for departed client ${clientId}`);
++		}
++		return failed;
++	}
++
+ 	/** Remove a client's customization contribution from this session. */
+ 	removeClientCustomizations(clientId: string): void {
+ 		this.clientCustomizationsDiff.model.removeClient(clientId);
+diff --git a/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts b/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts
+index eedb2871a5ddc..3c345ea9dcfdb 100644
+--- a/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts
++++ b/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts
+@@ -107,6 +107,27 @@ export class ClaudePromptQueue extends Disposable {
+ 		return entry.deferred.p;
+ 	}
+ 
++	/** True iff `turnId` still has an entry queued, in flight, or popped-but-unsettled. */
++	hasTurn(turnId: string): boolean {
++		return this._toYield.some(e => e.turnId === turnId)
++			|| this._yielded.some(e => e.turnId === turnId)
++			|| this._popped.some(e => e.turnId === turnId);
++	}
++
++	/** True iff an entry for `turnId` has already been handed to the SDK. */
++	isTurnYielded(turnId: string): boolean {
++		return this._yielded.some(e => e.turnId === turnId) || this._popped.some(e => e.turnId === turnId);
++	}
++
++	/** Distinct turn ids with an unsettled entry, in-flight ones first. */
++	pendingTurnIds(): readonly string[] {
++		const ids = new Set<string>();
++		for (const entry of [...this._yielded, ...this._popped, ...this._toYield]) {
++			ids.add(entry.turnId);
++		}
++		return [...ids];
++	}
++
+ 	/**
+ 	 * Most-recent in-flight or queued entry, used by steering to inherit
+ 	 * its parent's `turnId`. Prefers the in-flight head over the latest
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+index 0f9a3ce742910..abc8a78b0b1be 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+@@ -4,7 +4,6 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import type { McpSdkServerConfigWithInstance, McpServerConfig, OnElicitation, Options, PreToolUseHookInput, Settings, SyncHookJSONOutput } from '@anthropic-ai/claude-agent-sdk';
+-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+ import { tmpdir } from 'os';
+ import { delimiter, dirname, normalize } from '../../../../base/common/path.js';
+ import { URI } from '../../../../base/common/uri.js';
+@@ -12,10 +11,9 @@ import { rgDiskPath } from '../../../../base/node/ripgrep.js';
+ import { AiAgentEnvValue, AiAgentEnvVar } from '../../../chat/common/aiAgentEnv.js';
+ import { ClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { resolveClaudeEffort } from '../../common/claudeModelConfig.js';
+-import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
+ import type { ModelSelection } from '../../common/state/protocol/state.js';
+ import { IClaudeAgentSdkService } from './claudeAgentSdkService.js';
+-import { buildClientToolMcpServer } from './clientTools/claudeClientToolMcpServer.js';
++import { buildClientToolMcpServer, type ClientToolCallRegistry } from './clientTools/claudeClientToolMcpServer.js';
+ import { toClaudeSdkModelId } from './claudeModelSelection.js';
+ import type { IAgentHostNativeOTelConfig, IAgentHostTraceContext } from '../../common/otel/agentHostOTelService.js';
+ import type { ClaudeTransport } from './claudeProxyService.js';
+@@ -221,14 +219,14 @@ export async function buildOptions(
+  */
+ export async function buildClientMcpServers(
+ 	toolDiff: SessionClientToolsDiff,
+-	registry: PendingRequestRegistry<CallToolResult>,
++	registry: ClientToolCallRegistry,
+ 	sdkService: IClaudeAgentSdkService,
+ ): Promise<Record<string, McpSdkServerConfigWithInstance> | undefined> {
+ 	const tools = toolDiff.consume();
+ 	if (tools.length === 0) {
+ 		return undefined;
+ 	}
+-	const server = await buildClientToolMcpServer(tools, id => registry.register(id), sdkService);
++	const server = await buildClientToolMcpServer(tools, (id, toolName) => registry.register(id, toolDiff.model.ownerOf(toolName)), sdkService);
+ 	return { client: server };
+ }
+ 
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 32655514ccb35..ace03f79daced 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -12,7 +12,7 @@ import { URI } from '../../../../base/common/uri.js';
+ import { IInstantiationService } from '../../../instantiation/common/instantiation.js';
+ import { ILogService } from '../../../log/common/log.js';
+ import { ClaudeRuntimeEffortLevel } from '../../common/claudeModelConfig.js';
+-import { AgentSignal } from '../../common/agent.js';
++import { AgentSignal, type AgentTurnProviderCallState, type AgentTurnProviderSessionState, type IAgentTurnDiagnosticSnapshot } from '../../common/agent.js';
+ import type { IAgentHostClientTelemetryContext } from '../../common/agentHostTelemetry.js';
+ import { ISessionDatabase } from '../../common/sessionDataService.js';
+ import { ActionType } from '../../common/state/sessionActions.js';
+@@ -85,6 +85,9 @@ export interface ISdkResolvedCustomizations {
+ 	readonly plugins: readonly { readonly name: string; readonly path: string; readonly source?: string }[];
+ }
+ 
++/** How many recently settled turns {@link ClaudeSdkPipeline} keeps diagnostics for. */
++const MAX_SETTLED_TURNS_TRACKED = 16;
++
+ export class ClaudeSdkPipeline extends Disposable {
+ 	/**
+ 	 * Phase 11 — hot-swap the SDK's plugin set in place via
+@@ -227,6 +230,15 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	/** Set when the consumer loop ends in error (cancellation OR crash). Read by {@link send} to trigger rebind. */
+ 	private _needsRebind = false;
+ 
++	/** Reset on every SDK message; reported as `quietMs` in turn diagnostics. */
++	private readonly _quietStopWatch = StopWatch.create(false);
++
++	/**
++	 * How each recently settled turn's provider call ended, most recent last.
++	 * Bounded so a long-lived session cannot grow it without limit.
++	 */
++	private readonly _settledTurns = new Map<string, { readonly call: 'resolved' | 'rejected'; readonly started: boolean }>();
++
+ 	/** Tracks whether the consumer loop is currently draining {@link _query}. */
+ 	private _consumerLoopRunning = false;
+ 
+@@ -295,6 +307,37 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	 */
+ 	get hasActiveTurn(): boolean { return !this._queue.isEmpty; }
+ 
++	/** Liveness of the SDK subprocess this pipeline drives. */
++	get providerSessionState(): AgentTurnProviderSessionState {
++		if (this._store.isDisposed || this._abortController.signal.aborted) {
++			return 'shutdown';
++		}
++		return this._needsRebind ? 'disconnected' : 'active';
++	}
++
++	/**
++	 * Bounded liveness facts for `turnId`: whether the SDK call is still
++	 * pending, how it settled, and how long the SDK has been quiet.
++	 */
++	getTurnDiagnosticSnapshot(turnId: string): IAgentTurnDiagnosticSnapshot {
++		const queued = this._queue.hasTurn(turnId);
++		const settled = this._settledTurns.get(turnId);
++		let providerCallState: AgentTurnProviderCallState = 'notStarted';
++		if (queued) {
++			providerCallState = 'pending';
++		} else if (settled) {
++			providerCallState = settled.call;
++		}
++		return {
++			state: 'available',
++			providerCallState,
++			providerTurnStarted: queued ? this._queue.isTurnYielded(turnId) : settled?.started === true,
++			providerSessionState: this.providerSessionState,
++			callSettlesWithTurn: true,
++			quietMs: this._quietStopWatch.elapsed(),
++		};
++	}
++
+ 	/**
+ 	 * Abort the live SDK subprocess and **await its actual exit**.
+ 	 *
+@@ -502,7 +545,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			return;
+ 		}
+ 		this._abortController.abort();
+-		this._queue.failAll(new CancellationError());
++		this._failQueue(new CancellationError());
+ 		// Mark unhealthy but keep the `_query` handle: the next `send` rebinds,
+ 		// and `shutdownAndWait` still needs it to await the subprocess exit.
+ 		this._needsRebind = true;
+@@ -521,6 +564,22 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		}
+ 	}
+ 
++	/** Reject every pending entry, recording each turn's call as rejected first. */
++	private _failQueue(err: Error): void {
++		for (const turnId of this._queue.pendingTurnIds()) {
++			this._recordSettledTurn(turnId, 'rejected', this._queue.isTurnYielded(turnId));
++		}
++		this._queue.failAll(err);
++	}
++
++	private _recordSettledTurn(turnId: string, call: 'resolved' | 'rejected', started: boolean): void {
++		this._settledTurns.delete(turnId);
++		this._settledTurns.set(turnId, { call, started });
++		while (this._settledTurns.size > MAX_SETTLED_TURNS_TRACKED) {
++			this._settledTurns.delete(this._settledTurns.keys().next().value!);
++		}
++	}
++
+ 	private _wireAbortHandler(controller: AbortController): void {
+ 		controller.signal.addEventListener('abort', () => {
+ 			this._queue.notifyAborted();
+@@ -622,7 +681,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind-aborted: warm dispose failed: ${err}`));
+ 			void Promise.resolve(oldWarm[Symbol.asyncDispose]()).catch((err: unknown) =>
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] previous WarmQuery dispose failed during aborted rebind: ${err}`));
+-			this._queue.failAll(new CancellationError());
++			this._failQueue(new CancellationError());
+ 			this._needsRebind = true;
+ 			throw new CancellationError();
+ 		}
+@@ -665,6 +724,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		}
+ 		try {
+ 			for await (const message of query) {
++				this._quietStopWatch.reset();
+ 				if (this._abortController.signal.aborted) {
+ 					throw new CancellationError();
+ 				}
+@@ -696,6 +756,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 					// Intermediate result (still pending entries from a
+ 					// steering preempt) does NOT fire ChatTurnComplete.
+ 					if (completed && this._queue.isEmpty) {
++						this._recordSettledTurn(completed.turnId, 'resolved', true);
+ 						this._onDidProduceSignal.fire({
+ 							kind: 'action',
+ 							resource: this.chatChannelUri,
+@@ -728,7 +789,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			// not clobber the fresh one. Mark unhealthy (keep the handle for
+ 			// teardown); the next `send` rebinds.
+ 			if (this._query === query) {
+-				this._queue.failAll(fatal);
++				this._failQueue(fatal);
+ 				this._needsRebind = true;
+ 			}
+ 			if (!isCancellationError(fatal)) {
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+index 7d5b75cd6fe9b..f58114ab32335 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+@@ -6,6 +6,7 @@
+ import type { McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-sdk';
+ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+ import type { ToolDefinition } from '../../../common/state/protocol/state.js';
++import type { PendingRequestRegistry } from '../../../common/pendingRequestRegistry.js';
+ import type { IClaudeAgentSdkService } from '../claudeAgentSdkService.js';
+ import { jsonSchemaToZodRawShape } from './claudeJsonSchemaToZod.js';
+ 
+@@ -19,6 +20,9 @@ import { jsonSchemaToZodRawShape } from './claudeJsonSchemaToZod.js';
+  */
+ const TOOL_USE_ID_META_KEY = 'claudecode/toolUseId';
+ 
++/** Parked client-tool calls, keyed by SDK `tool_use_id`, tagged with the owning client id. */
++export type ClientToolCallRegistry = PendingRequestRegistry<CallToolResult, string | undefined>;
++
+ /**
+  * Build the per-session in-process MCP server that surfaces the workbench
+  * client's {@link ToolDefinition}s to the Claude SDK via
+@@ -35,7 +39,7 @@ const TOOL_USE_ID_META_KEY = 'claudecode/toolUseId';
+  */
+ export async function buildClientToolMcpServer(
+ 	snapshot: readonly ToolDefinition[],
+-	awaitResult: (toolUseId: string) => Promise<CallToolResult>,
++	awaitResult: (toolUseId: string, toolName: string) => Promise<CallToolResult>,
+ 	sdk: IClaudeAgentSdkService
+ ): Promise<McpSdkServerConfigWithInstance> {
+ 	const tools = await Promise.all(snapshot.map(def => sdk.tool(
+@@ -53,7 +57,7 @@ export async function buildClientToolMcpServer(
+ 					isError: true,
+ 				};
+ 			}
+-			return awaitResult(toolUseId);
++			return awaitResult(toolUseId, def.name);
+ 		}
+ 	)));
+ 	return sdk.createSdkMcpServer({ name: CLAUDE_CLIENT_MCP_SERVER_NAME, tools });
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index 03fac7f948404..d3519c6f8c692 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -19,7 +19,7 @@ import { InMemoryFileSystemProvider } from '../../../files/common/inMemoryFilesy
+ import { InstantiationService } from '../../../instantiation/common/instantiationService.js';
+ import { ServiceCollection } from '../../../instantiation/common/serviceCollection.js';
+ import { ILogService, NullLogService } from '../../../log/common/log.js';
+-import { AgentSession, AgentSignal, IAgent, resolveSubagentChatParent, SubagentChatSignal, type IAgentChatContext } from '../../common/agent.js';
++import { AgentSession, AgentSignal, IAgent, resolveSubagentChatParent, SubagentChatSignal, type IAgentChatContext, type IAgentTurnDiagnosticSnapshot } from '../../common/agent.js';
+ import { buildDefaultChangesetCatalog } from '../../common/changesetUri.js';
+ import { readToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+ import { toAgentMergeMessageMeta } from '../../common/meta/agentMergeMessageMeta.js';
+@@ -4573,7 +4573,7 @@ suite('AgentSideEffects', () => {
+ 				'powershell auto-approves; bash stays rule-resolvable; missing language is neither');
+ 		});
+ 
+-		test('tool_ready is dropped when the tool completes while permission lookup is pending', async () => {
++		test('tool_ready is denied when the tool completes while permission lookup is pending', async () => {
+ 			setupSession();
+ 			startTurn('turn-1');
+ 			disposables.add(sideEffects.registerProgressListener(agent));
+@@ -4626,9 +4626,12 @@ suite('AgentSideEffects', () => {
+ 			assert.deepStrictEqual({
+ 				status: toolCall?.kind === ResponsePartKind.ToolCall ? toolCall.toolCall.status : undefined,
+ 				readyActions: envelopes.filter(e => e.action.type === ActionType.ChatToolCallReady).length,
++				// The SDK is parked inside `canUseTool`; dropping the ask would leak it forever.
++				permissionResponses: agent.respondToPermissionCalls,
+ 			}, {
+ 				status: ToolCallStatus.Completed,
+ 				readyActions: 1,
++				permissionResponses: [{ requestId: 'tc-stale-ready', approved: false }],
+ 			});
+ 		});
+ 
+@@ -7692,4 +7695,230 @@ suite('AgentSideEffects', () => {
+ 		});
+ 	});
+ 
++	// ---- abandoned turn reaper -------------------------------------------
++
++	suite('abandoned turn reaper', () => {
++
++		/** A provider snapshot for a turn whose SDK call already settled. */
++		function settledSnapshot(providerCallState: 'resolved' | 'rejected' | 'notStarted'): IAgentTurnDiagnosticSnapshot {
++			return {
++				state: 'available',
++				providerCallState,
++				providerTurnStarted: providerCallState !== 'notStarted',
++				providerSessionState: 'active',
++				callSettlesWithTurn: true,
++			};
++		}
++
++		function sendTurn(turnId: string): void {
++			const action: ChatAction = {
++				type: ActionType.ChatTurnStarted,
++				turnId,
++				startedAt: '2025-01-01T00:00:00.000Z',
++				message: { text: 'hello', origin: { kind: MessageKind.User } },
++			};
++			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
++			sideEffects.handleAction(defaultChatUri, action, 'test');
++		}
++
++		/** Waits for the send to resolve and for the post-send check to run. */
++		async function settleSend(): Promise<void> {
++			await waitForSendMessageCalls(1);
++			await timeout(0);
++		}
++
++		test('closes a turn whose completion the provider dropped', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('resolved');
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			const chatState = stateManager.getChatState(defaultChatUri);
++			assert.deepStrictEqual({
++				activeTurnId: chatState?.activeTurn?.id,
++				endedTurn: chatState?.turns.at(-1)?.id,
++				state: chatState?.turns.at(-1)?.state,
++			}, {
++				activeTurnId: undefined,
++				endedTurn: 'turn-1',
++				state: TurnState.Complete,
++			});
++		});
++
++		test('fails a turn whose provider call was rejected', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('rejected');
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			const endedTurn = stateManager.getChatState(defaultChatUri)?.turns.at(-1);
++			const errorPart = endedTurn?.responseParts.find(part => part.kind === ResponsePartKind.Error);
++			assert.deepStrictEqual({
++				state: endedTurn?.state,
++				errorType: errorPart?.kind === ResponsePartKind.Error ? errorPart.error.errorType : undefined,
++				resumable: errorPart?.kind === ResponsePartKind.Error ? errorPart.resumable : undefined,
++			}, {
++				state: TurnState.Error,
++				errorType: 'executionAbandoned',
++				resumable: undefined,
++			});
++		});
++
++		test('leaves a turn whose provider call is still pending', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => ({
++				state: 'available',
++				providerCallState: 'pending',
++				providerTurnStarted: true,
++				providerSessionState: 'active',
++				callSettlesWithTurn: true,
++			});
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			assert.strictEqual(stateManager.getActiveTurnId(defaultChatUri), 'turn-1');
++		});
++
++		test('leaves a turn alone for a provider whose send returns before the turn ends', async () => {
++			setupSession();
++			// Without `callSettlesWithTurn` a resolved call says nothing about the turn.
++			agent.getTurnDiagnosticSnapshot = () => ({
++				state: 'available',
++				providerCallState: 'resolved',
++				providerTurnStarted: true,
++				providerSessionState: 'active',
++			});
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			assert.strictEqual(stateManager.getActiveTurnId(defaultChatUri), 'turn-1');
++		});
++
++		test('leaves a turn alone when the provider reports no diagnostics', async () => {
++			setupSession();
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			assert.strictEqual(stateManager.getActiveTurnId(defaultChatUri), 'turn-1');
++		});
++
++		test('leaves a turn parked on a request the provider still tracks', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => ({
++				...settledSnapshot('resolved'),
++				pendingHostRequests: [{ kind: 'permission', id: 'tc-1' }],
++			});
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			assert.strictEqual(stateManager.getActiveTurnId(defaultChatUri), 'turn-1');
++		});
++
++		test('leaves a turn parked on a request the user can see in state', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('resolved');
++			disposables.add(agent.onDidSendMessage(() => {
++				stateManager.dispatchServerAction(defaultChatUri, {
++					type: ActionType.ChatInputRequested,
++					request: {
++						id: 'req-1',
++						questions: [{ kind: ChatInputQuestionKind.Text, id: 'question-1', message: 'Which value?' }],
++					},
++				});
++			}));
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			assert.strictEqual(stateManager.getActiveTurnId(defaultChatUri), 'turn-1');
++		});
++
++		test('a client cancellation racing the close ends the turn exactly once', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('resolved');
++			const terminals: string[] = [];
++			disposables.add(stateManager.onDidEmitEnvelope(e => {
++				if (e.action.type === ActionType.ChatTurnComplete || e.action.type === ActionType.ChatTurnCancelled || e.action.type === ActionType.ChatError) {
++					terminals.push(e.action.type);
++				}
++			}));
++			disposables.add(agent.onDidSendMessage(() => {
++				const cancel: ChatAction = { type: ActionType.ChatTurnCancelled, turnId: 'turn-1', duration: 5 };
++				stateManager.dispatchClientAction(defaultChatUri, cancel, { clientId: 'test', clientSeq: 2 });
++				sideEffects.handleAction(defaultChatUri, cancel, 'test');
++			}));
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			assert.deepStrictEqual({
++				terminals,
++				state: stateManager.getChatState(defaultChatUri)?.turns.at(-1)?.state,
++			}, {
++				terminals: [ActionType.ChatTurnCancelled],
++				state: TurnState.Cancelled,
++			});
++		});
++
++		test('ends a resolved subagent turn with its parent and keeps a live background spawn', () => {
++			setupSession();
++			startTurn('turn-1');
++			disposables.add(sideEffects.registerProgressListener(agent));
++
++			for (const toolCallId of ['tc-foreground', 'tc-background']) {
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallStart, turnId: 'turn-1',
++						toolCallId, toolName: 'task', displayName: 'Task', contributor: undefined,
++						_meta: { toolKind: 'subagent', language: undefined },
++					},
++				});
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallReady, turnId: 'turn-1',
++						toolCallId, invocationMessage: 'Delegating...', toolInput: undefined,
++						confirmed: ToolCallConfirmationReason.NotNeeded,
++					},
++				});
++				agent.fireProgress({
++					kind: 'subagent_started', chat: URI.parse(defaultChatUri),
++					toolCallId, agentName: 'reviewer', agentDisplayName: 'Reviewer',
++				});
++			}
++
++			// The foreground spawn's tool call finishes; the background one keeps running.
++			agent.fireProgress({
++				kind: 'action', resource: URI.parse(defaultChatUri),
++				action: {
++					type: ActionType.ChatToolCallComplete, turnId: 'turn-1',
++					toolCallId: 'tc-foreground', result: { success: true, pastTenseMessage: 'Reviewed' },
++				},
++			});
++			agent.fireProgress({
++				kind: 'action', resource: URI.parse(defaultChatUri),
++				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1 },
++			});
++
++			const foreground = buildSubagentChatUri(sessionUri.toString(), 'tc-foreground');
++			const background = buildSubagentChatUri(sessionUri.toString(), 'tc-background');
++			assert.deepStrictEqual({
++				foregroundActiveTurn: stateManager.getActiveTurnId(foreground),
++				foregroundState: stateManager.getChatState(foreground)?.turns.at(-1)?.state,
++				backgroundStillRunning: stateManager.getActiveTurnId(background) !== undefined,
++			}, {
++				foregroundActiveTurn: undefined,
++				foregroundState: TurnState.Complete,
++				backgroundStillRunning: true,
++			});
++		});
++	});
++
+ });
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 12ba500c5b771..f5efdac9ac2d6 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -45,7 +45,7 @@ import { IFileService } from '../../../files/common/files.js';
+ import { InMemoryFileSystemProvider } from '../../../files/common/inMemoryFilesystemProvider.js';
+ import { Schemas } from '../../../../base/common/network.js';
+ import { INativeEnvironmentService } from '../../../environment/common/environment.js';
+-import { AgentChatMigrationDeferred, IActiveClient, IAgent, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentCreateSessionConfig, IAgentCreateSessionResult, IAgentMaterializeChatEvent, IAgentSpawnChatEvent, AgentSession, AgentSignal, GITHUB_COPILOT_PROTECTED_RESOURCE } from '../../common/agent.js';
++import { AgentChatMigrationDeferred, IActiveClient, IAgent, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentCreateSessionConfig, IAgentCreateSessionResult, IAgentMaterializeChatEvent, IAgentSpawnChatEvent, AgentSession, AgentSignal, GITHUB_COPILOT_PROTECTED_RESOURCE, type IAgentTurnDiagnosticSnapshot } from '../../common/agent.js';
+ import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, AgentHostGitHubMcpServerEnabledConfigKey } from '../../common/agentHostSchema.js';
+ import { AgentHostConfigKey } from '../../common/agentHostCustomizationConfig.js';
+ import { AgentFeedbackAttachmentDisplayKind } from '../../common/meta/agentFeedbackAttachments.js';
+@@ -2284,7 +2284,7 @@ suite('ClaudeAgent', () => {
+ 			undefined,
+ 			undefined,
+ 			undefined,
+-			new PendingRequestRegistry<CallToolResult>(),
++			new PendingRequestRegistry<CallToolResult, string | undefined>(),
+ 			'default',
+ 			instantiationService,
+ 		));
+@@ -2310,7 +2310,7 @@ suite('ClaudeAgent', () => {
+ 			undefined,
+ 			undefined,
+ 			undefined,
+-			new PendingRequestRegistry<CallToolResult>(),
++			new PendingRequestRegistry<CallToolResult, string | undefined>(),
+ 			'default',
+ 			instantiationService,
+ 		));
+@@ -6838,7 +6838,7 @@ suite('ClaudeAgentSession (Phase 7 §3.2)', () => {
+ 			undefined,
+ 			undefined,
+ 			undefined,
+-			new PendingRequestRegistry<CallToolResult>(),
++			new PendingRequestRegistry<CallToolResult, string | undefined>(),
+ 			'default',
+ 			instantiationService,
+ 		));
+@@ -10169,7 +10169,7 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		await agent.chats.sendMessage(chat, 'additional', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
+ 		const additional = agent.getSessionForTesting(backingSession)!;
+ 		let settled = false;
+-		void additional.pendingClientToolCalls.register('tool-1').then(() => settled = true, () => undefined);
++		void additional.pendingClientToolCalls.register('tool-1', undefined).then(() => settled = true, () => undefined);
+ 
+ 		agent.onClientToolCallComplete(chat, 'tool-1', { success: true, pastTenseMessage: 'ran' });
+ 		await tick();
+@@ -11062,3 +11062,118 @@ suite('ClaudeAgent — host seams', () => {
+ });
+ 
+ // #endregion
++
++suite('ClaudeAgent turn diagnostics', () => {
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	/** The call facts the reaper reads. Session state is asserted separately. */
++	function facts(snapshot: IAgentTurnDiagnosticSnapshot): Record<string, unknown> {
++		return snapshot.state === 'available'
++			? {
++				providerCallState: snapshot.providerCallState,
++				providerTurnStarted: snapshot.providerTurnStarted,
++				callSettlesWithTurn: snapshot.callSettlesWithTurn,
++			}
++			: { state: snapshot.state };
++	}
++
++	function sessionState(snapshot: IAgentTurnDiagnosticSnapshot): string | undefined {
++		return snapshot.state === 'available' ? snapshot.providerSessionState : undefined;
++	}
++
++	test('reports the call pending while the turn is queued and resolved once the final result lands', async () => {
++		const ctx = createTestContext(disposables);
++		await ctx.agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(ctx.agent, { workingDirectories: [URI.file('/work-diagnostics')] });
++		const chat = defaultChatUri(created.session);
++
++		const turnActive = new DeferredPromise<void>();
++		const finishTurn = new DeferredPromise<void>();
++		ctx.sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++		ctx.sdk.queryAdvance = async index => {
++			if (index === 1) {
++				turnActive.complete();
++				await finishTurn.p;
++			}
++		};
++		const send = ctx.agent.chats.sendMessage(chat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
++		await turnActive.p;
++		const pending = ctx.agent.getTurnDiagnosticSnapshot(chat, 'turn-1', chatContext(chat));
++		finishTurn.complete();
++		await send;
++		const resolved = ctx.agent.getTurnDiagnosticSnapshot(chat, 'turn-1', chatContext(chat));
++
++		assert.deepStrictEqual([facts(pending), facts(resolved), sessionState(pending)], [
++			{ providerCallState: 'pending', providerTurnStarted: true, callSettlesWithTurn: true },
++			{ providerCallState: 'resolved', providerTurnStarted: true, callSettlesWithTurn: true },
++			'active',
++		]);
++	});
++
++	test('reports the call rejected after the turn is aborted', async () => {
++		const ctx = createTestContext(disposables);
++		await ctx.agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(ctx.agent, { workingDirectories: [URI.file('/work-diagnostics')] });
++		const chat = defaultChatUri(created.session);
++
++		const turnActive = new DeferredPromise<void>();
++		const finishTurn = new DeferredPromise<void>();
++		ctx.sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++		ctx.sdk.queryAdvance = async index => {
++			if (index === 1) {
++				turnActive.complete();
++				await finishTurn.p;
++			}
++		};
++		const send = ctx.agent.chats.sendMessage(chat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
++		await turnActive.p;
++		await ctx.agent.chats.abort(chat, chatContext(chat));
++		await assert.rejects(send);
++		const rejected = ctx.agent.getTurnDiagnosticSnapshot(chat, 'turn-1', chatContext(chat));
++		finishTurn.complete();
++
++		assert.deepStrictEqual({ ...facts(rejected), providerSessionState: sessionState(rejected) }, {
++			providerCallState: 'rejected',
++			providerTurnStarted: true,
++			providerSessionState: 'shutdown',
++			callSettlesWithTurn: true,
++		});
++	});
++
++	test('reports a chat it does not own as missing', async () => {
++		const ctx = createTestContext(disposables);
++		const unknown = defaultChatUri(AgentSession.uri('claude', 'never-created'));
++
++		assert.deepStrictEqual(ctx.agent.getTurnDiagnosticSnapshot(unknown, 'turn-1', chatContext(unknown)), { state: 'missingChat' });
++	});
++
++	test('removing an active client fails the client tool calls it left parked', async () => {
++		const ctx = createTestContext(disposables);
++		await ctx.agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(ctx.agent, { workingDirectories: [URI.file('/work-diagnostics')] });
++		const chat = defaultChatUri(created.session);
++		ctx.sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++		await ctx.agent.chats.sendMessage(chat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
++
++		const session = ctx.agent.getSessionForTesting(created.session)!;
++		ctx.agent.getOrCreateActiveClient(chat, chatContext(chat), { clientId: 'client-a' });
++		ctx.agent.getOrCreateActiveClient(chat, chatContext(chat), { clientId: 'client-b' });
++		let departed: CallToolResult | undefined;
++		let survivor: CallToolResult | undefined;
++		void session.pendingClientToolCalls.register('call-a', 'client-a').then(result => departed = result, () => undefined);
++		void session.pendingClientToolCalls.register('call-b', 'client-b').then(result => survivor = result, () => undefined);
++
++		ctx.agent.removeActiveClient(chat, chatContext(chat), 'client-a');
++		await tick();
++
++		assert.deepStrictEqual({
++			departedIsError: departed?.isError,
++			departedText: departed?.content.map(block => block.type),
++			survivorSettled: survivor !== undefined,
++		}, {
++			departedIsError: true,
++			departedText: ['text'],
++			survivorSettled: false,
++		});
++	});
++});
+
+From d24c72b21c08945cb9d5b150d0084c41e6822507 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 18:13:08 -0400
+Subject: [PATCH 2/2] agentHost: give every host-side turn close the full
+ terminal cleanup
+
+Follow-up to the abandoned-turn reaper, addressing four review findings.
+
+A host-synthesized terminal action bypassed the cleanup that the provider
+signal path runs, so closing an abandoned parent left its subagent chats with
+stranded active turns: the reaper was creating the condition it exists to
+clear. It also never dropped the turn's resumed-execution record, so repeated
+abandoned resumes retained usage and stopwatch data until channel teardown.
+Both now happen inside _endTurnFromHost, which every host-side close already
+goes through, rather than at a fourth call site. Resolved spawns are read
+before the dispatch because ending a turn force-cancels its running tool
+calls, which would otherwise make a live background spawn look resolved.
+
+Tagging a parked client tool call with its owning client left a hole: removing
+a client only marks the tool diff for the next send, so the SDK can still
+invoke an already-built tool whose client has gone. The owner lookup then
+returned undefined, the call parked under an owner no failClientToolCalls call
+could ever match, and the new diagnostics reported it as a pending host
+request forever, holding the turn open. Such a call is now answered with an
+MCP error instead of being parked. A result buffered before the handler ran
+still wins, so a mapper-side failure is not double-answered.
+
+The post-send check only ran when sendMessage fulfilled, so a turn the
+provider never took was reported as a generic send failure. The rejection path
+now consults the snapshot too. The line is whether the provider ever took the
+turn: notStarted means there is no provider-side story and the host reports the
+non-resumable executionAbandoned outcome, while a call the provider did take
+keeps its own error, which carries the real message and the decoded proxy
+error metadata that core renders.
+
+Still no wall-clock or quiet-time trigger, and a turn parked on a request that
+is visible in state or tracked by the provider is left alone on both paths.
+---
+ .../agentHost/node/agentSideEffects.ts        |  37 +++++-
+ .../agentHost/node/claude/claudeSdkOptions.ts |  12 +-
+ .../test/node/agentSideEffects.test.ts        | 125 ++++++++++++++++++
+ .../test/node/claudeSdkOptions.test.ts        |  84 +++++++++++-
+ 4 files changed, 254 insertions(+), 4 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index a2bf1ebe942ca..63e8efbf86f10 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -969,14 +969,19 @@ export class AgentSideEffects extends Disposable {
+ 		}
+ 		const sessionUri = isAhpChatChannel(channel) ? parseRequiredSessionUriFromChatUri(channel) : channel;
+ 		const clientContext = this._turnTracker.getClientTelemetryContext(channel, turnId);
++		// Ending a turn force-cancels its running tool calls, so read the spawns first.
++		const endingSubagents = this._resolvedSubagentSpawns(channel, turnId);
+ 		this._stateManager.dispatchServerAction(channel, action);
+ 		const reason = turnEndReasonFor(action);
+ 		const failure = reason.kind === 'error' ? { stage: 'provider' as const, error: reason.error } : undefined;
+ 		const ended = this._completeTurn(channel, turnId, turnResultFor(action), failure);
+ 		this._toolCallTracker.clearSession(channel);
++		this._resumedTurnExecutions.delete(this._resumedTurnExecutionKey(channel, turnId));
+ 		if (ended) {
+ 			this._chatContributions.turnEnd({ session: sessionUri, channel, turnId, reason, clientContext });
+ 		}
++		// A host-closed parent must clear its children, or the reaper strands them.
++		this._endSubagentTurns(endingSubagents, action);
+ 		return ended;
+ 	}
+ 
+@@ -1821,6 +1826,10 @@ export class AgentSideEffects extends Disposable {
+ 			await agent.chats.sendMessage(chatUri, contribution.message.text, resolvedWorkingDirectories, resolvedAttachments, turnId, senderClientId, clientContext.clientType, sendContext);
+ 			this._closeAbandonedTurn(agent, turnChannel, chatUri, turnId, sendContext, this._turnDuration(turnStopWatch));
+ 		} catch (err) {
++			if (this._closeNeverStartedTurn(agent, turnChannel, chatUri, turnId, this._chatContext(sessionChannel, chat), this._turnDuration(turnStopWatch))) {
++				this._failSessionCreationIfStillCreating(sessionChannel, abandonedTurnError());
++				return;
++			}
+ 			const failure = buildTurnFailure(failureStage, err);
+ 			const error = failure.error;
+ 			this._logService.error(`[AgentSideEffects] ${failureStage} failed for session=${turnChannel}: code=${failure.errorCode}, message=${error.message}, type=${failure.errorName}`, err);
+@@ -1869,8 +1878,28 @@ export class AgentSideEffects extends Disposable {
+ 			this._endTurnFromHost(channel, { type: ActionType.ChatTurnComplete, turnId, duration });
+ 			return;
+ 		}
+-		const error: ErrorInfo = { errorType: TURN_ABANDONED_ERROR_TYPE, message: 'The agent stopped without finishing this turn.' };
+-		this._endTurnFromHost(channel, { type: ActionType.ChatError, turnId, duration, part: createErrorResponsePart(error) });
++		this._endTurnFromHost(channel, { type: ActionType.ChatError, turnId, duration, part: createErrorResponsePart(abandonedTurnError()) });
++	}
++
++	/**
++	 * Closes a turn whose send rejected before the provider ever took it, so a
++	 * control-plane rejection is not reported as a provider send failure. A call
++	 * the provider did take keeps its own error, which is more specific than
++	 * anything the host can synthesize.
++	 */
++	private _closeNeverStartedTurn(agent: IAgent, channel: ProtocolURI, chat: URI, turnId: string, context: IAgentChatContext, duration: number): boolean {
++		if (this._stateManager.getActiveTurnId(channel) !== turnId) {
++			return false;
++		}
++		const snapshot = this._providerTurnDiagnostics(agent, chat, turnId, context);
++		if (snapshot?.state !== 'available' || !snapshot.callSettlesWithTurn || snapshot.providerCallState !== 'notStarted') {
++			return false;
++		}
++		if (snapshot.pendingHostRequests?.length || this._hasVisiblePendingRequest(channel)) {
++			return false;
++		}
++		this._logService.warn(`[AgentSideEffects] Closing turn ${turnId} on ${channel} that the provider never started`);
++		return this._endTurnFromHost(channel, { type: ActionType.ChatError, turnId, duration, part: createErrorResponsePart(abandonedTurnError()) });
+ 	}
+ 
+ 	private _providerTurnDiagnostics(agent: IAgent, chat: URI, turnId: string, context: IAgentChatContext): IAgentTurnDiagnosticSnapshot | undefined {
+@@ -2031,6 +2060,10 @@ function turnEndReasonFor(action: IHostTerminalTurnAction): TurnEndReason {
+ /** `ErrorInfo.errorType` for a turn the host closed because its producer went away. */
+ const TURN_ABANDONED_ERROR_TYPE = 'executionAbandoned';
+ 
++function abandonedTurnError(): ErrorInfo {
++	return { errorType: TURN_ABANDONED_ERROR_TYPE, message: 'The agent stopped without finishing this turn.' };
++}
++
+ /**
+  * Builds the {@link ErrorInfo} for a failed `sendMessage` rejection. When the
+  * rejection text carries a `VSCODE_PROXY_ERROR` marker (embedded by a model
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+index abc8a78b0b1be..c545cd361f276 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+@@ -226,7 +226,17 @@ export async function buildClientMcpServers(
+ 	if (tools.length === 0) {
+ 		return undefined;
+ 	}
+-	const server = await buildClientToolMcpServer(tools, (id, toolName) => registry.register(id, toolDiff.model.ownerOf(toolName)), sdkService);
++	const server = await buildClientToolMcpServer(tools, (id, toolName) => {
++		const owner = toolDiff.model.ownerOf(toolName);
++		// Removal only marks the diff for the next send, so this tool can still be called.
++		if (owner === undefined && !registry.hasBufferedResult(id)) {
++			return Promise.resolve({
++				content: [{ type: 'text', text: `Client tool "${toolName}" is unavailable: no connected client provides it.` }],
++				isError: true,
++			});
++		}
++		return registry.register(id, owner);
++	}, sdkService);
+ 	return { client: server };
+ }
+ 
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index d3519c6f8c692..ad35102baf84e 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -7919,6 +7919,131 @@ suite('AgentSideEffects', () => {
+ 				backgroundStillRunning: true,
+ 			});
+ 		});
++
++		test('closing an abandoned parent also ends its resolved subagent turns', async () => {
++			setupSession();
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('resolved');
++			disposables.add(sideEffects.registerProgressListener(agent));
++			disposables.add(agent.onDidSendMessage(() => {
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallStart, turnId: 'turn-1',
++						toolCallId: 'tc-1', toolName: 'task', displayName: 'Task', contributor: undefined,
++						_meta: { toolKind: 'subagent', language: undefined },
++					},
++				});
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallReady, turnId: 'turn-1',
++						toolCallId: 'tc-1', invocationMessage: 'Delegating...', toolInput: undefined,
++						confirmed: ToolCallConfirmationReason.NotNeeded,
++					},
++				});
++				agent.fireProgress({
++					kind: 'subagent_started', chat: URI.parse(defaultChatUri),
++					toolCallId: 'tc-1', agentName: 'reviewer', agentDisplayName: 'Reviewer',
++				});
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallComplete, turnId: 'turn-1',
++						toolCallId: 'tc-1', result: { success: true, pastTenseMessage: 'Reviewed' },
++					},
++				});
++			}));
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			const subagentUri = buildSubagentChatUri(sessionUri.toString(), 'tc-1');
++			assert.deepStrictEqual({
++				parentActiveTurn: stateManager.getActiveTurnId(defaultChatUri),
++				subagentActiveTurn: stateManager.getActiveTurnId(subagentUri),
++				subagentState: stateManager.getChatState(subagentUri)?.turns.at(-1)?.state,
++			}, {
++				parentActiveTurn: undefined,
++				subagentActiveTurn: undefined,
++				subagentState: TurnState.Complete,
++			});
++		});
++
++		test('closing an abandoned resumed turn drops its resumed execution record', async () => {
++			setupSession();
++			stateManager.dispatchServerAction(defaultChatUri, {
++				type: ActionType.ChatTurnStarted,
++				turnId: 'turn-1',
++				startedAt: '2025-01-01T00:00:00.000Z',
++				message: { text: 'hello', origin: { kind: MessageKind.User } },
++			});
++			stateManager.dispatchServerAction(defaultChatUri, {
++				type: ActionType.ChatError,
++				turnId: 'turn-1',
++				duration: 100,
++				part: createErrorResponsePart({ errorType: 'requestFailed', message: 'failed' }, true),
++			});
++			const resumedTurn = stateManager.getChatState(defaultChatUri)?.turns.at(-1);
++			assert.ok(resumedTurn);
++			stateManager.dispatchServerAction(defaultChatUri, { type: ActionType.ChatTurnResume, turnId: 'turn-1' });
++			agent.chats.resumeTurn = async () => { };
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('resolved');
++
++			sideEffects.handleAction(defaultChatUri, { type: ActionType.ChatTurnResume, turnId: 'turn-1' }, 'client-1', AgentHostClientType.EditorWindow, resumedTurn);
++			await timeout(0);
++
++			assert.deepStrictEqual({
++				activeTurnId: stateManager.getActiveTurnId(defaultChatUri),
++				state: stateManager.getChatState(defaultChatUri)?.turns.at(-1)?.state,
++				resumedExecution: sideEffects.getResumedTurnDuration(defaultChatUri, 'turn-1'),
++			}, {
++				activeTurnId: undefined,
++				state: TurnState.Complete,
++				resumedExecution: undefined,
++			});
++		});
++
++		test('a send that rejects before the provider took the turn is reported as abandoned', async () => {
++			setupSession();
++			agent.sendMessageError = new Error('rebind failed');
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('notStarted');
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			const endedTurn = stateManager.getChatState(defaultChatUri)?.turns.at(-1);
++			const errorPart = endedTurn?.responseParts.find(part => part.kind === ResponsePartKind.Error);
++			assert.deepStrictEqual({
++				state: endedTurn?.state,
++				errorType: errorPart?.kind === ResponsePartKind.Error ? errorPart.error.errorType : undefined,
++				resumable: errorPart?.kind === ResponsePartKind.Error ? errorPart.resumable : undefined,
++			}, {
++				state: TurnState.Error,
++				errorType: 'executionAbandoned',
++				resumable: undefined,
++			});
++		});
++
++		test('a genuine send failure keeps its own error even when the provider call was rejected', async () => {
++			setupSession();
++			agent.sendMessageError = new Error('model_not_supported');
++			agent.getTurnDiagnosticSnapshot = () => settledSnapshot('rejected');
++
++			sendTurn('turn-1');
++			await settleSend();
++
++			const endedTurn = stateManager.getChatState(defaultChatUri)?.turns.at(-1);
++			const errorPart = endedTurn?.responseParts.find(part => part.kind === ResponsePartKind.Error);
++			assert.deepStrictEqual({
++				state: endedTurn?.state,
++				errorType: errorPart?.kind === ResponsePartKind.Error ? errorPart.error.errorType : undefined,
++				keepsProviderMessage: errorPart?.kind === ResponsePartKind.Error ? errorPart.error.message.includes('model_not_supported') : false,
++			}, {
++				state: TurnState.Error,
++				errorType: 'sendFailed',
++				keepsProviderMessage: true,
++			});
++		});
+ 	});
+ 
+ });
+diff --git a/src/vs/platform/agentHost/test/node/claudeSdkOptions.test.ts b/src/vs/platform/agentHost/test/node/claudeSdkOptions.test.ts
+index 9fe3524a74003..75087243d25d5 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSdkOptions.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSdkOptions.test.ts
+@@ -6,7 +6,14 @@
+ import assert from 'assert';
+ import { URI } from '../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+-import { buildClaudeTelemetryEnv, buildOptions, buildSubprocessEnv, toClaudeMcpServers } from '../../node/claude/claudeSdkOptions.js';
++import { buildClaudeTelemetryEnv, buildClientMcpServers, buildOptions, buildSubprocessEnv, toClaudeMcpServers } from '../../node/claude/claudeSdkOptions.js';
++import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
++import type { McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-sdk';
++import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
++import type { ClientToolCallRegistry } from '../../node/claude/clientTools/claudeClientToolMcpServer.js';
++import { SessionClientToolsDiff } from '../../node/claude/clientTools/claudeSessionClientToolsModel.js';
++import type { IClaudeAgentSdkService } from '../../node/claude/claudeAgentSdkService.js';
++import type { ToolDefinition } from '../../common/state/protocol/state.js';
+ import type { ClaudeTransport, IClaudeProxyHandle } from '../../node/claude/claudeProxyService.js';
+ import { McpServerType } from '../../../mcp/common/mcpPlatformTypes.js';
+ import { CustomizationType, McpServerStatus, type McpServerCustomization } from '../../common/state/protocol/state.js';
+@@ -472,3 +479,78 @@ suite('claudeSdkOptions / buildOptions additionalDirectories projection', () =>
+ 		assert.strictEqual(opts.additionalDirectories, undefined);
+ 	});
+ });
++
++suite('claudeSdkOptions / buildClientMcpServers', () => {
++
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	function clientTool(name: string): ToolDefinition {
++		return { name, description: 'echoes', inputSchema: { type: 'object', properties: {} } };
++	}
++
++	function makeSdk(): { sdk: IClaudeAgentSdkService; recorded: { name: string; handler: (args: Record<string, unknown>, extra: unknown) => Promise<CallToolResult> }[] } {
++		const recorded: { name: string; handler: (args: Record<string, unknown>, extra: unknown) => Promise<CallToolResult> }[] = [];
++		const sdk = {
++			createSdkMcpServer: async (options: { name: string }) => ({ name: options.name, instance: {} } as unknown as McpSdkServerConfigWithInstance),
++			tool: async (name: string, _desc: string, _schema: unknown, handler: (args: Record<string, unknown>, extra: unknown) => Promise<CallToolResult>) => {
++				const entry = { name, handler };
++				recorded.push(entry);
++				return entry as unknown as ReturnType<IClaudeAgentSdkService['tool']>;
++			},
++		} as unknown as IClaudeAgentSdkService;
++		return { sdk, recorded };
++	}
++
++	const toolUseMeta = { _meta: { 'claudecode/toolUseId': 'call-1' } };
++
++	test('parks a call for a connected client and tags it with the owner', async () => {
++		const { sdk, recorded } = makeSdk();
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('client-a', [clientTool('echo')]);
++		const registry: ClientToolCallRegistry = new PendingRequestRegistry<CallToolResult, string | undefined>();
++
++		await buildClientMcpServers(diff, registry, sdk);
++		let settled = false;
++		void recorded[0].handler({}, toolUseMeta).then(() => settled = true, () => undefined);
++		await Promise.resolve();
++
++		assert.deepStrictEqual({ settled, parked: registry.has('call-1'), owner: registry.getMetadata('call-1') }, { settled: false, parked: true, owner: 'client-a' });
++		registry.respond('call-1', { content: [] });
++	});
++
++	test('fails a call whose client has gone rather than parking one nothing can answer', async () => {
++		const { sdk, recorded } = makeSdk();
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('client-a', [clientTool('echo')]);
++		const registry: ClientToolCallRegistry = new PendingRequestRegistry<CallToolResult, string | undefined>();
++
++		await buildClientMcpServers(diff, registry, sdk);
++		// The client leaves after the SDK already built this tool.
++		diff.model.removeClient('client-a');
++		const result = await recorded[0].handler({}, toolUseMeta);
++
++		assert.deepStrictEqual({
++			isError: result.isError,
++			parked: registry.has('call-1'),
++			mentionsTool: result.content.some(block => block.type === 'text' && block.text.includes('echo')),
++		}, {
++			isError: true,
++			parked: false,
++			mentionsTool: true,
++		});
++	});
++
++	test('still consumes a result buffered before the handler ran', async () => {
++		const { sdk, recorded } = makeSdk();
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('client-a', [clientTool('echo')]);
++		const registry: ClientToolCallRegistry = new PendingRequestRegistry<CallToolResult, string | undefined>();
++
++		await buildClientMcpServers(diff, registry, sdk);
++		diff.model.removeClient('client-a');
++		registry.respondOrBuffer('call-1', { content: [{ type: 'text', text: 'buffered' }], isError: true });
++		const result = await recorded[0].handler({}, toolUseMeta);
++
++		assert.deepStrictEqual(result.content, [{ type: 'text', text: 'buffered' }]);
++	});
++});

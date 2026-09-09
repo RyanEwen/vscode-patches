@@ -1,0 +1,189 @@
+From 94655798aedb452a2895ea55633278113317913b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 28 Aug 2026 10:58:17 -0400
+Subject: [PATCH] Render an embedded attachment that has no content type
+
+---
+ .../agentHost/common/state/sessionState.ts    | 17 ++++++++
+ .../node/codex/codexPromptResolver.ts         |  9 ++--
+ .../node/copilot/copilotAgentSession.ts       |  3 +-
+ .../agentHost/stateToProgressAdapter.ts       |  7 +--
+ .../stateToProgressAdapter.test.ts            | 43 ++++++++++++++++++-
+ 5 files changed, 70 insertions(+), 9 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/state/sessionState.ts b/src/vs/platform/agentHost/common/state/sessionState.ts
+index b9c01605ce92e..b92a4e4b78227 100644
+--- a/src/vs/platform/agentHost/common/state/sessionState.ts
++++ b/src/vs/platform/agentHost/common/state/sessionState.ts
+@@ -56,6 +56,23 @@ import {
+ 	type Message,
+ } from './protocol/state.js';
+ 
++/**
++ * Content type of an embedded attachment, falling back to what
++ * {@link MessageAttachmentBase.displayKind} already states when the field is
++ * absent.
++ *
++ * The protocol declares `contentType` as required and every current producer
++ * sets it, so this is not a protocol gap and deliberately does not relax the
++ * generated type. It guards persisted records written before that was true,
++ * which stay on disk for the life of the session and which no producer-side
++ * change can reach. The parameter is structural rather than
++ * `MessageEmbeddedResourceAttachment` precisely because it accepts a record
++ * that violates the declared type.
++ */
++export function embeddedAttachmentContentType(attachment: { contentType?: string; displayKind?: string }): string | undefined {
++	return attachment.contentType ?? (attachment.displayKind === 'image' ? 'image/png' : undefined);
++}
++
+ // Re-export everything from the protocol state module
+ export {
+ 	ChangesetOperationScope, ChangesetOperationStatus, ChangesetStatus, CustomizationLoadStatus,
+diff --git a/src/vs/platform/agentHost/node/codex/codexPromptResolver.ts b/src/vs/platform/agentHost/node/codex/codexPromptResolver.ts
+index a3263f5df0745..e5f0094404a96 100644
+--- a/src/vs/platform/agentHost/node/codex/codexPromptResolver.ts
++++ b/src/vs/platform/agentHost/node/codex/codexPromptResolver.ts
+@@ -8,7 +8,7 @@ import * as fs from 'fs';
+ import * as os from 'os';
+ import { join } from '../../../../base/common/path.js';
+ import { URI } from '../../../../base/common/uri.js';
+-import { MessageAttachmentKind, type MessageAttachment, type MessageEmbeddedResourceAttachment } from '../../common/state/sessionState.js';
++import { MessageAttachmentKind, embeddedAttachmentContentType, type MessageAttachment, type MessageEmbeddedResourceAttachment } from '../../common/state/sessionState.js';
+ import { isHostSnapshotAttachment } from '../../common/meta/agentSnapshotAttachmentMeta.js';
+ import type { UserInput } from './protocol/generated/v2/UserInput.js';
+ import type { TextElement } from './protocol/generated/v2/TextElement.js';
+@@ -89,8 +89,9 @@ export function resolveCodexInput(
+ 					break;
+ 				}
+ 				case MessageAttachmentKind.EmbeddedResource: {
+-					if (att.contentType.startsWith('image/')) {
+-						const ext = guessImageExtension(att.contentType);
++					const contentType = embeddedAttachmentContentType(att);
++					if (contentType?.startsWith('image/')) {
++						const ext = guessImageExtension(contentType);
+ 						const tmp = join(os.tmpdir(), `codex-img-${crypto.randomBytes(8).toString('hex')}${ext}`);
+ 						try {
+ 							fs.writeFileSync(tmp, Buffer.from(att.data, 'base64'));
+@@ -103,7 +104,7 @@ export function resolveCodexInput(
+ 						}
+ 						break;
+ 					}
+-					if (isTextualContentType(att.contentType)) {
++					if (contentType !== undefined && isTextualContentType(contentType)) {
+ 						// The client inlines the live text of an unsaved / dirty
+ 						// editor (or a selection within one) as a `text/plain`
+ 						// embedded resource. Decode it and inline it into the
+diff --git a/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts b/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts
+index 066f8ce816b23..46980dca2aee7 100644
+--- a/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts
++++ b/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts
+@@ -51,6 +51,7 @@ import { isHostSnapshotAttachment } from '../../common/meta/agentSnapshotAttachm
+ import { ISessionDatabase, ISessionDataService } from '../../common/sessionDataService.js';
+ import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
+ import { MessageAttachmentKind, ToolCallContributorKind, type FileEdit, type MessageAttachment, type ToolCallContributor } from '../../common/state/protocol/state.js';
++import { embeddedAttachmentContentType } from '../../common/state/sessionState.js';
+ import { ActionType, isChatAction, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
+ import { MessageKind, ResponsePartKind, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, ToolCallConfirmationReason, ToolCallRiskAssessmentKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ToolResultContentType, buildSubagentSessionUri, createErrorResponsePart, isSubagentSession, parseRequiredSessionUriFromChatUri, type Customization, type Message, type PendingMessage, type ChatInputAnswer, type ChatInputOption, type ChatInputQuestion, type ChatInputRequest, type ToolCallResult, type ToolResultContent, type ToolResultTerminalContent, type Turn, type ITurnTokenTotal, type UsageInfo, type UsageInfoMeta, type IContextAttributionData, type ISessionPromptCacheState } from '../../common/state/sessionState.js';
+ import { IAgentConfigurationService } from '../agentConfigurationService.js';
+@@ -2832,7 +2833,7 @@ export class CopilotAgentSession extends Disposable {
+ 			return undefined;
+ 		}
+ 		if (attachment.type === MessageAttachmentKind.EmbeddedResource) {
+-			return { type: 'blob' as const, data: attachment.data, mimeType: attachment.contentType, displayName: attachment.label };
++			return { type: 'blob' as const, data: attachment.data, mimeType: embeddedAttachmentContentType(attachment) ?? 'application/octet-stream', displayName: attachment.label };
+ 		}
+ 		if (attachment.type !== MessageAttachmentKind.Resource) {
+ 			return undefined;
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
+index 44352f6523e00..6f633f3acf603 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
+@@ -13,7 +13,7 @@ import { Schemas } from '../../../../../../base/common/network.js';
+ import { posix, win32 } from '../../../../../../base/common/path.js';
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { generateUuid } from '../../../../../../base/common/uuid.js';
+-import { buildSubagentChatUri, getTurnError, isMessageHiddenFromTranscript, MessageKind, parseChatUri, ToolCallCancellationReason, ToolCallContributorKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ResponsePartKind, getInlineToolInput, getToolFileEdits, getToolOutputText, getToolSubagentContent, hasReportedUsage, readUsageInfoMeta, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, type ActiveTurn, type ChatInputAnswer, type ChatInputRequest, type ICompletedToolCall, type InputRequestResponsePart, type Message, type TerminalCommandResult, type ToolCallPendingConfirmationState, type ToolCallState, type ToolResultSubagentContent, type Turn, FileEditKind, ToolResultContentType, type ToolResultContent, type UsageInfo, type UsageInfoMeta } from '../../../../../../platform/agentHost/common/state/sessionState.js';
++import { buildSubagentChatUri, getTurnError, isMessageHiddenFromTranscript, MessageKind, parseChatUri, ToolCallCancellationReason, ToolCallContributorKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ResponsePartKind, getInlineToolInput, getToolFileEdits, getToolOutputText, getToolSubagentContent, hasReportedUsage, readUsageInfoMeta, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, FileEditKind, ToolResultContentType, embeddedAttachmentContentType, type ActiveTurn, type ChatInputAnswer, type ChatInputRequest, type ICompletedToolCall, type InputRequestResponsePart, type Message, type TerminalCommandResult, type ToolCallPendingConfirmationState, type ToolCallState, type ToolResultSubagentContent, type Turn, type ToolResultContent, type UsageInfo, type UsageInfoMeta } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+ import type { ChatInputRequestWithPlanReview, IAgentHostPlanReview } from '../../../../../../platform/agentHost/common/agentHostPlanReview.js';
+ import { getToolKind } from '../../../../../../platform/agentHost/common/state/sessionReducers.js';
+ import { readToolCallMeta } from '../../../../../../platform/agentHost/common/meta/agentToolCallMeta.js';
+@@ -1208,7 +1208,8 @@ function messageAttachmentToVariableEntry(attachment: MessageAttachment, connect
+ 	}
+ 
+ 	if (attachment.type === MessageAttachmentKind.EmbeddedResource) {
+-		if (!attachment.contentType.startsWith('image/')) {
++		const contentType = embeddedAttachmentContentType(attachment);
++		if (!contentType?.startsWith('image/')) {
+ 			return {
+ 				kind: 'generic',
+ 				id: generateUuid(),
+@@ -1223,7 +1224,7 @@ function messageAttachmentToVariableEntry(attachment: MessageAttachment, connect
+ 			id: generateUuid(),
+ 			name: attachment.label || 'image',
+ 			value: decodeBase64(attachment.data).buffer,
+-			mimeType: attachment.contentType,
++			mimeType: contentType,
+ 			isURL: false,
+ 			_meta: attachment._meta,
+ 		};
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
+index b36d0e1d72e88..e226ff42876e8 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
+@@ -15,7 +15,7 @@ import { toAgentMessageDelegationMeta } from '../../../../../../platform/agentHo
+ import { AgentSystemNotificationKind, AgentSystemNotificationSeverity, toAgentSystemNotificationMeta } from '../../../../../../platform/agentHost/common/meta/agentSystemNotificationMeta.js';
+ import { McpAuthRequiredReason } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+ import { createAgentHostResourceUriMapper, fromAgentHostUri, toAgentHostContentUri } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+-import { buildSubagentChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageAttachmentKind, MessageKind, ToolCallContributorKind, ToolCallRiskAssessmentKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ToolCallConfirmationReason, ToolResultContentType, TurnState, ResponsePartKind, readUsageInfoMeta, withMessageHiddenFromTranscript, type ActiveTurn, type ICompletedToolCall, type ToolCallPendingConfirmationState, type ToolCallRunningState, type Turn, type ToolCallResponsePart, ToolCallCancellationReason, type Message, type ToolResultContent } from '../../../../../../platform/agentHost/common/state/sessionState.js';
++import { buildSubagentChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, createErrorResponsePart, MessageAttachmentKind, MessageKind, ToolCallContributorKind, ToolCallRiskAssessmentKind, ToolCallRiskAssessmentStatus, ToolCallStatus, ToolCallConfirmationReason, ToolResultContentType, TurnState, ResponsePartKind, readUsageInfoMeta, withMessageHiddenFromTranscript, ToolCallCancellationReason, type ActiveTurn, type ICompletedToolCall, type ToolCallPendingConfirmationState, type ToolCallRunningState, type Turn, type ToolCallResponsePart, type Message, type ToolResultContent, type MessageEmbeddedResourceAttachment } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+ import { ChatTranscriptContextAttachmentDisplayKind, IChatRequestTranscriptContextVariableEntry, toChatTranscriptContextAttachmentMeta } from '../../../common/attachments/chatVariableEntries.js';
+ import { ChatRequestOriginKind } from '../../../common/chatRequestOrigin.js';
+ import { IChatToolInvocation, IChatToolInvocationSerialized, ToolConfirmKind, type IChatMarkdownContent, type IChatTerminalToolInvocationData, type IChatThinkingPart, type IChatUsage } from '../../../common/chatService/chatService.js';
+@@ -132,6 +132,47 @@ suite('stateToProgressAdapter', () => {
+ 
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+ 
++	suite('embedded attachments without a content type', () => {
++
++		// A pasted image persisted with no `contentType`. Reading it unguarded
++		// threw, so the attachment rendered as a broken image.
++		//
++		// The protocol declares `contentType` required and every current producer
++		// sets it, so this record is only expressible by asserting past the
++		// declared type. That is exactly what it is: a record written by an older
++		// build, still on disk, that the type system says cannot exist.
++		const pastedImage = {
++			type: MessageAttachmentKind.EmbeddedResource,
++			label: 'Pasted Image',
++			displayKind: 'image',
++			data: 'iVBORw0KGgo=',
++		} as unknown as MessageEmbeddedResourceAttachment;
++
++		test('an image attachment with no content type still restores as an image', () => {
++			const restored = messageAttachmentsToVariableData([pastedImage], 'local')?.variables[0];
++
++			assert.strictEqual(restored?.kind, 'image');
++			assert.strictEqual(restored?.name, 'Pasted Image');
++		});
++
++		test('a declared content type still wins', () => {
++			const restored = messageAttachmentsToVariableData([{ ...pastedImage, contentType: 'image/gif' }], 'local')?.variables[0];
++
++			assert.ok(restored?.kind === 'image');
++			assert.strictEqual(restored.mimeType, 'image/gif');
++		});
++
++		test('a non-image attachment with no content type restores as generic, not as an image', () => {
++			const restored = messageAttachmentsToVariableData([{
++				type: MessageAttachmentKind.EmbeddedResource,
++				label: 'notes.txt',
++				data: 'aGVsbG8=',
++			} as unknown as MessageEmbeddedResourceAttachment], 'local')?.variables[0];
++
++			assert.strictEqual(restored?.kind, 'generic');
++		});
++	});
++
+ 	test('detects the canonical automatic reply answer', () => {
+ 		assert.deepStrictEqual([
+ 			containsAutomaticReplyAnswer({

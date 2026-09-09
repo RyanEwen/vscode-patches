@@ -1,0 +1,18 @@
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),{execFileSync}=require('node:child_process');
+const root=path.resolve(__dirname,'..');
+const catalog=JSON.parse(fs.readFileSync(path.join(root,'catalog.json'),'utf8'));
+const files=[];
+function walk(dir){for(const d of fs.readdirSync(dir,{withFileTypes:true})){if(d.name==='.git'||d.name.startsWith('backup'))continue;const p=path.join(dir,d.name);if(d.isDirectory())walk(p);else files.push(p);}}walk(root);
+let syntax=0;
+for(const f of files){
+ const data=fs.readFileSync(f,'utf8');
+ const secretPatterns=[/gh[pousr]_[A-Za-z0-9]{30,}/,/github_pat_[A-Za-z0-9_]{40,}/,/sk-(?:ant|proj)-[A-Za-z0-9_-]{25,}/,/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/];
+ assert(!secretPatterns.some(r=>r.test(data)),'Potential credential in '+path.relative(root,f));
+ if(/\.(?:mjs|cjs)$/.test(f)) {execFileSync(process.execPath,['--check',f],{stdio:'pipe'});syntax++;}
+ if(f.includes('patcher-snapshots')) {execFileSync(process.execPath,['--input-type=module','--check'],{input:data,stdio:['pipe','pipe','pipe']});syntax++;}
+}
+assert.equal(new Set(catalog.fixes.map(f=>f.id)).size,catalog.fixes.length);
+for(const p of catalog.prs){const f=path.join(root,'source-patches',p.repo.split('/')[1],p.number+'.patch');assert(fs.readFileSync(f,'utf8').includes('diff --git'),'Missing patch '+p.url);assert(fs.existsSync(path.join(root,'docs/patches',p.repo.split('/')[1]+'-'+p.number+'.md')));}
+const listed=JSON.parse(execFileSync(process.execPath,[path.join(root,'patch-vscode-fixes.mjs'),'--list'],{encoding:'utf8'}));
+assert.deepEqual(listed,catalog.fixes.map(({id,target,title})=>({id,target,title})));
+console.log(`PASS: ${syntax} JavaScript files/snapshots parse; ${catalog.fixes.length} unique catalog entries; ${catalog.prs.length} source patches and detail pages; known-secret scan clean.`);

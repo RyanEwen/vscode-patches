@@ -1,0 +1,117 @@
+From 50252f1ad7c42155f0503adac60c0dd20e756461 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 14:53:47 -0400
+Subject: [PATCH 1/2] Surface a client tool's error when it returns no content
+
+A client tool can report a failure as an `error` alone with no content:
+the workbench builds exactly that shape whenever the tool throws, so a
+browser call that fails to navigate arrives as
+`{success: false, error: {message}}` and nothing else.
+
+`convertToolCallResult` read only `content`, so that became
+`{content: [], isError: true}`. The model was handed an empty tool
+result with no indication of what went wrong, and the reason for the
+failure was dropped on the floor.
+
+Use the error message as the content when the tool supplied none. Tools
+that already describe the failure in `content` keep their own, so no
+message is duplicated.
+---
+ .../clientTools/claudeClientToolResult.ts     |  8 +++++++
+ .../claudeClientToolResult.test.ts            | 21 +++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts
+index fc0de3cd51045..f3d0c0455b789 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts
+@@ -35,6 +35,14 @@ const CLAUDE_CLIENT_RESOURCE_SCHEME = 'claude-client';
+ export function convertToolCallResult(result: ToolCallResult, toolUseId: string): CallToolResult {
+ 	const blocks = result.content ?? [];
+ 	const content = blocks.map((block, index) => convertBlock(block, toolUseId, index));
++	// A tool can report a failure as an `error` alone, with no content: the
++	// workbench builds that shape whenever a client tool throws. Passing it
++	// straight through would hand the model an empty result and no hint that
++	// anything went wrong, so surface the message as the content it lacks.
++	// Tools that already describe the failure in `content` keep theirs.
++	if (result.error && content.length === 0) {
++		content.push({ type: 'text', text: result.error.message });
++	}
+ 	const out: CallToolResult = { content };
+ 	if (result.structuredContent !== undefined) {
+ 		out.structuredContent = result.structuredContent;
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts
+index d4f8314befe90..799e470f170cf 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts
+@@ -88,6 +88,27 @@ suite('claudeClientToolResult / convertToolCallResult', () => {
+ 		}
+ 	});
+ 
++	test('an error-only failure surfaces the message as content instead of an empty result', () => {
++		// The workbench builds this shape whenever a client tool throws: an error
++		// and nothing else. An empty result tells the model nothing went wrong.
++		const errorOnly = convertToolCallResult(makeResult({
++			success: false,
++			error: { message: 'page.goto: net::ERR_EMPTY_RESPONSE at http://localhost:5173/' },
++		}), 'tu_7');
++
++		// A tool that already described the failure keeps its own content.
++		const withContent = convertToolCallResult(makeResult({
++			success: false,
++			content: [{ type: ToolResultContentType.Text, text: 'No browser page found' }],
++			error: { message: 'No browser page found' },
++		}), 'tu_8');
++
++		assert.deepStrictEqual({ errorOnly: errorOnly.content, withContent: withContent.content }, {
++			errorOnly: [{ type: 'text', text: 'page.goto: net::ERR_EMPTY_RESPONSE at http://localhost:5173/' }],
++			withContent: [{ type: 'text', text: 'No browser page found' }],
++		});
++	});
++
+ 	test('structuredContent passes through unchanged', () => {
+ 		const out = convertToolCallResult(makeResult({
+ 			structuredContent: { k: 'v' },
+
+From 9c59614693e0711c4283f64cb55381ee271d9ccb Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 17:02:40 -0400
+Subject: [PATCH 2/2] Make comments accurate: only the failure reason was
+ missing, not the failure itself
+
+---
+ .../node/claude/clientTools/claudeClientToolResult.ts       | 6 +-----
+ .../test/node/clientTools/claudeClientToolResult.test.ts    | 3 +--
+ 2 files changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts
+index f3d0c0455b789..fc45ecde9e875 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolResult.ts
+@@ -35,11 +35,7 @@ const CLAUDE_CLIENT_RESOURCE_SCHEME = 'claude-client';
+ export function convertToolCallResult(result: ToolCallResult, toolUseId: string): CallToolResult {
+ 	const blocks = result.content ?? [];
+ 	const content = blocks.map((block, index) => convertBlock(block, toolUseId, index));
+-	// A tool can report a failure as an `error` alone, with no content: the
+-	// workbench builds that shape whenever a client tool throws. Passing it
+-	// straight through would hand the model an empty result and no hint that
+-	// anything went wrong, so surface the message as the content it lacks.
+-	// Tools that already describe the failure in `content` keep theirs.
++	// `isError` below already marks the failure; without this the model would not learn why it failed.
+ 	if (result.error && content.length === 0) {
+ 		content.push({ type: 'text', text: result.error.message });
+ 	}
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts
+index 799e470f170cf..90326d514d122 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolResult.test.ts
+@@ -89,8 +89,7 @@ suite('claudeClientToolResult / convertToolCallResult', () => {
+ 	});
+ 
+ 	test('an error-only failure surfaces the message as content instead of an empty result', () => {
+-		// The workbench builds this shape whenever a client tool throws: an error
+-		// and nothing else. An empty result tells the model nothing went wrong.
++		// An error-only result still carries `isError`, but without content the model never learns the reason.
+ 		const errorOnly = convertToolCallResult(makeResult({
+ 			success: false,
+ 			error: { message: 'page.goto: net::ERR_EMPTY_RESPONSE at http://localhost:5173/' },

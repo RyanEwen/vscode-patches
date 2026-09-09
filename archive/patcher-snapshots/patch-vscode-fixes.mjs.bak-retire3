@@ -1,0 +1,2555 @@
+#!/usr/bin/env node
+/**
+ * Re-apply the local VS Code agent-host fixes to an INSTALLED VS Code, so they
+ * survive a VS Code update without another debugging session.
+ *
+ * A VS Code update replaces both bundles and silently drops every fix here.
+ * Symptoms, in the order they tend to be noticed: sessions stop listing in
+ * remote windows, deleting a session stops sticking, browser-tool turns hang.
+ *
+ * Two bundles are patched, because the code runs in two places:
+ *
+ *   workbench  the client. For a remote window this is the LOCAL install
+ *              (Windows), not the container.
+ *                resources/app/out/vs/workbench/workbench.desktop.main.js
+ *   agenthost  the agent host. For a dev container this runs INSIDE the
+ *              container, from the shared `vscode` docker volume, so one
+ *              patch covers every dev container on that server commit.
+ *                /vscode/vscode-server/bin/<arch>/<commit>/out/vs/platform/
+ *                agentHost/node/agentHostMain.js
+ *
+ * Usage:
+ *   node patch-vscode-fixes.mjs --status
+ *   node patch-vscode-fixes.mjs --apply
+ *   node patch-vscode-fixes.mjs --revert
+ *   node patch-vscode-fixes.mjs --apply --only session-delete,replay-drive
+ *   node patch-vscode-fixes.mjs --apply --target "<path to a bundle>"
+ *
+ * Restart VS Code fully afterwards (not Reload Window): the container's server
+ * survives a reload, so only a container restart picks up an agenthost change.
+ * Expect a "Your Code installation appears to be corrupt" banner: that is the
+ * checksum notice for a modified bundle, dismissible and harmless.
+ *
+ * Every fix matches on structure and reuses whatever names the build chose,
+ * because minified identifiers differ per build. Each must match exactly once
+ * or it is skipped, so this fails closed rather than doing anything fuzzy to a
+ * multi-megabyte bundle.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+
+const BACKUP_SUFFIX = '.vscodefix-orig';
+const VOLUME = 'vscode';
+const VOLUME_GLOB = '/vscode/vscode-server/bin/*/*/out/vs/platform/agentHost/node/agentHostMain.js';
+
+/**
+ * Pick a local variable name for injected code that cannot collide with any
+ * identifier the minifier already chose at that site.
+ */
+function pickName(taken) {
+	for (const name of ['L', 'q', 'z', 'j', 'Z', '_nf']) {
+		if (!taken.includes(name)) { return name; }
+	}
+	throw new Error('no free identifier');
+}
+
+const FIXES = [
+	{
+		id: 'client-tool-input-schema',
+		target: 'workbench',
+		title: 'a client tool runs with empty input when its arguments never streamed',
+		// A call whose arguments never streamed arrives with no `toolInput`, which
+		// `resolveToolInput` turns into `{}`, indistinguishable from a genuine empty
+		// argument set. The browser tools then prepare with `pageId` undefined and
+		// throw, though all nine declare it required. Check the parsed parameters
+		// against the tool's own schema at the single invocation point instead.
+		// Re-anchored for 1.133.x: upstream inserted an `invocationFailed` branch and
+		// made the tool input an awaited read, which widened the gap. Upstream still
+		// does not check required properties, so this entry is still doing work.
+		unpatched: /if\(!(\w+)\)\{(\w+)\(\w+\(\d+,null,(\w+)\),"toolUnavailable"\);return\}[\s\S]{0,700}?let (\w+);try\{let \w+=JSON\.parse\([\s\S]{0,220}?"invalidInput"\);return\}/,
+		patched: /_mreq\.length&&/,
+		build: (m, toolData, fail, toolName, params) =>
+			m
+			+ `let _mreq=${toolData}.inputSchema&&${toolData}.inputSchema.type==="object"&&${toolData}.inputSchema.required`
+			+ `?${toolData}.inputSchema.required.filter(k=>${params}[k]===void 0):[];`
+			+ `if(_mreq.length&&(${fail}('Invalid tool input for "'+${toolName}+'": missing required '+_mreq.join(", "),"invalidInput"),1))return;`,
+	},
+	{
+		id: 'tool-dedupe',
+		target: 'workbench',
+		title: 'client tools invoked twice, hanging the turn',
+		// Every client tool gets two ChatToolCallReady events: one from the
+		// permission flow and one from the stream mapper on content_block_stop.
+		// The existing guard is armed inside markInvocationStarted, which runs
+		// after an await, so both readies clear it before either arms it. Arming
+		// it synchronously as execution starts makes the second a no-op.
+		// Re-anchored for 1.133.x: `_executeClientTool` gained arguments and an
+		// `activeAttempts` counter now sits between the clear and the call. The guard
+		// is still armed in the post-await callback, so the defect is unchanged.
+		unpatched: /(let (\w+)=(\w+)=>\{(\w+)=(\w+),(\w+)\.clear\(\);)(let [\s\S]{0,300}?this\._executeClientTool\([\s\S]{0,300}?\(\w+=!0,(\w+)\.add\((\w+)\)\)\})/,
+		patched: /\.clear\(\);(\w+)\.add\((\w+)\);let /,
+		build: (m, prefix, fnName, param, assigned, req, store, rest, guardSet, key) =>
+			`${prefix}${guardSet}.add(${key});${rest}`,
+	},
+	{
+		id: 'session-list',
+		target: 'workbench',
+		title: 'sessions never list in remote windows',
+		// A dev-container window listed no sessions at all. The host reports each
+		// session's working directories wrapped for the agent-host filesystem
+		// (`vscode-agent-host://b64-<host address>/workspace/printstream`), while
+		// the window's folder is `vscode-remote://dev-container+<hex>/...`.
+		// `isEqualOrParent` gates on the scheme before anything else, so the two
+		// never match and the whole list is filtered out. Reported as #330979.
+		//
+		// The wrapper carries the original URI in its `_ah` query, and unwrapping
+		// it here yields the very `vscode-remote:` URI the window uses for that
+		// folder, so the comparison is exact rather than assumed. Measured in a
+		// live window: the unwrapped authority equals the folder's, byte for byte.
+		//
+		// Two earlier revisions are recorded so they are not retried. Normalising
+		// both sides to `file:` with an empty authority lists the sessions, but
+		// compares paths alone, so two different remotes exposing the same path
+		// would match. Lifting a `file:` directory into the folder's namespace
+		// filtered every session out, and this is why: the reported directory is
+		// not `file:` at all, so that rewrite never fired. The namespace lift is
+		// kept as the fallback for a host that does report a bare `file:` path.
+		//
+		// The unwrap is what made this offerable upstream, since it no longer
+		// assumes the window's remote is the session's host. Mirrors #331349.
+		//
+		// The optional clause matches both earlier revisions as well as the
+		// upstream form, so an already-patched bundle upgrades in place. That
+		// matters because the `.vscodefix-orig` backup here is not pristine.
+		unpatched: /_matchesAnyFolder\((\w+),(\w+)\)\{(?:const (\w+)=(\w+)=>\4\.scheme==="file"\?\4:\4\.with\(\{scheme:"file",authority:"",query:"",fragment:""\}\);)?return \1\.some\((\w+)=>\2\.some\((\w+)=>(\w+)\.isEqualOrParent\((?:\3\()?\5\)?,(?:\3\()?\6\.uri\)?\)\)\)\}/,
+		patched: /_matchesAnyFolder\(\w+,\w+\)\{const \w+=\(\w+,\w+\)=>/,
+		build: (...args) => {
+			const src = args[args.length - 1];
+			const [, dirs, folders, fn, fnArg, dir, folder, uriNs] = args;
+			// The agent-host URI decoder, located by shape so the minifier is free
+			// to rename it. Reused rather than reimplemented: it owns the `_ah`
+			// encoding, and a copy here would drift from it silently.
+			// The second alternative covers 1.136.0, where the query read moved into a helper.
+			const decoder = src.match(/function (\w+)\((\w+)\)\{if\(\2\.scheme!==\w+\)return \2;let (?:\w+,\w+=\2\.query\?new URLSearchParams\(\2\.query\)\.get\(|(\w+)=\w+\(\2\);return!\3\|\|typeof \3\.scheme!="string"\?)/);
+			if (!decoder) { throw new Error('session-list: agent-host URI decoder not found'); }
+			const taken = [dirs, folders, fn, fnArg, dir, folder, uriNs, decoder[1]].filter(Boolean);
+			const ns = pickName(taken);
+			const d = pickName([...taken, ns]);
+			const f = pickName([...taken, ns, d]);
+			return `_matchesAnyFolder(${dirs},${folders}){`
+				+ `const ${ns}=(${d},${f})=>${d}.scheme==="file"&&${f}.scheme!=="file"&&${f}.authority?`
+				+ `${f}.with({path:${d}.path,query:null,fragment:null}):${d};`
+				+ `return ${dirs}.some(${dir}=>${folders}.some(${folder}=>`
+				+ `${uriNs}.isEqualOrParent(${ns}(${decoder[1]}(${dir}),${folder}.uri),${folder}.uri)))}`;
+		},
+	},
+	{
+		id: 'embedded-attachment-content-type',
+		target: 'workbench',
+		title: 'a pasted image renders as a broken thumbnail',
+		// An embedded attachment is persisted without a `contentType`, and the
+		// restore path reads `.contentType.startsWith('image/')` straight off it,
+		// so the read throws and the attachment never renders.
+		//
+		// Measured in a real session: the stored record is
+		// `{"type":"embeddedResource","label":"Pasted Image","displayKind":"image","data":"..."}`
+		// with no `contentType` key anywhere in the database. The Windows-style
+		// path in the hover was a red herring: that is just the label formatter
+		// rendering a remote path on a Windows client.
+		//
+		// `displayKind` already says it is an image, so the type is inferred from
+		// it rather than guessed. A non-image with no content type falls through to
+		// the generic branch instead of being treated as an image.
+		//
+		// Current producers all default the field, so NEW pastes were never
+		// affected; this repairs attachments already on disk. Mirrors
+		// microsoft/vscode#331556.
+		unpatched: /if\((\w+)\.type==="embeddedResource"\)return \1\.contentType\.startsWith\("image\/"\)\?\{kind:"image",id:(\w+)\(\),name:\1\.label\|\|"image",value:(\w+)\(\1\.data\)\.buffer,mimeType:\1\.contentType,isURL:!1/,
+		patched: /\?\?\(\w+\.displayKind==="image"\?"image\/png"/,
+		build: (m, att, uuid, decode) =>
+			`if(${att}.type==="embeddedResource")return `
+			+ `(${att}.contentType??(${att}.displayKind==="image"?"image/png":"")).startsWith("image/")`
+			+ `?{kind:"image",id:${uuid}(),name:${att}.label||"image",value:${decode}(${att}.data).buffer,`
+			+ `mimeType:${att}.contentType??"image/png",isURL:!1`,
+	},
+	{
+		id: 'client-tool-buffer',
+		target: 'agenthost',
+		title: 'a client tool result is dropped when it arrives before the SDK asks for it',
+		// The workbench runs a client tool off the stream-mapper ready and completes
+		// it in milliseconds, before the SDK has invoked the tool and registered its
+		// handler. `respond` discards a result nothing is waiting for, so when the
+		// SDK registers moments later it waits forever and the turn never finishes.
+		// Copilot already uses `respondOrBuffer` here; this brings Claude in line.
+		// Verified live: the buffered result is collected ~1.5s later and the turn
+		// continues, in auto mode, which never once completed before.
+		unpatched: /completeClientToolCall\(([\w$]+),([\w$]+)\)\{let ([\w$]+)=([\w$]+)\(\2,\1\);return this\._pendingClientToolCalls\.respond\(\1,\3\)\}/,
+		patched: /completeClientToolCall\([\s\S]{0,200}?_pendingClientToolCalls\.respondOrBuffer\(/,
+		build: (m, toolCallId, result, converted, convertFn) => {
+			const held = pickName([toolCallId, result, converted, convertFn]);
+			return `completeClientToolCall(${toolCallId},${result}){`
+				+ `let ${converted}=${convertFn}(${result},${toolCallId}),`
+				+ `${held}=this._pendingClientToolCalls.respond(${toolCallId},${converted});`
+				+ `${held}||this._pendingClientToolCalls.respondOrBuffer(${toolCallId},${converted});`
+				+ `return ${held}}`;
+		},
+	},
+	{
+		id: 'client-tool-error',
+		target: 'agenthost',
+		title: 'a client tool error reaches the model as an empty result',
+		// A client tool that throws is reported as an `error` with no content, and
+		// only `content` was read, so the model got `{content: [], isError: true}`:
+		// told that something failed but never what.
+		unpatched: /function ([\w$]+)\(([\w$]+),([\w$]+)\)\{let ([\w$]+)=\{content:\(\2\.content\?\?\[\]\)\.map\(\(([\w$]+),([\w$]+)\)=>([\w$]+)\(\5,\3,\6\)\)\};return \2\.structuredContent!==void 0&&\(\4\.structuredContent=\2\.structuredContent\),\(!\2\.success\|\|\2\.error\)&&\(\4\.isError=!0\),\4\}/,
+		patched: /\.error&&\w+\.length===0&&\w+\.push\(\{type:"text",text:\w+\.error\.message\}\)/,
+		build: (m, fn, result, toolUseId, out, block, index, convertBlock) => {
+			const arr = pickName([fn, result, toolUseId, out, block, index, convertBlock]);
+			return `function ${fn}(${result},${toolUseId}){`
+				+ `let ${arr}=(${result}.content??[]).map((${block},${index})=>${convertBlock}(${block},${toolUseId},${index}));`
+				+ `${result}.error&&${arr}.length===0&&${arr}.push({type:"text",text:${result}.error.message});`
+				+ `let ${out}={content:${arr}};`
+				+ `return ${result}.structuredContent!==void 0&&(${out}.structuredContent=${result}.structuredContent),`
+				+ `(!${result}.success||${result}.error)&&(${out}.isError=!0),${out}}`;
+		},
+	},
+	// The next five edits together implement the replayed-client-tool guard
+	// (upstream: the client_tool_invoked signal PR). An SDK resume can replay a
+	// transcript-dangling tool_use without streaming anything, so no client
+	// execution is ever requested and the turn heartbeats forever. Each edit is
+	// inert without the others (the router falls back to register), so partial
+	// application after a VS Code update degrades to the unpatched behavior.
+	{
+		id: 'replay-args',
+		target: 'agenthost',
+		title: 'client tool MCP handler forwards tool name and args',
+		// The handler only forwards the tool_use_id, so the replay path cannot tell
+		// which tool was invoked or with what. Forward the name and arguments too.
+		//
+		// Every identifier is captured, never hardcoded. The 1.133.x minifier
+		// swapped the roles of the two names this previously assumed, so the patch
+		// silently passed `args.name` (undefined) as the tool name and the tool
+		// definition as the arguments. `[REPLAYFIX] await <id> (undefined)` in the
+		// agent host log is the signature of that regression.
+		unpatched: /(async\(([\w$]+),([\w$]+)\)=>\{let ([\w$]+)=[\w$]+\(\3\);return \4===void 0\?\{content:\[\{type:"text",text:`Client tool "\$\{([\w$]+)\.name\}"[\s\S]{0,160}?`\}\],isError:!0\}:)([\w$]+)\(\4\)(\}\)\)\);return [\w$]+\.createSdkMcpServer\()/,
+		patched: /(?:isError:!0\}:|return await )[\w$]+\([\w$]+,[\w$]+\.name,[\w$]+\)/,
+		// Also matches the try/catch form `client-tool-handler-never-throws` rewrites this into.
+		build: (m, prefix, args, extra, id, toolDef, cb, suffix) =>
+			`${prefix}${cb}(${id},${toolDef}.name,${args})${suffix}`,
+	},
+	{
+		id: 'replay-route',
+		target: 'agenthost',
+		title: 'client tool wiring routes through the replay-aware awaiter',
+		unpatched: /\{client:await ([\w$]+)\((\w+),(\w+)=>(\w+)\.register\(\3\),(\w+)\)\}/,
+		patched: /\{client:await [\w$]+\(\w+,\(\w+,\w+,\w+\)=>\w+\.__vsAwait\?/,
+		build: (m, fn, t, i, n, e) =>
+			`{client:await ${fn}(${t},(${i},nm,ag)=>${n}.__vsAwait?${n}.__vsAwait(${i},nm,ag):${n}.register(${i}),${e})}`,
+	},
+	{
+		id: 'replay-turnid',
+		target: 'agenthost',
+		title: 'session stashes the active turn id',
+		unpatched: /async send\(((?:[\w$]+,){2,8}[\w$]+)\)\{let ([\w$]+)=this\._requirePipeline\(\);/,
+		patched: /async send\([^\)]*\)\{this\.__vsTurnId=/,
+		// `turnId` is the second parameter, whatever the arity.
+		build: (m, params, pipe) =>
+			`async send(${params}){this.__vsTurnId=${params.split(",")[1]};let ${pipe}=this._requirePipeline();`,
+	},
+	{
+		id: 'replay-seen',
+		target: 'agenthost',
+		title: 'session records which tool calls actually streamed, and under which turn',
+		// Records `toolCallId -> turnId` rather than a bare set of ids. The turn id
+		// is needed by `replay-drive`'s resync, and taking it from the signal makes
+		// it authoritative: the session-level `__vsTurnId` is stashed only in
+		// `send()`, so a turn synthesized elsewhere -- a promoted steering turn --
+		// leaves it pointing at the preempted turn. Observed: every client tool
+		// call readied inside a steering turn was stranded, because the resync
+		// asked for a request under the wrong turn and silently matched nothing.
+		unpatched: /this\._register\((\w+)\.onDidProduceSignal\((\w+)=>this\._onDidSessionProgress\.fire\(this\._enrichSignalWithMcpContributor\(this\._enrichSignalWithCredits\(\2\)\)\)\)\)/,
+		patched: /onDidProduceSignal\(\w+=>\{\w+&&\w+\.kind==="action"&&\w+\.action\.type==="chat\/toolCallStart"/,
+		build: (m, s, y) =>
+			`this._register(${s}.onDidProduceSignal(${y}=>{${y}&&${y}.kind==="action"&&${y}.action.type==="chat/toolCallStart"&&(this.__vsSeen??=new Map()).set(${y}.action.toolCallId,${y}.action.turnId);this._onDidSessionProgress.fire(this._enrichSignalWithMcpContributor(this._enrichSignalWithCredits(${y})))}))`,
+	},
+	{
+		id: 'replay-drive',
+		target: 'agenthost',
+		title: 'drive execution for a replayed (never-streamed) client tool call',
+		unpatched: /_buildStartupToolWiring\(([\w$]+),([\w$]+)\)\{let ((?:[^;]{0,400}?,)?)([\w$]+)=await ([\w$]+)\(this\.toolDiff,this\._pendingClientToolCalls,this\._sdkService\)/,
+		patched: /_buildStartupToolWiring\([^\)]*\)\{this\._pendingClientToolCalls\.__vsAwait=[\s\S]{0,4000}?let done=false,fire=/,
+		build: (m, e, e2, lead, t, yl) =>
+			`_buildStartupToolWiring(${e},${e2}){`
+			+ 'this._pendingClientToolCalls.__vsAwait=(id,nm,ag)=>{'
+			+ '(globalThis.__vsDriven??=new Set).add(this.chatChannelUri.toString());'
+			+ '(globalThis.__vsInvoked??=new Set).add(id);'
+			+ 'this._logService.info(`[REPLAYFIX] await ${id} (${nm}) seen=${!!(this.__vsSeen&&this.__vsSeen.has(id))}`);'
+			+ 'if(this.__vsSeen&&this.__vsSeen.has(id)){'
+			// The turn the call actually streamed under. `__vsTurnId` is only set in
+			// `send()`, so it is stale for a promoted steering turn and the resync
+			// then matches no pending request, stranding the call for good.
+			+ 'let vt=(this.__vsSeen.get&&this.__vsSeen.get(id))||this.__vsTurnId;'
+			+ 'this._logService.info(`[REPLAYFIX] resync ${id} turn=${vt} stashed=${this.__vsTurnId}`);'
+			+ 'globalThis.__vsResync&&globalThis.__vsResync(this.chatChannelUri.toString(),vt,id);'
+			+ 'return this._pendingClientToolCalls.register(id)}'
+			+ 'return this._pendingClientToolCalls.registerAndFire(id,()=>{'
+			+ 'let ow=this.toolDiff.model.ownerOf(nm);'
+			+ 'if(!ow){this._logService.warn(`[REPLAYFIX] no owning client for replayed tool ${nm}; ${id} cannot execute`);return}'
+			+ 'let done=false,fire=(pid)=>{if(done)return;done=true;'
+			+ 'if(pid){this._onDidSessionProgress.fire({kind:"subagent_started",chat:this.chatChannelUri,toolCallId:pid,agentName:"subagent",agentDisplayName:"Subagent"});}'
+			+ 'let ex=pid?{parentToolCallId:pid}:{};'
+			+ 'this._logService.info(`[REPLAYFIX] driving replayed client tool ${id} (${nm}) turn=${this.__vsTurnId} parent=${pid||"none"}`);'
+			+ 'this._onDidSessionProgress.fire({kind:"action",resource:this.chatChannelUri,...ex,action:{type:"chat/toolCallStart",turnId:this.__vsTurnId,toolCallId:id,toolName:nm,displayName:nm,contributor:{kind:"client",clientId:ow}}});'
+			+ 'this._onDidSessionProgress.fire({kind:"action",resource:this.chatChannelUri,...ex,action:{type:"chat/toolCallReady",turnId:this.__vsTurnId,toolCallId:id,invocationMessage:nm,toolInput:JSON.stringify(ag??{}),confirmed:"not-needed"}});'
+			+ '};'
+			+ '(async()=>{try{'
+			+ 'let sid=this.sessionId,ids=await this._sdkService.listSubagents(sid);'
+			+ 'for(let aid of ids||[]){'
+			+ 'let ms=await this._sdkService.getSubagentMessages(sid,aid);'
+			+ 'for(let mm of ms||[]){'
+			+ 'let cc=mm&&mm.message&&mm.message.content;'
+			+ 'if(Array.isArray(cc)&&cc.some(b=>b&&b.type==="tool_use"&&b.id===id)){fire(mm.parent_tool_use_id||void 0);return}'
+			+ '}}'
+			+ '}catch(e2){this._logService.warn(`[REPLAYFIX] subagent lookup failed for ${id}: ${e2}`)}'
+			+ 'fire(void 0)})();'
+			+ '})};'
+			+ `let ${lead}${t}=await ${yl}(this.toolDiff,this._pendingClientToolCalls,this._sdkService)`,
+	},
+	// The next four edits together surface a steering message as its own turn,
+	// which is what upstream did for Copilot (PR #318456) and what CONTEXT.md M10
+	// already specified: the ack belongs at model visibility, not queue
+	// acceptance. Without them a steer is acked the moment the queue hands it to
+	// the SDK, the pending bubble is removed, and the message is left with no
+	// representation while the model visibly acts on it.
+	{
+		id: 'steering-pending',
+		target: 'agenthost',
+		title: 'the pipeline only receives the steering id, not the message',
+		unpatched: /(\w+)\.injectSteering\((\w+),(\w+)\.id\)\}setPermissionMode/,
+		patched: /\w+\.injectSteering\(\w+,\w+\.id,\w+\)\}setPermissionMode/,
+		build: (m, pipeline, sdkMessage, pending) =>
+			`${pipeline}.injectSteering(${sdkMessage},${pending}.id,${pending})}setPermissionMode`,
+	},
+	{
+		id: 'steering-buffer',
+		target: 'agenthost',
+		title: 'a steering message is forgotten once it is queued',
+		// The guard makes injection idempotent per pending id. `steering-hold`
+		// suppresses the early ack, so the client keeps the message pending and
+		// re-sends it on any resync. Without it the same steer is queued twice and
+		// yielded under two different turns, leaving a turn open that no work fills.
+		unpatched: /injectSteering\((\w+),(\w+)\)\{if\(this\._abortController([\s\S]{0,600}?)this\._queue\.push\(\{sdkMessage:\1,/,
+		patched: /injectSteering\(\w+,\w+,\w+\)\{if\(this\._steerSeen[\s\S]{0,1200}?_steerFlips=new Map\)\)/,
+		build: (m, prompt, pendingId, middle) => {
+			const message = pickName([prompt, pendingId]);
+			return `injectSteering(${prompt},${pendingId},${message}){`
+				+ `if(this._steerSeen&&this._steerSeen.has(${pendingId}))return;`
+				+ `(this._steerSeen||(this._steerSeen=new Set)).add(${pendingId});`
+				+ `if(this._abortController${middle}`
+				+ `(this._steerFlips||(this._steerFlips=new Map)).set(${pendingId},${message}),`
+				+ `this._queue.push({sdkMessage:${prompt},`;
+		},
+	},
+	{
+		id: 'steering-hold',
+		target: 'agenthost',
+		title: 'the pending bubble is cleared when the queue hands the message over',
+		// Held until the SDK echoes the message back, so it is never invisible.
+		// `steering-promote` clears it by starting the steering turn instead.
+		unpatched: /,(\w+)=>this\._onDidProduceSignal\.fire\(\{kind:"steering_consumed",chat:this\.chatChannelUri,id:\1\}\)\)\)/,
+		patched: /,\(\)=>\{\}\)\),this\._router/,
+		build: () => `,()=>{}))`,
+	},
+	{
+		id: 'steering-promote',
+		target: 'agenthost',
+		title: 'a steering message never becomes its own turn',
+		// The SDK emits one result per turn it ran, so the result that ends the
+		// preempted turn is where the steer has demonstrably reached the model.
+		// It does not echo steering messages on the stream, so there is no
+		// earlier signal to use.
+		unpatched: /(\w+)&&this\._queue\.isEmpty&&this\._onDidProduceSignal\.fire\(\{kind:"action",resource:this\.chatChannelUri,action:\{type:"chat\/turnComplete",turnId:\1\.turnId,duration:Math\.max\(0,\1\.stopWatch\.elapsed\(\)\)\}\}\)/,
+		patched: /__ahPromoted=_sfV\.id/,
+		build: (m, completed) => {
+			const [pendingId, steering, stamp, watch] = ['_sfI', '_sfV', '_sfS', '_sfW'];
+			const drain = `this._steerFlips&&(this._steerFlips.forEach((v,k)=>this._onDidProduceSignal.fire(`
+				+ `{kind:"steering_consumed",chat:this.chatChannelUri,id:k})),this._steerFlips.clear())`;
+			const complete = (turn, sw) => `this._onDidProduceSignal.fire({kind:"action",resource:this.chatChannelUri,`
+				+ `action:{type:"chat/turnComplete",turnId:${turn},duration:Math.max(0,${sw})}})`;
+			return `${completed}&&(this._queue.isEmpty`
+				+ `?(${drain},${complete(`${completed}.turnId`, `${completed}.stopWatch.elapsed()`)},`
+				+ `this.__ahPromoted===${completed}.turnId&&(this.__ahPromoted=void 0))`
+				+ `:(()=>{`
+				+ `let ${pendingId}=this._queue.peekParent()&&this._queue.peekParent().steeringPendingId,`
+				+ `${steering}=${pendingId}&&this._steerFlips&&this._steerFlips.get(${pendingId});`
+				+ `if(!${steering})return;`
+				+ `this._steerFlips.delete(${steering}.id);`
+				+ `${complete(`${completed}.turnId`, `${completed}.stopWatch.elapsed()`)};`
+				+ `let ${stamp}=Date.now(),${watch}={elapsed:()=>Date.now()-${stamp}};`
+				+ `this._onDidProduceSignal.fire({kind:"action",resource:this.chatChannelUri,`
+				+ `action:{type:"chat/turnStarted",turnId:${steering}.id,startedAt:new Date().toISOString(),`
+				+ `message:${steering}.message,queuedMessageId:${steering}.id}});`
+				+ `this.__ahPromoted=${steering}.id;`
+				+ `for(let _sfL of[this._queue._toYield,this._queue._yielded,this._queue._popped])`
+				+ `for(let _sfE of _sfL||[]){_sfE.turnId=${steering}.id;_sfE.stopWatch=${watch}}`
+				+ `})())`;
+		},
+	},
+	{
+		id: 'steering-drain',
+		target: 'agenthost',
+		title: 'a steering message the SDK never echoes leaves its bubble behind on abort',
+		unpatched: /abort\(\)\{this\._abortController\.signal\.aborted\|\|\(this\._abortController\.abort\(\),this\._queue\.failAll\(new (\w+)\),this\._needsRebind=!0\)\}/,
+		patched: /abort\(\)\{this\._abortController[\s\S]{0,700}?__ahPromoted&&\(this\._onDidProduceSignal/,
+		build: (m, cancelError) =>
+			`abort(){this._abortController.signal.aborted||(this._abortController.abort(),`
+			+ `this._queue.failAll(new ${cancelError}),`
+			+ `this._steerFlips&&(this._steerFlips.forEach((v,k)=>this._onDidProduceSignal.fire(`
+			+ `{kind:"steering_consumed",chat:this.chatChannelUri,id:k})),this._steerFlips.clear()),`
+			+ `this._steerSeen&&this._steerSeen.clear(),`
+			+ `this.__ahPromoted&&(this._onDidProduceSignal.fire({kind:"action",resource:this.chatChannelUri,`
+			+ `action:{type:"chat/turnCancelled",turnId:this.__ahPromoted,duration:0}}),this.__ahPromoted=void 0),`
+			+ `this._needsRebind=!0)}`,
+	},
+	{
+		id: 'client-tool-single-trigger',
+		target: 'agenthost',
+		title: 'a client tool executes off the streamed ready rather than the runtime invocation',
+		// Upstream proposal: microsoft/vscode#330933. Admits a Claude client tool
+		// to execution only once its runtime invocation is announced, so the call
+		// cannot run twice, run with no arguments, or finish before anything
+		// awaits it. Other providers announce nothing and are left on the
+		// streamed ready, matching the PR.
+		unpatched: /(\w+)\?\.status==="running"&&(\w+)\?\.kind==="client"\?this\._setSessionInputNeeded\((\w+),\{id:(\w+),kind:"toolClientExecution"/,
+		patched: /globalThis\.__vsInvoked&&globalThis\.__vsInvoked\.has/,
+		build: (m, toolCall, contributor, chatUri, requestId) =>
+			`(globalThis.__vsResync=globalThis.__vsResync||((c,t,i)=>this._syncToolInputNeeded(c,t,i))),`
+			+ `${toolCall}?.status==="running"&&${contributor}?.kind==="client"`
+			+ `&&(!globalThis.__vsDriven||!globalThis.__vsDriven.has(${chatUri})`
+			+ `||(globalThis.__vsInvoked&&globalThis.__vsInvoked.has(${toolCall}.toolCallId)))`
+			+ `?this._setSessionInputNeeded(${chatUri},{id:${requestId},kind:"toolClientExecution"`,
+	},
+	{
+		id: 'session-chip-list-scope',
+		target: 'agenthost',
+		title: 'the session list re-derives the chip from the branch for inactive sessions',
+		// `session-chip-scope` fixes only the WRITE path, which runs on turn
+		// completion. The list has its own READ path: `computeListEntryChanges`
+		// returns the persisted summary first, and failing that derives one from
+		// the BRANCH changeset and persists it. Two consequences, both observed
+		// here: a session that has not completed a turn since the patch keeps its
+		// branch-derived number forever, and a session that never ran a turn at
+		// all still gets one written for it (sessions with zero turns and zero
+		// file edits showing +16070 -634, i.e. the entire `dev` vs `origin/main`
+		// divergence).
+		//
+		// Source the read path from the session changeset as well, and stop
+		// deriving from the branch at all: with no session-scoped evidence the
+		// honest answer is no chip, not the branch's number. The persisted
+		// summary is kept as the last resort rather than the first, because in a
+		// multi-folder session it holds the all-folder aggregate that must never
+		// be clobbered by a primary-only re-derivation (the worked example in
+		// `getListMetadataKeys`). Metadata keys and the changeset URI suffix are
+		// protocol constants, so they are written literally; the two summarisers
+		// are captured, since those names are minifier-chosen.
+		unpatched: /computeListEntryChanges\(([\w$]+),([\w$]+)\)\{if\(this\._stateManager\.getSessionState\(\1\)\)return;let ([\w$]+)=\2\[([\w$]+)\];if\(\3!==void 0\)try\{return JSON\.parse\(\3\)\}catch\{return\}let ([\w$]+)=this\._stateManager\.getChangesetState\(([\w$]+)\(\1\)\),([\w$]+)=([\w$]+)\(\5\);if\(\7\)return this\.persistChangesSummary\(\1,\7\),\7;let ([\w$]+)=\2\[([\w$]+)\],([\w$]+)=\2\[([\w$]+)\];if\(\9===void 0&&\11===void 0\)return;let ([\w$]+)=this\.parsePersistedStaticChangesets\(\1,\{branchRaw:\9,legacyRaw:\11\}\),([\w$]+)=([\w$]+)\(\13\.branch\);if\(\14\)return this\.persistChangesSummary\(\1,\14\),\14\}/,
+		patched: /computeListEntryChanges\([\w$]+,[\w$]+\)\{if\(this\._stateManager\.getSessionState\([\w$]+\)\)return;let __ls=/,
+		build: (m, session, meta, o, summaryKey, i, branchUri, s, fromState, a, branchKey, l, legacyKey, d, c, fromDiffs) =>
+			`computeListEntryChanges(${session},${meta}){`
+			+ `if(this._stateManager.getSessionState(${session}))return;`
+			+ `let __ls=${fromState}(this._stateManager.getChangesetState(${session}+"/changeset/session"));`
+			+ `if(__ls)return this.persistChangesSummary(${session},__ls),__ls;`
+			+ `let __sr=${meta}["agentHost.changeset.session"];`
+			+ `if(__sr!==void 0){`
+			+ `let __sp=this.parsePersistedStaticChangesets(${session},{sessionRaw:__sr}),__ss=${fromDiffs}(__sp.session);`
+			+ `if(__ss)return this.persistChangesSummary(${session},__ss),__ss}`
+			+ `let __st=${meta}["agentHost.changes"];`
+			+ `if(__st!==void 0)try{return JSON.parse(__st)}catch{return}`
+			+ `}`,
+	},
+	{
+		id: 'slash-resolve-harness',
+		target: 'workbench',
+		title: 'a message containing a slash command never submits in a remote window',
+		// `resolvePromptSlashCommand` parses the command's uri unconditionally,
+		// but a built-in skill's uri is a discovery-only identity on the
+		// `agent-builtin` scheme with no content behind it ("the entries have no
+		// openable content"). The read rejects, the rejection escapes the
+		// resolver, and its caller is the input-decoration update that feeds
+		// `parsedInput` -- so the message can never be sent and nothing is
+		// reported. Reported as microsoft/vscode#331138, fixed by
+		// microsoft/vscode#331145.
+		//
+		// Mirrors the upstream change: the parse becomes best-effort and yields
+		// `undefined`, cancellation still propagates, and the two consumers that
+		// dereference `parsedPromptFile` are guarded (see `slash-consumer-*`).
+		// `isCancellationError` is not reachable by name in the bundle, so the
+		// cancellation test is inlined the way that helper defines it.
+		unpatched: /async resolvePromptSlashCommand\((\w+),(\w+),(\w+)\)\{let (\w+)=\(await this\.getSlashCommands\(\2,\3\)\)\.find\((\w+)=>\5\.name===\1\);if\(\4\)\{let (\w+)=await this\.promptsService\.parseNew\(\4\.uri,\3\);return\{\.\.\.\4,userInvocable:\6\.header\?\.userInvocable\?\?\4\.userInvocable,parsedPromptFile:\6\}\}\}/,
+		patched: /async resolvePromptSlashCommand\(\w+,\w+,\w+\)\{let \w+=\(await this\.getSlashCommands\([\s\S]{0,240}?parseNew\(\w+\.uri,\w+\)\.catch\(/,
+		build: (m, name, session, token, cmd, pred, parsed) => {
+			const err = pickName([name, session, token, cmd, pred, parsed]);
+			return `async resolvePromptSlashCommand(${name},${session},${token}){`
+				+ `let ${cmd}=(await this.getSlashCommands(${session},${token})).find(${pred}=>${pred}.name===${name});`
+				+ `if(${cmd}){let ${parsed}=await this.promptsService.parseNew(${cmd}.uri,${token}).catch(${err}=>{`
+				+ `if(${err}&&(${err}.name==="Canceled"||${err}.name==="AbortError"))throw ${err};return void 0});`
+				+ `return{...${cmd},userInvocable:${parsed}?.header?.userInvocable??${cmd}.userInvocable,parsedPromptFile:${parsed}}}}`;
+		},
+	},
+	{
+		id: 'slash-resolve-prompts',
+		target: 'workbench',
+		title: 'the prompts service resolver rejects on an unreadable slash command',
+		// Same defect in the other resolver, reached by a different caller. This
+		// one has a logger, so a non-cancellation failure is traced with the
+		// command name — a real parse regression stays distinguishable from a
+		// command that legitimately has nothing to read.
+		unpatched: /async resolvePromptSlashCommand\((\w+),(\w+),(\w+)\)\{let (\w+)=\(await this\.getPromptSlashCommands\(\3\)\)\.find\((\w+)=>\5\.name===\1&&(\w+)\(\5\.sessionTypes,\2\)\);if\(\4\)return\{\.\.\.\4,parsedPromptFile:await this\.parseNew\(\4\.uri,\3\)\}\}/,
+		patched: /async resolvePromptSlashCommand\(\w+,\w+,\w+\)\{let \w+=\(await this\.getPromptSlashCommands\([\s\S]{0,240}?parseNew\(\w+\.uri,\w+\)\.catch\(/,
+		build: (m, name, sessionType, token, cmd, pred, matches) => {
+			const err = pickName([name, sessionType, token, cmd, pred, matches]);
+			return `async resolvePromptSlashCommand(${name},${sessionType},${token}){`
+				+ `let ${cmd}=(await this.getPromptSlashCommands(${token})).find(${pred}=>${pred}.name===${name}&&${matches}(${pred}.sessionTypes,${sessionType}));`
+				+ `if(${cmd})return{...${cmd},parsedPromptFile:await this.parseNew(${cmd}.uri,${token}).catch(${err}=>{`
+				+ `if(${err}&&(${err}.name==="Canceled"||${err}.name==="AbortError"))throw ${err};`
+				+ `this.logger.trace("[resolvePromptSlashCommand] no readable content for \'"+${cmd}.name+"\' ("+${cmd}.uri+"): "+(${err}&&${err}.message||${err}));`
+				+ `return void 0})}}`;
+		},
+	},
+	{
+		id: 'slash-consumer-sessions',
+		target: 'workbench',
+		title: 'the session send path dereferences a prompt file that may be absent',
+		// With the resolvers now yielding `undefined` for a command with no
+		// readable content, this consumer would throw on `.body`/`.uri`. A
+		// discovery-only command simply contributes no variable entry.
+		unpatched: /if\((\w+)\)\{let (\w+)=\1\.parsedPromptFile,(\w+)=\2\.body\?\.variableReferences\.map\(\(\{name:(\w+),offset:(\w+),fullLength:(\w+)\}\)=>\(\{name:\4,range:new (\w+)\(\5,\5\+\6\)\}\)\)\?\?\[\],(\w+)=(\w+)\.toToolReferences\(\3\);return (\w+)\(\2\.uri,"vscode\.prompt\.file",void 0,!0,\8\)\}/,
+		patched: /let \w+=\w+\.parsedPromptFile;if\(\w+\)\{let \w+=\w+\.body\?\.variableReferences/,
+		build: (m, cmd, parsed, refs, nameV, offV, lenV, rangeNs, tools, toolsSvc, entryFn) =>
+			`if(${cmd}){let ${parsed}=${cmd}.parsedPromptFile;if(${parsed}){`
+			+ `let ${refs}=${parsed}.body?.variableReferences.map(({name:${nameV},offset:${offV},fullLength:${lenV}})=>`
+			+ `({name:${nameV},range:new ${rangeNs}(${offV},${offV}+${lenV})}))??[],`
+			+ `${tools}=${toolsSvc}.toToolReferences(${refs});`
+			+ `return ${entryFn}(${parsed}.uri,"vscode.prompt.file",void 0,!0,${tools})}}`,
+	},
+	{
+		id: 'slash-consumer-widget',
+		target: 'workbench',
+		title: 'the chat widget dereferences a prompt file that may be absent',
+		// Same guard on the widget's send path. Prompt-run telemetry is still
+		// recorded for a command with no body, and the header metadata step is
+		// simply skipped rather than throwing.
+		unpatched: /if\(!(\w+)\)return!0;let (\w+)=\1\.parsedPromptFile,(\w+)=\2\.body\?\.variableReferences\.map\(\(\{name:(\w+),offset:(\w+),fullLength:(\w+)\}\)=>\(\{name:\4,range:new (\w+)\(\5,\5\+\6\)\}\)\)\?\?\[\],(\w+)=this\.toolsService\.toToolReferences\(\3\);(\w+)\.attachedContext\.insertFirst\((\w+)\(\2\.uri,"vscode\.prompt\.file",void 0,!0,\8\)\);let (\w+)=\{storage:\1\.storage\}/,
+		patched: /let \w+=\w+\.parsedPromptFile;if\(\w+\)\{let \w+=\w+\.body\?\.variableReferences[\s\S]{0,400}?attachedContext\.insertFirst/,
+		build: (m, cmd, parsed, refs, nameV, offV, lenV, rangeNs, tools, input, entryFn, evt) =>
+			`if(!${cmd})return!0;let ${parsed}=${cmd}.parsedPromptFile;if(${parsed}){`
+			+ `let ${refs}=${parsed}.body?.variableReferences.map(({name:${nameV},offset:${offV},fullLength:${lenV}})=>`
+			+ `({name:${nameV},range:new ${rangeNs}(${offV},${offV}+${lenV})}))??[],`
+			+ `${tools}=this.toolsService.toToolReferences(${refs});`
+			+ `${input}.attachedContext.insertFirst(${entryFn}(${parsed}.uri,"vscode.prompt.file",void 0,!0,${tools}))}`
+			+ `let ${evt}={storage:${cmd}.storage}`,
+	},
+	{
+		id: 'slash-consumer-widget-header',
+		target: 'workbench',
+		title: 'the chat widget applies header metadata from an absent prompt file',
+		// Tail of the same function: the header step must tolerate no prompt file.
+		unpatched: /!\((\w+)\.header&&!await this\._applyPromptMetadata\(\1\.header,(\w+)\)\)/,
+		patched: /!\(\w+\?\.header&&!await this\._applyPromptMetadata\(/,
+		build: (m, parsed, input) =>
+			`!(${parsed}?.header&&!await this._applyPromptMetadata(${parsed}.header,${input}))`,
+	},
+	{
+		id: 'client-tool-owner-recency',
+		target: 'agenthost',
+		title: 'a tool call is stamped with a client that has gone away',
+		// `ownerOf` without a preference resolves to the first-inserted
+		// contributor. A window reload connects with a new clientId and
+		// re-pushes the same tools while the departed entry can still be
+		// present, so every later call is stamped with a dead client and fails
+		// on arrival — permanently, not for the grace window. Prefer the most
+		// recent contributor: a reconnecting window is the one most recently
+		// known to be alive. Mirrors microsoft/vscode#331300.
+		unpatched: /setTools\((\w+),(\w+)\)\{this\._toolSet\.set\(\1,\2\),this\._merged\.set\(this\._toolSet\.merged\(\),void 0\)\}getTools\((\w+)\)\{return this\._toolSet\.get\(\3\)\}removeClient\((\w+)\)\{this\._toolSet\.delete\(\4\)&&this\._merged\.set\(this\._toolSet\.merged\(\),void 0\)\}ownerOf\((\w+),(\w+)\)\{return this\._toolSet\.ownerOf\(\5,\6\)\}/,
+		patched: /setTools\(\w+,\w+\)\{this\.__rec=/,
+		build: (m, cid, tools, getId, remId, tname, pref) =>
+			`setTools(${cid},${tools}){this.__rec=(this.__rec||[]).filter(_r=>_r!==${cid}),this.__rec.unshift(${cid}),`
+			+ `this._toolSet.set(${cid},${tools}),this._merged.set(this._toolSet.merged(),void 0)}`
+			+ `getTools(${getId}){return this._toolSet.get(${getId})}`
+			+ `removeClient(${remId}){this.__rec=(this.__rec||[]).filter(_r=>_r!==${remId}),`
+			+ `this._toolSet.delete(${remId})&&this._merged.set(this._toolSet.merged(),void 0)}`
+			+ `ownerOf(${tname},${pref}){`
+			+ `let _c=${pref}?[${pref}].concat(this.__rec||[]):(this.__rec||[]);`
+			+ `for(let _id of _c)if(this._toolSet.get(_id).some(_t=>_t.name===${tname}))return _id;`
+			+ `return this._toolSet.ownerOf(${tname},${pref})}`,
+	},
+	{
+		id: 'native-model-vision',
+		target: 'agenthost',
+		title: 'a pasted image is labelled unsupported though the model receives it',
+		// The native (SDK) projection hardcodes supportsVision to false while the
+		// CAPI one reads the real capability. The SDK's ModelInfo carries no vision
+		// field, so false stood in for "unknown" -- but nothing downstream treats it
+		// that way: the provider collapses it to a boolean and the attachment widget
+		// renders a warning plus "{model} does not support images" over an image the
+		// model does receive and describe. Every row this transport offers is a
+		// Claude model with image input. Mirrors microsoft/vscode#331396.
+		unpatched: /(\{provider:\w+,id:\w+\.value,name:\w+\.displayName,)supportsVision:!1/,
+		patched: /\{provider:\w+,id:\w+\.value,name:\w+\.displayName,supportsVision:!0/,
+		build: (m, head) => `${head}supportsVision:!0`,
+	},
+	{
+		id: 'consumed-message-not-removed',
+		target: 'workbench',
+		title: 'a queued message the host consumed is retired as cancelled',
+		// `removePendingRequest` settles the caller's `sendRequest` promise as
+		// `{kind:"rejected",reasonCode:"cancelled"}`, which is right for a message
+		// the user withdrew. The server-initiated turn path calls it for the
+		// message the host just STARTED RUNNING, so a delivered message reports
+		// cancellation. Skip the id that is becoming this turn; the queue entry
+		// still clears via the reconciliation that follows the same state change.
+		// Mirrors microsoft/vscode#331408.
+		//
+		// Re-anchored for 1.136.0: upstream (#332461) inserted a second
+		// assignment, `previousTurnIds = currentTurnIds`, between the queue
+		// assignment and `startServerRequest`. The optional group keeps older
+		// bundles matching, and the build re-emits that assignment when it is
+		// present. The removal loop itself is unchanged, so this entry still
+		// does work.
+		unpatched: /for\(let (\w+) of (\w+)\)(\w+)\.has\(\1\)\|\|this\._chatService\.removePendingRequest\((\w+),\1\);\2=\3,(?:(\w+)=(\w+),)?(\w+)\.startServerRequest\((\w+)\.id,/,
+		patched: /\|\|\w+===\w+\.id\|\|this\._chatService\.removePendingRequest/,
+		build: (m, it, prev, cur, session, prevTurns, curTurns, chatSession, turn) =>
+			`for(let ${it} of ${prev})${cur}.has(${it})||${it}===${turn}.id||this._chatService.removePendingRequest(${session},${it});`
+			+ `${prev}=${cur},`
+			+ (prevTurns ? `${prevTurns}=${curTurns},` : '')
+			+ `${chatSession}.startServerRequest(${turn}.id,`,
+	},
+	{
+		id: 'consumed-message-settles-sent',
+		target: 'workbench',
+		title: 'a consumed queued message never resolves its send promise',
+		// The other half: with the cancel path skipped, the caller is still
+		// waiting. The request the host's turn creates arrives under the very id
+		// the message was queued with, so settle the deferred there, as sent.
+		//
+		// Every path settles exactly once, because nothing else will now that
+		// reconciliation leaves a consumed message alone. Reporting it as sent
+		// means handing back an agent and a response to await, so when there is
+		// neither the caller is told the send failed rather than left waiting.
+		// The completion promise is settled by the session's store as well as by
+		// the response, so a session closed mid-turn cannot leave it pending;
+		// the ordinary send path makes the same guarantee.
+		//
+		// Mirrors microsoft/vscode#331408, including its review round.
+		//
+		// Re-anchored for 1.136.0: upstream (#332461) put a `resume` branch at
+		// the top of the handler, which reopens an existing request and returns
+		// early, so the gap before `getAgent` grew from under 140 characters to
+		// 214. Only the window changed. The settlement is still appended to the
+		// non-resume path; a resumed turn's request already exists, so it has
+		// no deferred left to settle.
+		unpatched: /(\w+)\.onDidStartServerRequest&&(\w+)\.add\(\1\.onDidStartServerRequest\(\(\{id:(\w+),[\s\S]{0,240}?\}\)=>\{[\s\S]{0,320}?let (\w+)=this\.chatAgentService\.getAgent\(\w+\),\w+=\w+\(\w+,\4\);(\w+)=\w+\.addRequest\([\s\S]{0,240}?\),\w+=0,\w+\(\)/,
+		patched: /_qcm=this\._queuedRequestDeferreds\.get\(/,
+		build: (m, provider, store, id, agent, lastRequest) =>
+			m
+			+ `,(()=>{let _qcm=this._queuedRequestDeferreds.get(${id});`
+			+ `if(!_qcm)return;`
+			+ `this._queuedRequestDeferreds.delete(${id});`
+			+ `let _qcr=${lastRequest}&&${lastRequest}.response;`
+			+ `if(!${agent}||!_qcr){_qcm.complete({kind:"rejected",reason:"The provider started the request but the session could not describe it"});return}`
+			+ `let _qcs,_qcc=new Promise(_qcx=>{_qcs=_qcx});`
+			+ `let _qcf=()=>{if(_qcs){let _qcy=_qcs;_qcs=void 0;_qcy()}};`
+			+ `if(_qcr.isComplete)_qcf();`
+			+ `else{let _qcl=${store}.add(_qcr.onDidChange(()=>{_qcr.isComplete&&(_qcl.dispose(),_qcf())}));`
+			+ `${store}.add({dispose:_qcf})}`
+			+ `_qcm.complete({kind:"sent",data:{agent:${agent},`
+			+ `responseCreatedPromise:Promise.resolve(_qcr),responseCompletePromise:_qcc}})})()`,
+	},
+	{
+		id: 'consumed-message-sync-reconcile',
+		target: 'workbench',
+		title: 'reconciliation cancels the consumed message and settles nothing',
+		// Two defects in one function, both on the path the host's own turn takes.
+		//
+		// `getPendingRequests` hands back the model's live array, and
+		// `replacePendingRequests` empties it in place before the settlement loop
+		// runs, so the loop iterates nothing and every message that really did
+		// leave the provider queue is left waiting forever. Copying it first is
+		// what makes the loop, and therefore the guard below, do anything at all.
+		//
+		// The loop then rejects the message the host just consumed, racing the
+		// `sent` settlement from `consumed-message-settles-sent`: both follow the
+		// same state change. Skipping the consumed id leaves that settlement to
+		// the request path, which reports what actually happened.
+		//
+		// The id arrives in a third parameter, supplied by
+		// `consumed-message-sync-arg`. Other callers pass two arguments and get
+		// `undefined`, which no request id equals, so they are unaffected.
+		// Mirrors microsoft/vscode#331408.
+		unpatched: /syncPendingRequestsFromRemote\((\w+),(\w+)\)\{let (\w+)=this\._sessionModels\.get\(\1\);if\(!\3\)return;let (\w+)=\3\.getPendingRequests\(\),([\s\S]{0,900}?)for\(let (\w+) of \4\)\{if\((\w+)\.has\(\6\.request\.id\)\)continue;/,
+		patched: /syncPendingRequestsFromRemote\(\w+,\w+,_qcid\)/,
+		build: (m, res, remote, model, prev, mid, entry, kept) =>
+			`syncPendingRequestsFromRemote(${res},${remote},_qcid){`
+			+ `let ${model}=this._sessionModels.get(${res});if(!${model})return;`
+			+ `let ${prev}=[...${model}.getPendingRequests()],${mid}`
+			+ `for(let ${entry} of ${prev}){`
+			+ `if(${kept}.has(${entry}.request.id)||${entry}.request.id===_qcid)continue;`,
+	},
+	{
+		id: 'consumed-message-sync-arg',
+		target: 'workbench',
+		title: 'reconciliation is not told which message the host consumed',
+		// The projection knows which turn the host started, so it can name the
+		// message that left the queue by being run rather than withdrawn. Feeds
+		// `consumed-message-sync-reconcile`, which is inert without it.
+		//
+		// Anchored on the enclosing method rather than on the nearest preceding
+		// `_getSessionState` call: a lazy match from that alone starts at an
+		// earlier method and captures ITS state variable, emitting a name that is
+		// not in scope here. Caught before install, by reading what was emitted.
+		// Mirrors microsoft/vscode#331408.
+		unpatched: /_applyRemotePendingMessages\((\w+),(\w+)\)\{([\s\S]{0,300}?)let (\w+)=this\._getSessionState\(([\s\S]{0,700}?)this\._chatService\.syncPendingRequestsFromRemote\((\w+),(\w+)\)/,
+		patched: /syncPendingRequestsFromRemote\(\w+,\w+,\w+\.activeTurn\?\.id\)/,
+		build: (m, res, chat, pre, state, mid, arg, projected) =>
+			m.slice(0, m.lastIndexOf(`this._chatService.syncPendingRequestsFromRemote(`))
+			+ `this._chatService.syncPendingRequestsFromRemote(${arg},${projected},${state}.activeTurn?.id)`,
+	},
+	{
+		id: 'steer-preempt-not-error',
+		target: 'agenthost',
+		title: 'a turn interrupted by a steer renders as failed',
+		// Interrupting a turn makes the SDK emit a result of subtype
+		// `error_during_execution`, and the mapper turns any such result into a
+		// ChatError. Without `steering-promote` the preempted turn has no bubble
+		// so this is invisible; promoting the steer gives it somewhere to land,
+		// and every steered message renders an error above its own correct answer.
+		//
+		// The SDK always makes an internal diagnostic the FIRST entry of `errors`
+		// and appends the real errors, if any, after it. On its own it is not a
+		// failure: an interrupted turn carries nothing else. So the fix belongs
+		// where the error text is extracted, not in the signal fan-out. Dropping
+		// the diagnostic leaves a genuine error intact (minus a prefix never meant
+		// for users) and leaves an interrupted turn with no error text at all, so
+		// no ChatError is built for it.
+		//
+		// Two earlier attempts were wrong and are recorded so they are not retried:
+		// keying the fan-out on the pending steer raced (the promotion clears the
+		// flip at the same result seam the signal flows through), and matching the
+		// `[ede_diagnostic]` marker alone was too broad, since a genuine failure
+		// starts with that marker too.
+		//
+		// Pairs with `steering-promote`: enabling that without this brings the
+		// error bubble back. Mirrors the fix pushed to microsoft/vscode#330785.
+		unpatched: /if\((\w+)\.subtype==="error_during_execution"\)return \1\.errors\?\.join\(`\n`\)/,
+		patched: /startsWith\("\[ede_diagnostic\]"\)/,
+		build: (m, msg) =>
+			`if(${msg}.subtype==="error_during_execution"){let _de=${msg}.errors?.filter(e=>!e.startsWith("[ede_diagnostic]"));return _de&&_de.length?_de.join(String.fromCharCode(10)):void 0}`,
+	},
+	{
+		id: 'project-customizations-namespace',
+		target: 'agenthost',
+		title: 'project slash commands are missing until the first turn',
+		// In a dev container the window hands the session its working directory in
+		// the CLIENT's namespace, so it arrives as
+		// `vscode-remote://dev-container+<hex>/workspace/repo`. The host runs
+		// inside that container and its file service only answers for `file:`, so
+		// reading customizations off those URIs finds nothing, and finds nothing
+		// QUIETLY: the scan returns empty rather than failing.
+		//
+		// Every project-scope agent, skill, command, rule, MCP server and hook is
+		// therefore invisible to the host. User-scope ones still work, because
+		// `userHome` is already host-local, which is what makes the symptom look
+		// like `.claude/commands` specifically. Slash commands reappear after the
+		// first turn only because the SDK then supplies its own list; the disk
+		// scan never starts working.
+		//
+		// Measured, not inferred: a diagnostic build logged
+		// `workingDirectory=vscode-remote://...` against `userHome=file:///home/node`,
+		// and a probe command placed in user scope appeared pre-turn while the
+		// project's own commands did not.
+		//
+		// The path is what both namespaces agree on, which materialize already
+		// relies on by handing the SDK `workingDirectory.fsPath` as its cwd.
+		// Upstream expresses that as `URI.file(resource.fsPath)`; a minified patch
+		// has no URI class to hand, so it uses the equivalent `.with()` on the
+		// instance. Only these host-side reads are converted: anything sent back
+		// to the client keeps the original namespace.
+		unpatched: /([\w$]+)\(this\.workingDirectories,([\w$]+),this\._fileService,this\._logService\),([\w$]+)\(this\.workingDirectory,\2,this\._fileService\),([\w$]+)\(this\.workingDirectory,\2,this\._fileService\),([\w$]+)\(this\.workingDirectory,\2,this\._fileService\)/,
+		patched: /this\.workingDirectories&&this\.workingDirectories\.map\(/,
+		build: (m, multi, home, rules, mcp, hooks) =>
+			`${multi}(this.workingDirectories&&this.workingDirectories.map(u=>u.scheme==="file"?u:u.with({scheme:"file",authority:""})),${home},this._fileService,this._logService),`
+			+ `${rules}((this.workingDirectory&&(this.workingDirectory.scheme==="file"?this.workingDirectory:this.workingDirectory.with({scheme:"file",authority:""}))),${home},this._fileService),`
+			+ `${mcp}((this.workingDirectory&&(this.workingDirectory.scheme==="file"?this.workingDirectory:this.workingDirectory.with({scheme:"file",authority:""}))),${home},this._fileService),`
+			+ `${hooks}((this.workingDirectory&&(this.workingDirectory.scheme==="file"?this.workingDirectory:this.workingDirectory.with({scheme:"file",authority:""}))),${home},this._fileService)`,
+	},
+	{
+		id: 'toolcall-progress-emit',
+		target: 'agenthost',
+		title: 'a long tool call reports nothing while it runs',
+		// The SDK already says a tool call is still working. Every foreground
+		// tool call over ~30s produces a `tool_progress` heartbeat, and a running
+		// subagent produces `system/task_progress` naming its current step. The
+		// mapper switch handles stream_event/result/assistant/user and delegates
+		// only `system` to the subagent handler, so both fall through `default`
+		// and are dropped. A turn that spends minutes inside one call sends the
+		// client nothing but keepalives.
+		//
+		// Heartbeat frames carry a SYNTHETIC tool_use_id of the form
+		// `<real>-heartbeat-<n>`, which matches no tool call; the real id is in
+		// `parent_tool_use_id`. Keying on tool_use_id compiles, runs, and never
+		// matches. Verified live: a 95s Bash call produced heartbeats at 29s, 58s
+		// and 87s, each carrying the synthetic id.
+		//
+		// Upstream this is `chat/toolCallProgress`, submitted to the
+		// agent-host-protocol repo which owns these types. VS Code cannot carry
+		// it until that lands and is synced, so this applies the same action to
+		// the shipped bundles. Actions are not filtered by negotiated version
+		// (isActionKnownToVersion has no callers), so an unknown action type
+		// reaches the client untouched.
+		unpatched: /switch\(([\w$]+)\.type\)\{case"stream_event":return ([\w$]+)\(([\w$]+)\(\1\.event,([\w$]+),([\w$]+),(.{0,500}?)default:return \1\.type==="system"\?([\w$]+)\(\1,\4,([\w$]+)\):\[\]\}/,
+		patched: /chat\/toolCallProgress/,
+		build: (m, msg, tag, mapStream, chat, turn, mid, sysFn, reg) =>
+			`switch(${msg}.type){case"stream_event":return ${tag}(${mapStream}(${msg}.event,${chat},${turn},${mid}`
+			+ `default:{let P=null;`
+			+ `if(${msg}.type==="tool_progress"){P={i:${msg}.parent_tool_use_id||${msg}.tool_use_id,m:Math.round((${msg}.elapsed_time_seconds||0)*1e3),t:void 0}}`
+			+ `else if(${msg}.type==="system"&&${msg}.subtype==="task_progress"){P={i:${msg}.tool_use_id,m:(${msg}.usage&&${msg}.usage.duration_ms)||0,t:${msg}.summary||${msg}.description}}`
+			+ `if(P&&P.i&&${turn}!==void 0){return[{kind:"action",resource:${chat},action:{type:"chat/toolCallProgress",turnId:${turn},toolCallId:P.i,elapsedMs:P.m,...P.t?{message:P.t}:{}}}]}`
+			+ `return ${msg}.type==="system"?${sysFn}(${msg},${chat},${reg}):[]}}`,
+	},
+	{
+		id: 'toolcall-progress-reduce',
+		target: 'workbench',
+		title: 'the client has nowhere to record tool call progress',
+		// Pairs with `toolcall-progress-emit`. The chat reducer has no case for
+		// the action, so it would land nowhere, the state would never change, and
+		// the render path would never be triggered. Mirrors the upstream reducer:
+		// running only, replacing any previous report wholesale.
+		unpatched: /case"chat\/toolCallContentChanged":return (\w+)\((\w+),(\w+)\.turnId,\3\.toolCallId,(\w+)=>\4\.status!=="running"\?\4:\{\.\.\.\4,\.\.\.\3\._meta!==void 0\?\{_meta:\3\._meta\}:\{\},content:\3\.content\}\);/,
+		patched: /case"chat\/toolCallProgress":/,
+		build: (m, upd, st, act, tc) =>
+			`case"chat/toolCallContentChanged":return ${upd}(${st},${act}.turnId,${act}.toolCallId,${tc}=>${tc}.status!=="running"?${tc}:{...${tc},...${act}._meta!==void 0?{_meta:${act}._meta}:{},content:${act}.content});`
+			+ `case"chat/toolCallProgress":return ${upd}(${st},${act}.turnId,${act}.toolCallId,${tc}=>${tc}.status!=="running"?${tc}:{...${tc},...${act}._meta!==void 0?{_meta:${act}._meta}:{},progress:{elapsedMs:${act}.elapsedMs,...${act}.message!==void 0?{message:${act}.message}:{}}});`,
+	},
+	{
+		id: 'toolcall-progress-reduce-host',
+		target: 'agenthost',
+		title: 'the agent host does not know the progress action either',
+		// The host bundles its own copy of the chat reducer, so without this it
+		// logs `Unhandled action type` for every progress report it forwards.
+		// Same edit as `toolcall-progress-reduce`, which patches the workbench copy;
+		// upstream both come from one source file and need only the single case.
+		unpatched: /case"chat\/toolCallContentChanged":return (\w+)\((\w+),(\w+)\.turnId,\3\.toolCallId,(\w+)=>\4\.status!=="running"\?\4:\{\.\.\.\4,\.\.\.\3\._meta!==void 0\?\{_meta:\3\._meta\}:\{\},content:\3\.content\}\);/,
+		patched: /case"chat\/toolCallProgress":/,
+		build: (m, upd, st, act, tc) =>
+			`case"chat/toolCallContentChanged":return ${upd}(${st},${act}.turnId,${act}.toolCallId,${tc}=>${tc}.status!=="running"?${tc}:{...${tc},...${act}._meta!==void 0?{_meta:${act}._meta}:{},content:${act}.content});`
+			+ `case"chat/toolCallProgress":return ${upd}(${st},${act}.turnId,${act}.toolCallId,${tc}=>${tc}.status!=="running"?${tc}:{...${tc},...${act}._meta!==void 0?{_meta:${act}._meta}:{},progress:{elapsedMs:${act}.elapsedMs,...${act}.message!==void 0?{message:${act}.message}:{}}});`,
+	},
+	{
+		id: 'toolcall-progress-render',
+		target: 'workbench',
+		title: 'a running tool call renders no progress',
+		// Pairs with the other two. The chat UI already has a progress channel:
+		// the Executing state carries a `progress` observable, which the generic
+		// running row renders in place of the invocation message. Nothing on the
+		// agent-host path ever feeds it, so it stays empty for the life of every
+		// turn. `acceptProgress` is its only writer and its sole caller is the
+		// extension-host tools service.
+		//
+		// A bare heartbeat carries no message, so the elapsed time is appended to
+		// whatever label the row already shows rather than replacing it with
+		// nothing.
+		unpatched: /(\w+)\.status!=="running"\)return;(\w+)\.invocationMessage=(\w+)\(\1\.invocationMessage,(\w+)\)\?\?\2\.invocationMessage,/,
+		patched: /acceptProgress\(\{progress:void 0/,
+		build: (m, tc, inv, resolve, auth) =>
+			`${tc}.status!=="running")return;${tc}.progress&&${inv}.acceptProgress({progress:void 0,message:((a,b)=>{let c=typeof a==="string"?a:a&&a.value,s=Math.floor(b/1e3),d=s<60?s+"s":Math.floor(s/60)+"m "+s%60+"s";return(c||"Working")+" ("+d+")"})(${resolve}(${tc}.progress.message,${auth})??${inv}.invocationMessage,${tc}.progress.elapsedMs)}),`
+			+ `${inv}.invocationMessage=${resolve}(${tc}.invocationMessage,${auth})??${inv}.invocationMessage,`,
+	},
+	{
+		id: 'session-delete',
+		target: 'agenthost',
+		title: 'deleting a Claude session does not delete the transcript',
+		// Delete reaches the provider, and each implements it itself: Copilot has
+		// `_deleteSdkSession`, Claude's `_disposeChat` is in-memory only, so the
+		// transcript survives and the session is re-listed on reopen. Claude already
+		// calls `_sdkService.deleteSession` in `truncateChat`, so the comment in
+		// `_disposeChat` claiming the SDK has no delete RPC is simply stale.
+		//
+		// Re-anchored for 1.133.x: the old `disposeSession`/`_teardownEntry` shape
+		// this matched no longer exists in any build. A provisional chat is skipped,
+		// since it never reached the SDK and asking would pull in the download that
+		// provisional creation avoids. Both reads happen before the teardown that
+		// clears them. Tracked upstream as microsoft/vscode#330698.
+		unpatched: /let ([\w$]+)=this\._findChatByUri\(([\w$]+)\);\1&&await this\._disposeLiveSession\(\1\),this\._chatBackings\.delete\(\2\),this\._chatConfigScopes\.delete\(\2\),this\._pruneActiveClientHandlesForChat\(([\w$]+)\),this\._otelService\.releaseSessionTraceContext\(([\w$]+)\.resource\.toString\(\)\)/,
+		patched: /deleteSession\(__sid\)/,
+		build: (m, target, chatKey, chat, ctx) => {
+			const err = pickName([target, chatKey, chat, ctx]);
+			return `let ${target}=this._findChatByUri(${chatKey});`
+				+ `let __prov=${target}!==void 0&&!${target}.isPipelineReady,`
+				+ `__sid=__prov?void 0:this._chatBackings.get(${chatKey})?.sdkSessionId;`
+				+ `${target}&&await this._disposeLiveSession(${target}),`
+				+ `this._chatBackings.delete(${chatKey}),this._chatConfigScopes.delete(${chatKey}),`
+				+ `this._pruneActiveClientHandlesForChat(${chat}),`
+				+ `this._otelService.releaseSessionTraceContext(${ctx}.resource.toString());`
+				+ `if(__sid!==void 0){try{await this._sdkService.deleteSession(__sid),`
+				+ 'this._logService.info(`[Claude] Deleted SDK session transcript ${__sid}`)}'
+				+ `catch(${err}){`
+				+ 'this._logService.warn(`[Claude] Failed to delete SDK session transcript: ${' + err + '}`)}}';
+		},
+	},
+	{
+		id: 'remote-window-authority-init',
+		target: 'workbench',
+		title: 'the in-window agent host claims to be local in a remote window',
+		// LOCAL_AGENT_HOST_AUTHORITY means "the host shares the client's
+		// filesystem", which toAgentHostUri relies on to hand `file:` URIs
+		// through untouched. In a dev container the host runs on the remote
+		// machine, so those paths reach a Windows renderer as `C:\workspace\...`
+		// and every agent link and image is dead.
+		//
+		// Name the machine the paths are on: "local" for the client, or
+		// "local+<remoteAuthority>" for the window's remote. The mapping entry
+		// turns the latter into vscode-remote URIs.
+		unpatched: /this\._isSessionsWindow=(\w+)\.isSessionsWindow,this\._enableSmokeTestDriver=!!\1\.enableSmokeTestDriver,/,
+		patched: /this\.__ahAuth=/,
+		build: (m, env) =>
+			`this._isSessionsWindow=${env}.isSessionsWindow,this._enableSmokeTestDriver=!!${env}.enableSmokeTestDriver,`
+			+ `this.__ahAuth=${env}.remoteAuthority?"local+"+${env}.remoteAuthority.toLowerCase():"local",`,
+	},
+	{
+		id: 'remote-window-authority-fs',
+		target: 'workbench',
+		title: 'the agent host filesystem registers under the local authority',
+		// Pairs with the other two. The filesystem provider must answer for the
+		// same authority the URIs are wrapped with, or nothing resolves.
+		unpatched: /_agentHostFileSystemService\.registerAuthority\((\w+),this\._agentHostService\)/,
+		patched: /_agentHostFileSystemService\.registerAuthority\(this\.__ahAuth,this\._agentHostService\)/,
+		build: () =>
+			`_agentHostFileSystemService.registerAuthority(this.__ahAuth,this._agentHostService)`,
+	},
+	{
+		id: 'remote-window-authority-session',
+		target: 'workbench',
+		title: 'the session handler is told the host is local',
+		// The third site. This is the value threaded to every toAgentHostUri
+		// call, so it decides whether chat links, images, attachments and diffs
+		// are wrapped.
+		unpatched: /connection:this\._agentHostService,connectionAuthority:(\w+),/,
+		patched: /connection:this\._agentHostService,connectionAuthority:this\.__ahAuth,/,
+		build: () =>
+			`connection:this._agentHostService,connectionAuthority:this.__ahAuth,`,
+	},
+	{
+		id: 'remote-window-authority-map',
+		target: 'workbench',
+		title: 'agent host file paths are handed to the client unmapped',
+		// The fast path returns `file:` URIs untouched whenever the host is
+		// "local", which is only safe when the host really is on the client's
+		// machine. Rebase onto the window's own remote connection instead:
+		// RemoteAuthorities.rewrite gives the browser a loadable URL, so images
+		// render, and links open the same editor the explorer already uses.
+		// Wrapping in vscode-agent-host: would fix links but not images, since
+		// FileAccess.uriToBrowserUri only rewrites vscode-remote and file.
+		//
+		// Re-anchored for 1.136.0: upstream (#332791) moved the body into a
+		// three-parameter `wrapAgentHostUri(uri, authority, contentRef)`, with
+		// `toAgentHostUri` and `toAgentHostContentUri` as two-argument wrappers.
+		// The fast path is unchanged. The optional third parameter keeps older
+		// bundles matching; when present it is re-emitted so the untouched
+		// `...contentRef?{contentRef:!0}:{}` tail still names a declared variable.
+		unpatched: /function (\w+)\((\w+),(\w+)(?:,(\w+))?\)\{if\(\3==="local"&&\2\.scheme===(\w+)\.file\)return \2;/,
+		patched: /__ahWin/,
+		build: (m, fn, uri, auth, contentRef, schemas) =>
+			`function ${fn}(${uri},${auth}` + (contentRef ? ',' + contentRef : '') + `){if(${uri}.scheme===${schemas}.file){if(${auth}==="local")return ${uri};`
+			+ `let __ahWin=${auth}.startsWith("local+")?${auth}.slice(6):void 0;`
+			+ `if(__ahWin)return ${uri}.with({scheme:${schemas}.vscodeRemote,authority:__ahWin})}`,
+	},
+	{
+		id: 'subagent-completion-when-idle',
+		target: 'agenthost',
+		title: 'a background subagent that finishes after its turn stays running',
+		// The router derives the turn id from the prompt queue head and drops
+		// every SDK message once the queue drains. A background subagent settles
+		// after the turn that spawned it has ended, so its `task_notification`
+		// lands with no turn and is discarded. The chip then spins forever and
+		// the spawn record leaks, which contradicts the registry's own contract:
+		// "Background spawns survive across turns by design (their completion
+		// arrives later via `system.task_notification`)".
+		//
+		// The completion path is inlined rather than calling the mapper, so the
+		// patch cannot bind to the wrong function if minified names shift.
+		// `task_started` always arrives mid-turn, so it needs no handling here.
+		unpatched: /,(\w+)!==void 0\)try\{let (\w+)=(\w+)\((\w+),this\._chatChannelUri,\1,this\._mapperState,this\._logService,this\._subagents,this\._clientToolOwner,(\w+)\?\.turnDuration\);for\(let (\w+) of \2\)this\._onDidProduceSignal\.fire\(\6\)\}catch\((\w+)\)\{this\._logService\.warn\(`\[ClaudeSdkMessageRouter\] mapper threw, skipping message: \$\{\7\}`\)\}/,
+		patched: /__ahIdleSpawn/,
+		build: (m, turn, sig, mapFn, msg, ctx, one, err) =>
+			`,${turn}!==void 0)try{let ${sig}=${mapFn}(${msg},this._chatChannelUri,${turn},this._mapperState,this._logService,this._subagents,this._clientToolOwner,${ctx}?.turnDuration);`
+			+ `for(let ${one} of ${sig})this._onDidProduceSignal.fire(${one})}`
+			+ `catch(${err}){this._logService.warn(\`[ClaudeSdkMessageRouter] mapper threw, skipping message: \${${err}}\`)}`
+			+ `else if(${msg}.type==="system"&&${msg}.subtype==="task_notification"&&${msg}.tool_use_id&&(${msg}.status==="completed"||${msg}.status==="failed"||${msg}.status==="stopped")){`
+			+ `let __ahIdleSpawn=this._subagents.getSpawn(${msg}.tool_use_id);`
+			+ `__ahIdleSpawn&&__ahIdleSpawn.markCompleted()&&(this._subagents.removeSpawn(${msg}.tool_use_id),`
+			+ `this._onDidProduceSignal.fire({kind:"subagent_completed",chat:this._chatChannelUri,toolCallId:${msg}.tool_use_id}))}`,
+	},
+	{
+		id: 'replay-user-prompt-only',
+		target: 'agenthost',
+		title: 'restored messages show context the user never typed',
+		// resolvePromptToContentBlocks sends the prompt as the first text block
+		// and appends host-composed context after it: attachment representations
+		// (shared browser pages, repo and branch details) and the reference
+		// reminder. The replay mapper joins every text block back together, so a
+		// rehydrated turn shows that context as words the user typed. Live turns
+		// are unaffected, which is why it only appears on returning to a session.
+		//
+		// It also leaks into session titles, which are seeded from the first
+		// turn's text, producing sessions named after the browser-context blurb.
+		unpatched: /return\{kind:"user-text",uuid:(\w+)\.uuid,text:(\w+)\.map\((\w+)=>\3\.text\)\.join\(`\n`\),timestamp:(\w+)\}/,
+		patched: /kind:"user-text",uuid:\w+\.uuid,text:\w+\[0\]\.text/,
+		build: (m, msg, blocks, b, ts) =>
+			`return{kind:"user-text",uuid:${msg}.uuid,text:${blocks}[0].text,timestamp:${ts}}`,
+	},
+	{
+		id: 'session-chip-scope-v2',
+		target: 'agenthost',
+		title: 'the session list chip counts the whole branch, not the session',
+		// Re-anchored for the current bundle: upstream added a multi-root
+		// branch ahead of the summary write, so the previous entry no longer
+		// matched and silently stopped applying to the live server.
+		//
+		// The chip must count the session's own footprint. Keep the multi-folder
+		// aggregate under the branch changeset, and move the legacy diffs key
+		// and the summary write to the session changeset.
+		// Mirrors microsoft/vscode#331345.
+		unpatched: /this\._persistSessionFlag\((\w+),(\w+)\((\w+)\),JSON\.stringify\((\w+)\)\),\3==="branch"\)\{this\._persistSessionFlag\(\1,(\w+),JSON\.stringify\(\4\)\);let (\w+)=this\._configurationService\.getEffectiveWorkingDirectories\(\1\);if\((\w+)\(\6\)\)await this\._updateMultiFolderChangesSummary\(\1,(\w+)\.object,\6,\4\);else\{let (\w+)=(\w+)\(\4\)\?\?\{additions:0,deletions:0,files:0\};this\.persistChangesSummary\(\1,\9\),this\._stateManager\.setSessionSummaryChanges\(\1,\9\)\}\}/,
+		patched: /==="session"&&\(\(\)=>\{this\._persistSessionFlag/,
+		build: (m, session, keyFor, kind, diffs, legacyKey, workDirs, isMulti, ref, summary, summarise) =>
+			`this._persistSessionFlag(${session},${keyFor}(${kind}),JSON.stringify(${diffs})),`
+			+ `(${kind}==="session"&&(()=>{`
+			+ `this._persistSessionFlag(${session},${legacyKey},JSON.stringify(${diffs}));`
+			+ `let ${workDirs}=this._configurationService.getEffectiveWorkingDirectories(${session}),${summary}=${summarise}(${diffs});`
+			+ `if(!${isMulti}(${workDirs})&&${summary}){this.persistChangesSummary(${session},${summary}),this._stateManager.setSessionSummaryChanges(${session},${summary})}`
+			+ `})()),`
+			+ `${kind}==="branch"){`
+			+ `let ${workDirs}=this._configurationService.getEffectiveWorkingDirectories(${session});`
+			+ `if(${isMulti}(${workDirs}))await this._updateMultiFolderChangesSummary(${session},${ref}.object,${workDirs},${diffs})`
+			+ `}`,
+	},
+	{
+		id: 'keyed-item-transient-empty',
+		target: 'workbench',
+		title: 'a momentarily empty collection tears down live keyed items',
+		// autorunPerKeyedItem disposes the store of every key missing from the
+		// incoming collection. A derived collection that reads empty for a tick
+		// during a state update therefore destroys every item at once.
+		//
+		// For agent host client tools that disposal reaches the request
+		// lifecycle, which cancels the shared execution token, so an in-flight
+		// tool dies as "Canceled" or "Tool permission request aborted" while the
+		// host still holds the request and waits forever for a completion.
+		// Observed with a logpoint: the dropped key had zero siblings present.
+		//
+		// Treat an empty read as "nothing new to reconcile" rather than
+		// "everything went away". A key that returns reuses its existing item,
+		// so the work continues, and the helper's outer cleanup still disposes
+		// the stores when the autorun itself is torn down.
+		unpatched: /for\(let\[(\w+),(\w+)\]of (\w+)\)(\w+)\.has\(\1\)\|\|\(\2\.store\.dispose\(\),\3\.delete\(\1\)\)/,
+		patched: /\.size!==0\)for\(let\[\w+,\w+\]of \w+\)\w+\.has/,
+		build: (m, key, cell, map, present) =>
+			`if(${present}.size!==0)for(let[${key},${cell}]of ${map})${present}.has(${key})||(${cell}.store.dispose(),${map}.delete(${key}))`,
+	},
+	{
+		id: 'client-tool-stale-self-abort',
+		target: 'workbench',
+		title: 'a client tool abandons itself when only its label changes',
+		// A client tool call is readied twice: once with a placeholder label
+		// ("Run MCP tool client__issue_fetch") and once with the real one
+		// ("issue_fetch"), same toolInput both times. The in-flight attempt asks
+		// whether it is still current by comparing the whole request, so the
+		// label change makes it judge itself superseded and abandon, leaving the
+		// execution request outstanding and the agent waiting forever.
+		//
+		// Measured in one turn that issued two identical calls at the same
+		// instant: the call readied once completed, the call readied twice
+		// stalled with its execution request never removed.
+		//
+		// Accept the attempt as current when the tool name and input still
+		// match. The original equality stays as the first test, so this only
+		// widens what counts as current and never narrows it.
+		//
+		// Pairs with keyed-item-transient-empty. That one stops a mass teardown
+		// from cancelling the token; this one stops the attempt abandoning
+		// itself. Either alone leaves the call stranded.
+		unpatched: /\(\)=>(\w+)===(\w+)&&\((\w+)\|\|(\w+)\((\w+)\.read\(void 0\),(\w+)\)\)/,
+		patched: /__ahCur/,
+		build: (m, gen, cur, started, eq, obs, req) =>
+			`()=>${gen}===${cur}&&(${started}||${eq}(${obs}.read(void 0),${req})||(()=>{`
+			+ `let __ahCur=${obs}.read(void 0);`
+			+ `return!!__ahCur&&!!__ahCur.toolCall&&!!${req}.toolCall`
+			+ `&&__ahCur.toolCall.toolName===${req}.toolCall.toolName`
+			+ `&&JSON.stringify(__ahCur.toolCall.toolInput??null)===JSON.stringify(${req}.toolCall.toolInput??null)})())`,
+	},
+	{
+		id: 'cold-chat-customizations',
+		target: 'agenthost',
+		title: 'a restored session has no slash commands until its next message',
+		// `getChatCustomizations` resolves the chat through its LIVE runtime, so
+		// a chat that has a backing but no resident runtime reports no
+		// customizations at all: no project commands, no skills, no agents, no
+		// rules, not even the read-only built-ins. That is every session
+		// restored into a fresh host process, and every session idle eviction
+		// released. Typing `/` then offers only the host's own commands
+		// (`/rename`), and sending any message puts them all back.
+		//
+		// The provider already supports the cold read. The provisional session
+		// `_createProvisionalChatSession` builds recovers its working
+		// directories from the SDK transcript cwd or the persisted overlay and
+		// starts no SDK Query, and `getSessionCustomizations` documents the
+		// pre-materialize path as showing the full disk set. This entry point
+		// is simply the one that never reaches it.
+		//
+		// The runtime is torn down again before returning. Leaving it resident
+		// makes `_ensureResolvedChatSession` treat the chat as provisional on
+		// the next send and materialize it fresh (`isResume: false` starts the
+		// SDK with `sessionId` rather than `resume`), so a chat with a
+		// transcript would silently begin a new conversation. A read must not
+		// decide that.
+		//
+		// Queued on the chat's own sequencer and re-checked inside the lock, so
+		// it cannot race a send resolving the same backing. Filed upstream as
+		// microsoft/vscode#332047.
+		unpatched: /async getChatCustomizations\((\w+),(\w+),(\w+)\)\{let (\w+)=this\._findChatByUri\(\1\);return \4\?\(\3&&\4\.setHostCustomizations\(\3\),\4\.getSessionCustomizations\(\)\):\[\]\}/,
+		patched: /__ahColdCtx/,
+		build: (m, chat, ctx, host, sess) =>
+			`async getChatCustomizations(${chat},${ctx},${host}){let ${sess}=this._findChatByUri(${chat});`
+			+ `if(!${sess}){let __ahColdCtx=this._resolveChatContext(${chat},${ctx});`
+			+ `if(!__ahColdCtx.sdkSessionId)return[];`
+			+ `return this._sessionSequencer.queue(__ahColdCtx.sequencerKey,async()=>{`
+			+ `let __ahResident=this._findChatByUri(__ahColdCtx.chatKey);`
+			+ `if(__ahResident)return ${host}&&__ahResident.setHostCustomizations(${host}),__ahResident.getSessionCustomizations();`
+			+ `let __ahTransient;`
+			+ `try{__ahTransient=await this._createProvisionalChatSession(__ahColdCtx.configurationResource,${chat},__ahColdCtx.resource);`
+			+ `return ${host}&&__ahTransient.setHostCustomizations(${host}),await __ahTransient.getSessionCustomizations()}`
+			+ `catch(__ahErr){this._logService.warn(\`[Claude] customization read could not resolve chat \${__ahColdCtx.chatKey}\`,__ahErr);return[]}`
+			+ `finally{__ahTransient&&this._deleteLiveChat(__ahColdCtx.chatKey)}})}`
+			+ `return ${host}&&${sess}.setHostCustomizations(${host}),${sess}.getSessionCustomizations()}`,
+	},
+	{
+		id: 'subagent-spawn-turn',
+		target: 'agenthost',
+		title: 'a spawned subagent does not record the turn that spawned it',
+		// Pairs with subagent-resumed-output: that fix needs to know which turn
+		// a still-running subagent belongs to, and the spawn record does not
+		// carry it. Stamped first-writer-wins, matching the record's other
+		// fields. Upstream as microsoft/vscode#332075.
+		unpatched: /function ([\w$]+)\((\w+),(\w+),(\w+),(\w+)\)\{let (\w+)=\2\.input,(\w+)=typeof \6\?\.description=="string"\?\6\.description:void 0,(\w+)=typeof \6\?\.subagent_type=="string"\?\6\.subagent_type:void 0,(\w+)=typeof \6\?\.prompt=="string"\?\6\.prompt:void 0,(\w+)=\2\.input!==void 0\?([\w$]+)\(\2\.input\):void 0;\5\.recordSpawn\(\2\.id,\{subagentType:\8,description:\7,prompt:\9\}\);/,
+		patched: /__ahSpawnRec/,
+		build: (m, fn, blk, chat, turn, reg, input, desc, stype, prompt, inputJson, stringify) =>
+			`function ${fn}(${blk},${chat},${turn},${reg}){let ${input}=${blk}.input,`
+			+ `${desc}=typeof ${input}?.description=="string"?${input}.description:void 0,`
+			+ `${stype}=typeof ${input}?.subagent_type=="string"?${input}.subagent_type:void 0,`
+			+ `${prompt}=typeof ${input}?.prompt=="string"?${input}.prompt:void 0,`
+			+ `${inputJson}=${blk}.input!==void 0?${stringify}(${blk}.input):void 0;`
+			+ `let __ahSpawnRec=${reg}.recordSpawn(${blk}.id,{subagentType:${stype},description:${desc},prompt:${prompt}});`
+			+ `__ahSpawnRec.turnId===void 0&&(__ahSpawnRec.turnId=${turn});`,
+	},
+	{
+		id: 'subagent-resume-anchor',
+		target: 'agenthost',
+		title: 'nothing records the turn a parent will resume into after a subagent',
+		// Records the spawning turn on the registry when a background subagent
+		// starts. It has to live on the registry rather than the spawn because
+		// completion removes the spawn, and completion is exactly when the
+		// parent resumes. Pairs with subagent-resumed-output. Upstream as
+		// microsoft/vscode#332075.
+		unpatched: /if\((\w+)==="task_started"\)\{let (\w+)=(\w+)\.tool_use_id,(\w+)=\2\?(\w+)\.getSpawn\(\2\):void 0;return \4&&\(\4\.background=!0\),\[\]\}/,
+		patched: /__ahResumeTurn=/,
+		build: (m, sub, id, msg, spawn, reg) =>
+			`if(${sub}==="task_started"){let ${id}=${msg}.tool_use_id,${spawn}=${id}?${reg}.getSpawn(${id}):void 0;`
+			+ `return ${spawn}&&(${spawn}.background=!0,${spawn}.turnId!==void 0&&(${reg}.__ahResumeTurn=${spawn}.turnId)),[]}`,
+	},
+	{
+		id: 'subagent-resumed-output',
+		target: 'agenthost',
+		title: 'everything the parent says after a background subagent finishes is dropped',
+		// The pipeline takes the turn from the prompt queue head, so a parent
+		// that spawns background subagents ends its own turn and every later
+		// message arrives with no turn. The router then returns early and drops
+		// it, silently at every log level, so when the subagents settle and the
+		// parent resumes the chat shows nothing more. The transcript keeps it
+		// all, which is why restarting the agent host reveals the whole reply.
+		//
+		// Falls back to the anchor subagent-resume-anchor recorded at spawn
+		// time, and drops that anchor once a message for a different turn
+		// arrives. Anchoring on the spawn event rather than on live spawns is
+		// what makes it survive the completion that removes the spawn.
+		// Upstream as microsoft/vscode#332075.
+		unpatched: /async handle\((\w+),(\w+),(\w+)\)\{if\(\1\.type==="assistant"\?/,
+		patched: /this\._subagents\.__ahResumeTurn/,
+		build: (m, msg, turn, ctx) =>
+			`async handle(${msg},${turn},${ctx}){`
+			+ `if(${turn}!==void 0&&${turn}!==this._subagents.__ahResumeTurn)this._subagents.__ahResumeTurn=void 0;`
+			+ `${turn}===void 0&&(${turn}=this._subagents.__ahResumeTurn);`
+			+ `if(${msg}.type==="assistant"?`,
+	},
+	{
+		id: 'optimistic-turn-start-masks-streaming',
+		target: 'workbench',
+		title: 'responses appear only when the turn ends, never streaming',
+		// The client applies its own `chat/turnStarted` optimistically and keeps it
+		// in `_pendingActions` until the backend echoes it with the originating
+		// clientSeq. The agent host does not echo that clientSeq, so the pending
+		// start survives the whole turn, and `_recomputeOptimistic` replays it over
+		// the confirmed state on every single action. Replaying a turn start resets
+		// `activeTurn` to a fresh empty turn, so `activeTurn.responseParts` reads as
+		// empty for the entire stream no matter how many deltas have been applied.
+		//
+		// Measured in a live window: 17 `chat/delta` envelopes arrived between 8.0s
+		// and 19.4s and every one passed the channel filter, yet the confirmed part
+		// count of 1 was rewritten to 0 on all 19 recomputes. The renderer set up
+		// its markdown observer at 19.4s and emitted the whole 2,432 characters in
+		// one go. With the fix the same prompt set the observer up at 7.8s and
+		// emitted 16 times across 12 seconds.
+		//
+		// The existing code already knows the echo lacks the clientSeq: it promotes
+		// the pending start when a terminal action arrives, which is exactly why the
+		// text lands all at once at the end. Widening that promotion to the first
+		// action naming the turn confirms the start while the turn is still running.
+		// Upstream as microsoft/vscode#332087.
+		//
+		// The minified method keeps its `IfTerminal` name because renaming it would
+		// mean rewriting its call site for no behavioural gain.
+		unpatched: /_promotePendingTurnStartIfTerminal\((\w+)\)\{if\(!(\w+)\(\1\)\|\|\1\.type!=="chat\/turnComplete"&&\1\.type!=="chat\/turnCancelled"&&\1\.type!=="chat\/error"\)return;/,
+		patched: /_promotePendingTurnStartIfTerminal\(\w+\)\{if\(!\w+\(\w+\)\|\|\w+\.turnId===void 0\)return;/,
+		build: (m, act, isChat) =>
+			`_promotePendingTurnStartIfTerminal(${act}){if(!${isChat}(${act})||${act}.turnId===void 0)return;`,
+	},
+	{
+		id: 'host-local-customization-roots',
+		target: 'agenthost',
+		title: 'the customization watchers never attach in a remote window',
+		// Confirmed by instrumenting `doWatch`: the failing watches come from
+		// `_watchCustomizations`, which builds watchers over the session's working
+		// directories. In a remote window those arrive as `vscode-remote://<window>`,
+		// and the host serves its own disk through `file:` with no provider for that
+		// scheme, so each watch throws ENOPRO. The events they would be matched
+		// against carry `file:` resources, so nothing would match either.
+		//
+		// Mapped inside the method rather than in the `workingDirectories` getter,
+		// because that getter also feeds values handed back to the client, which
+		// must stay in the client's namespace. Inside the method the roots are only
+		// ever used to watch this host's own disk.
+		//
+		// This replaces two earlier call-site edits. There are three callers
+		// (construction, rebuild, and `materialize`), and patching them one at a
+		// time left `materialize` behind, so the mapping now lives in the single
+		// place every caller passes through. Upstream as microsoft/vscode#333665.
+		unpatched: /_watchCustomizations\((\w+)\)\{let (\w+)=new (\w+),/,
+		patched: /_watchCustomizations\(\w+\)\{\w+=\w+\?\.map\(u=>u&&u\.scheme==="vscode-remote"/,
+		build: (m, roots, store, disposable) =>
+			`_watchCustomizations(${roots}){${roots}=${roots}?.map(u=>u&&u.scheme==="vscode-remote"`
+			+ `?u.with({scheme:"file",authority:""}):u);let ${store}=new ${disposable},`,
+	},
+	{
+		id: 'host-local-mcp-root-identity',
+		target: 'agenthost',
+		title: 'a disabled workspace MCP server is no longer denied in a remote window',
+		// Pairs with `host-local-customization-roots`. That entry hands discovery
+		// host-local roots so it can read the filesystem, which also makes each
+		// definition's `defaultCwd` a `file:` URI. The primary root it is compared
+		// against stays in the window's namespace by design, so in a remote window
+		// the comparison never matches: a disabled `.mcp.json` server at the
+		// primary root is skipped by the denied branch and can still be started,
+		// and an enabled one is redundantly injected as an external server.
+		//
+		// Compare in the namespace discovery reports in. Found by review on
+		// microsoft/vscode#333683 and fixed there the same way.
+		unpatched: /(\w+)=\[\];for\(let (\w+) of (\w+)\)\{if\((\w+)\.get\(\2\.customization\.id\)!==!0\)\{\2\.defaultCwd&&(\w+)\(\2\.defaultCwd,(\w+)\)&&\1\.push\((\w+)\(\2\)\);continue\}\2\.defaultCwd&&\5\(\2\.defaultCwd,\6\)\|\|(\w+)\.set\(\2\.name,\2\)\}/,
+		patched: /__vsPrimaryRoot=/,
+		build: (m, denied, def, defs, enablement, isEqual, primary, toDenied, out) =>
+			`${denied}=[],__vsPrimaryRoot=${primary}&&${primary}.scheme==="vscode-remote"`
+			+ `?${primary}.with({scheme:"file",authority:""}):${primary};`
+			+ `for(let ${def} of ${defs}){`
+			+ `if(${enablement}.get(${def}.customization.id)!==!0){`
+			+ `${def}.defaultCwd&&__vsPrimaryRoot&&${isEqual}(${def}.defaultCwd,__vsPrimaryRoot)&&${denied}.push(${toDenied}(${def}));`
+			+ `continue}`
+			+ `${def}.defaultCwd&&__vsPrimaryRoot&&${isEqual}(${def}.defaultCwd,__vsPrimaryRoot)||${out}.set(${def}.name,${def})}`,
+	},
+	{
+		id: 'chat-turnstarted-idempotent',
+		target: 'workbench',
+		title: 'a replayed turn start keeps rebuilding the turn empty, so the response never streams',
+		// Root cause of the same defect `optimistic-turn-start-masks-streaming`
+		// works around from the other end, and both are wanted.
+		//
+		// The chat subscription keeps an optimistic overlay: every action the
+		// client dispatches is applied locally, held in `_pendingActions`, and
+		// replayed on top of confirmed state each time a confirmed action
+		// arrives. A pending entry is retired only when the backend echoes it
+		// with the client's own clientSeq, and the agent host does not echo the
+		// clientSeq for `chat/turnStarted`, so that start stays pending for the
+		// whole turn.
+		//
+		// The reducer case then rebuilt `activeTurn` unconditionally, with an
+		// empty `responseParts`, on every replay. Once the start was confirmed by
+		// some other path each recompute wiped the streamed content again, so
+		// `activeTurn.responseParts` read as empty for the entire turn no matter
+		// how many deltas had been applied, and the whole response landed in one
+		// go at turn end.
+		//
+		// Returning `state` unchanged when the turn is already the active turn,
+		// or already among the completed turns, makes the case idempotent: a
+		// replayed start can no longer reset a turn in progress, and cannot
+		// resurrect a finished turn as an empty active one. Restarting a finished
+		// turn stays `chat/turnResume`'s job.
+		//
+		// Only the workbench copy is patched. The agent host bundles this same
+		// reducer, but it has no optimistic overlay at all (no `_pendingActions`,
+		// `applyOptimistic` or `_recomputeOptimistic` anywhere in that bundle), so
+		// it applies each action once and never replays one. Patching it there
+		// would be inert.
+		//
+		// `state.turns` is read without a guard because the reducer's own
+		// `chat/truncated` case already does the same, so it is never absent.
+		// Upstream as microsoft/vscode#332087.
+		unpatched: /case"chat\/turnStarted":\{let (\w+)=\{\.\.\.(\w+),activeTurn:\{id:(\w+)\.turnId,startedAt:\3\.startedAt,message:\3\.message,responseParts:\[\],usage:void 0\}\};/,
+		patched: /case"chat\/turnStarted":\{if\(\w+\.activeTurn\?\.id===\w+\.turnId\|\|\w+\.turns\.some\(/,
+		build: (m, next, state, action) => {
+			const turn = pickName([next, state, action]);
+			return `case"chat/turnStarted":{`
+				+ `if(${state}.activeTurn?.id===${action}.turnId`
+				+ `||${state}.turns.some(${turn}=>${turn}.id===${action}.turnId))return ${state};`
+				+ `let ${next}={...${state},activeTurn:{id:${action}.turnId,startedAt:${action}.startedAt,`
+				+ `message:${action}.message,responseParts:[],usage:void 0}};`;
+		},
+	},
+	{
+		id: 'truncation-retire-stranded',
+		target: 'workbench',
+		title: 'a stranded optimistic truncation is replayed forever and blanks the transcript',
+		// Same optimistic-overlay mechanism as `chat-turnstarted-idempotent`, but
+		// the action here is not idempotent by nature, so making the reducer
+		// tolerant is not the fix: the pending entry has to be retired.
+		//
+		// A client-dispatched `chat/truncated` is applied optimistically and stays
+		// in `_pendingActions` until the host echoes its clientSeq. The agent host
+		// applies it without echoing, so the pending truncation is replayed over
+		// confirmed state on every later envelope, clearing `activeTurn` and, when
+		// it carries no turnId, every turn with it. The workbench dispatches the
+		// truncation immediately before `chat/turnStarted`, so this blanks the
+		// transcript of the turn that follows, for as long as the entry lives.
+		//
+		// Retire it once the host has evidently applied it, folding it into
+		// confirmed state on the way out. Two observations count as evidence:
+		//   - a confirmed `chat/truncated` for the same turnId that carries NO
+		//     origin. Our own echo is already dropped by clientSeq, and a foreign
+		//     origin is not proof that OUR action was applied.
+		//   - a confirmed `chat/turnStarted` this client dispatched after the
+		//     truncation. Dispatches are processed in order, so a later one being
+		//     acknowledged means the earlier one was seen.
+		//
+		// Exactly one entry, the earliest match, is retired per observation,
+		// because one observation is evidence of one host-side application. The
+		// first revision retired every match and is recorded so it is not
+		// retried: with two truncations pending around a turn start, echoing the
+		// first retired the second as well, and the replay then restored the very
+		// turn the second was meant to clear.
+		//
+		// `_reconcile` is restructured the way upstream restructured it, which is
+		// load bearing rather than cosmetic: the echoed entry is dropped by
+		// clientSeq BEFORE any promotion runs, so promoting an earlier entry
+		// cannot shift the index of the echoed one. It also brings the two
+		// promotions onto one path, so the truncation check sees own-origin
+		// envelopes too, which is what the second evidence case needs.
+		//
+		// `isChatAction` is not re-tested. `receiveEnvelope` returns early unless
+		// `_isRelevantEnvelope` passed, and this subclass tests exactly that, so
+		// nothing else can reach `_reconcile`. The regex keeps `this._chatUri` in
+		// the match for the same reason it matters here: four subscription classes
+		// in this bundle carry a byte-identical `_reconcile`, and only the chat one
+		// is meant.
+		//
+		// Upstream's helper takes a `promote` flag for the turn-start caller;
+		// here it always promotes, since `_promotePendingTurnStartIfTerminal` is
+		// deliberately left alone. That method is rewritten by
+		// `optimistic-turn-start-masks-streaming`, and folding it into this entry
+		// would make the two collide over one site for no behavioural gain.
+		//
+		// Upstream branch fix/retire-stranded-truncation.
+		unpatched: /_isRelevantEnvelope\((\w+)\)\{return (\w+)\(\1\.action\)&&\1\.channel===this\._chatUri\}_onSnapshotApplied\((\w+)\)\{super\._onSnapshotApplied\(\3\),this\._recomputeOptimistic\(\)\}_reconcile\((\w+),(\w+)\)\{if\(\5&&\4\.origin\)\{let (\w+)=this\._pendingActions\.findIndex\((\w+)=>\7\.clientSeq===\4\.origin\.clientSeq\);\6!==-1\?\(\4\.rejectionReason\|\|this\._confirmedApply\(\4\.action\),this\._pendingActions\.splice\(\6,1\)\):\4\.rejectionReason\|\|this\._confirmedApply\(\4\.action\)\}else \4\.rejectionReason\|\|\(this\._promotePendingTurnStartIfTerminal\(\4\.action\),this\._confirmedApply\(\4\.action\)\);this\._recomputeOptimistic\(\)\}/,
+		patched: /__ahRetireTruncation\(\w+,\w+\)\{let /,
+		build: (m, relArg, isChat, snapArg, env, own) =>
+			`_isRelevantEnvelope(${relArg}){return ${isChat}(${relArg}.action)&&${relArg}.channel===this._chatUri}`
+			+ `_onSnapshotApplied(${snapArg}){super._onSnapshotApplied(${snapArg}),this._recomputeOptimistic()}`
+			+ `_reconcile(${env},${own}){`
+			+ `${own}&&${env}.origin&&this.dropPendingByClientSeq(${env}.origin.clientSeq);`
+			+ `${env}.rejectionReason||(`
+			+ `${own}||this._promotePendingTurnStartIfTerminal(${env}.action),`
+			+ `this.__ahRetireTruncation(${env},${own}),`
+			+ `this._confirmedApply(${env}.action));`
+			+ `this._recomputeOptimistic()}`
+			+ `__ahRetireTruncation(_ahE,_ahO){`
+			+ `let _ahA=_ahE.action,_ahG=_ahE.origin;`
+			+ `_ahA.type==="chat/truncated"&&!_ahG`
+			+ `?this.__ahRetireEarliest(_ahP=>_ahP.action.type==="chat/truncated"&&_ahP.action.turnId===_ahA.turnId)`
+			+ `:_ahA.type==="chat/turnStarted"&&_ahO&&_ahG`
+			+ `&&this.__ahRetireEarliest(_ahP=>_ahP.action.type==="chat/truncated"&&_ahP.clientSeq<_ahG.clientSeq)}`
+			+ `__ahRetireEarliest(_ahF){`
+			+ `let _ahI=this._pendingActions.findIndex(_ahF);`
+			+ `_ahI!==-1&&this._confirmedApply(this._pendingActions.splice(_ahI,1)[0].action)}`,
+	},
+	{
+		id: 'plugin-read-surface-errors',
+		target: 'agenthost',
+		title: 'a filesystem the host cannot address looks exactly like an absent file',
+		// `readJsonFile` and `pathExists` in `pluginParsers` are the two reads all
+		// of plugin discovery goes through, and both swallow every error and
+		// report absent. A missing `plugin.json` and a filesystem the host cannot
+		// address at all are therefore indistinguishable, at every log level.
+		//
+		// That is why a whole cluster of remote-window defects was invisible. A
+		// remote window hands the host `vscode-agent-host://`-wrapped URIs, and
+		// inside the container `FileService` has no provider for them, so every
+		// probe throws `ENOPRO: No file system provider found for resource ...`
+		// and discovery reports an empty, entirely plausible-looking result.
+		// Permission errors vanish the same way.
+		//
+		// Keep the read absent, but say so. A missing file (`FILE_NOT_FOUND`) or
+		// a path that runs through a file (`FILE_NOT_DIRECTORY`) stays silent
+		// because those are the ordinary answers; everything else is warned with
+		// the resource and the message.
+		//
+		// The classification is inlined rather than calling the bundle's own
+		// `toFileOperationResult`, which sits far from this site and would need a
+		// second unanchored identifier. The two forms it has to recognise are
+		// `FileOperationError`, which carries the numeric `fileOperationResult`
+		// (`FILE_NOT_FOUND` 1, `FILE_NOT_DIRECTORY` 9, fixed by the declaration
+		// order of the const enum in `files.ts`), and `FileSystemProviderError`,
+		// which carries `code` and, via `markAsFileSystemProviderError`, the
+		// `"<code> (FileSystemError)"` name. Verified against this bundle's own
+		// `toFileOperationResult`, whose switch maps `EntryNotFound` to 1 and
+		// `EntryNotADirectory` to 9. A raw node `ENOENT` that reached here would
+		// be logged rather than silenced, which is what upstream does too.
+		//
+		// LOCAL SCOPE, deliberately narrower than the upstream branch
+		// `fix/surface-missing-provider-errors`. That change threads an
+		// `ILogService` through 22 files to reach these helpers, because they are
+		// free functions that take only a URI and an `IFileService`. Rethreading
+		// that in a minified bundle is not worth the blast radius, so the logger
+		// is taken off the `IFileService` itself: the concrete `FileService` is
+		// constructed as `new FileService(logService)` and keeps it as a plain
+		// `logService` property, which this build preserves. If a future build
+		// mangles that property, or the caller passes something other than the
+		// concrete service, it falls back to `console.warn` so the message is
+		// still emitted somewhere rather than lost. Upstream's `tryResolve` and
+		// the bare `fileService.resolve` swallows in `readSkills`,
+		// `readMarkdownComponents` and `readInstructionComponents` are NOT
+		// covered here; these two helpers carry the overwhelming majority of the
+		// probes and all of the manifest reads.
+		unpatched: /async function ([\w$]+)\(([\w$]+),([\w$]+)\)\{try\{let ([\w$]+)=await \3\.readFile\(\2\);return ([\w$]+)\(\4\.value\.toString\(\)\)\}catch\{return\}\}async function ([\w$]+)\(([\w$]+),([\w$]+)\)\{try\{return await \8\.resolve\(\7\),!0\}catch\{return!1\}\}/,
+		patched: /__ahPluginReadWarn/,
+		build: (m, readJsonFile, jsonUri, jsonFs, contents, parseJSONC, pathExists, existsUri, existsFs) =>
+			`function __ahPluginReadSilent(e){`
+			+ `let r=e&&e.fileOperationResult;if(typeof r=="number")return r===1||r===9;`
+			+ `let c=e&&typeof e.code=="string"?e.code:"";`
+			+ `if(!c){let n=String(e&&e.name||"");c=n.endsWith(" (FileSystemError)")?n.slice(0,-18):""}`
+			+ `return c==="EntryNotFound"||c==="EntryNotADirectory"}`
+			+ `function __ahPluginReadWarn(u,f,e){`
+			+ `if(__ahPluginReadSilent(e))return;`
+			+ `let t="[pluginParsers] Failed to read '"+u.toString()+"': "+(e instanceof Error?e.message:String(e));`
+			+ `try{let l=f&&f.logService;typeof l?.warn=="function"?l.warn(t):console.warn(t)}catch{console.warn(t)}}`
+			+ `async function ${readJsonFile}(${jsonUri},${jsonFs}){`
+			+ `try{let ${contents}=await ${jsonFs}.readFile(${jsonUri});return ${parseJSONC}(${contents}.value.toString())}`
+			+ `catch(__ahReadErr){__ahPluginReadWarn(${jsonUri},${jsonFs},__ahReadErr);return}}`
+			+ `async function ${pathExists}(${existsUri},${existsFs}){`
+			+ `try{return await ${existsFs}.resolve(${existsUri}),!0}`
+			+ `catch(__ahReadErr){__ahPluginReadWarn(${existsUri},${existsFs},__ahReadErr);return!1}}`,
+	},
+	{
+		id: 'client-tool-no-host-confirm',
+		target: 'agenthost',
+		title: 'a client tool the workbench already confirmed is confirmed again by the host',
+		// The Claude SDK gates in-process MCP tools through `canUseTool`, so a
+		// workbench client tool (`mcp__client__*`) took the generic
+		// pending_confirmation path even though the stream mapper had already
+		// readied it as a running client execution. The extra host-side prompt
+		// regresses the call from Running back to PendingConfirmation, and the
+		// workbench rewrites that into a SECOND ToolClientExecution request with
+		// no pre-approval, which is how a client tool gets run twice
+		// (microsoft/vscode#330683).
+		//
+		// The allow sits after the interactive built-ins (`AskUserQuestion`,
+		// `ExitPlanMode`) and before the server-tool auto-allow, because the
+		// interactive pair is exempt from auto-approval by design: their
+		// "permission" IS the user-facing question, and allowing them early would
+		// swallow it. `allowedTools` is deliberately left alone; its semantics for
+		// in-process MCP tools under the plan and dontAsk modes are unverified.
+		//
+		// The ownership test is not optional. The SDK server map is built from the
+		// external MCP configuration plus the in-process client server with no
+		// reserved-name check, so a workspace or user MCP server literally named
+		// `client` also emits `mcp__client__*` tools. Keying on the prefix alone
+		// would skip confirmation for tools no window owns. Anything carrying the
+		// prefix without an owner falls through to the MCP confirmation path
+		// unchanged.
+		//
+		// Upstream adds a `hasClientTool(name)` accessor on the session; here it is
+		// inlined as the one expression that accessor is (`toolDiff.model.ownerOf`),
+		// so this stays a single anchorable site rather than an entry that is inert
+		// without a second one. Both name helpers are captured from the bundle
+		// rather than reimplemented, since the `mcp__<server>__` prefix is built
+		// from a module constant the minifier is free to rename.
+		// Mirrors microsoft/vscode#334037.
+		unpatched: /if\((\w+)\.has\((\w+)\)\)return (\w+)\((\w+),(\w+),\2,(\w+),(\w+)\);let (\w+)=(\w+)\(\2\),(\w+)=\4\.serverToolHost;/,
+		patched: /\.toolDiff\.model\.ownerOf\(\w+\(\w+\)\)!==void 0\)return\{behavior:"allow"/,
+		build: (...args) => {
+			const src = args[args.length - 1];
+			const [, interactive, toolName, handleInteractive, deps, session, input, options, serverToolName, extractServerTool, serverToolHost] = args;
+			// `stripClientToolNamePrefix` / `hasClientToolNamePrefix`, located by
+			// shape. Both read the same `mcp__${CLAUDE_CLIENT_MCP_SERVER_NAME}__`
+			// template, which is what makes the pair identifiable.
+			const names = src.match(/var (\w+)="client";function (\w+)\((\w+)\)\{let (\w+)=`mcp__\$\{\1\}__`;return \3\.startsWith\(\4\)\?\3\.slice\(\4\.length\):\3\}function (\w+)\((\w+)\)\{return \6\.startsWith\(`mcp__\$\{\1\}__`\)\}/);
+			if (!names) { throw new Error('client-tool-no-host-confirm: client tool name helpers not found'); }
+			const [, , strip, , , hasPrefix] = names;
+			return `if(${interactive}.has(${toolName}))return ${handleInteractive}(${deps},${session},${toolName},${input},${options});`
+				+ `if(${hasPrefix}(${toolName})&&${session}.toolDiff.model.ownerOf(${strip}(${toolName}))!==void 0)`
+				+ `return{behavior:"allow",updatedInput:${input}};`
+				+ `let ${serverToolName}=${extractServerTool}(${toolName}),${serverToolHost}=${deps}.serverToolHost;`;
+		},
+	},
+	{
+		id: 'client-tool-ownerless-fail-map-start',
+		target: 'agenthost',
+		title: 'the stream mapper does not record that a client tool call has no owner',
+		// First of five edits implementing the ownerless-client-tool failure. A
+		// client tool (`mcp__client__<name>`) runs on whichever connected window
+		// contributed it. When no connected client provides it, the Claude session
+		// stamps no contributor on ChatToolCallStart, so nothing publishes a
+		// ToolClientExecution request, the disconnect grace timer never arms, and
+		// the in-process MCP handler parks on the pending registry forever: the
+		// turn hangs with no error and no way out. The Copilot session already
+		// fails such calls immediately (`No client was connected to run ...`);
+		// this brings Claude in line.
+		//
+		// Each edit is inert without the others. Without this one the flag is never
+		// set, so `-map-stop` emits nothing; without `-session` the completion is
+		// rendered but the handler still parks. Partial application after a VS Code
+		// update therefore degrades to the unpatched hang rather than to a
+		// half-failed call.
+		//
+		// The owner lookup already exists a few statements later (it feeds the
+		// `contributor` field); this hoists it above `startToolBlock` so the answer
+		// is available while the block is being recorded. Upstream widens
+		// `startToolBlock` with a sixth `ownerless` parameter and stores it in the
+		// active-block record. Here the record is stamped through
+		// `getActiveToolBlock` instead, which is the same object by identity and
+		// keeps the whole change inside this one function: widening the method
+		// signature would need a second anchor in `ClaudeMapperState`, several
+		// thousand characters away, that is inert on its own.
+		unpatched: /if\((\w+)\.type==="tool_use"\)\{let (\w+)=(\w+)\(\1\.name\),(\w+)=(\w+)\(\1\.name\);(\w+)\.startToolBlock\((\w+)\.index,\1\.id,\2,(\w+),\4\);let (\w+)=!\4&&(\w+)\.has\(\2\);(\w+)===null\?\9&&(\w+)\.recordSpawn\(\1\.id\):\12\.noteInnerTool\(\1\.id,\11\);let (\w+)=\4\?void 0:(\w+)\(\2\),(\w+)=\4\?(\w+)\?\.\(\2\):void 0;return\[/,
+		patched: /\.getActiveToolBlock\(\w+\.index\)\.ownerless=!0/,
+		build: (m, block, toolName, strip, isClientTool, hasPrefix, state, event, turnId, spawns, spawnNames, parent, registry, meta, metaFor, owner, ownerOf) =>
+			`if(${block}.type==="tool_use"){`
+			+ `let ${toolName}=${strip}(${block}.name),${isClientTool}=${hasPrefix}(${block}.name),`
+			+ `${owner}=${isClientTool}?${ownerOf}?.(${toolName}):void 0;`
+			+ `${state}.startToolBlock(${event}.index,${block}.id,${toolName},${turnId},${isClientTool}),`
+			+ `${isClientTool}&&${owner}===void 0&&(${state}.getActiveToolBlock(${event}.index).ownerless=!0);`
+			+ `let ${spawns}=!${isClientTool}&&${spawnNames}.has(${toolName});`
+			+ `${parent}===null?${spawns}&&${registry}.recordSpawn(${block}.id):${registry}.noteInnerTool(${block}.id,${parent});`
+			+ `let ${meta}=${isClientTool}?void 0:${metaFor}(${toolName});return[`,
+	},
+	{
+		id: 'client-tool-ownerless-fail-map-stop',
+		target: 'agenthost',
+		title: 'a client tool call no window can run is never failed',
+		// Second of five. Pairs with `-map-start`, which marks the active tool
+		// block when the client-tool owner lookup came back empty. At
+		// `content_block_stop` the mapper already emits ChatToolCallReady for the
+		// call; this follows it with a ChatToolCallComplete carrying
+		// `success:false` and the `toolUnavailable` error code the workbench
+		// already uses for exactly this situation, so the call renders as failed
+		// instead of running forever.
+		//
+		// It has to come AFTER the ready rather than instead of it: the reducer
+		// only accepts a completion for a call it has already seen readied, and
+		// the tool-call tracker keys its bookkeeping off the same order.
+		//
+		// The two message strings are emitted as plain concatenation. Upstream
+		// runs them through `localize` with the tool name as a placeholder, but a
+		// minified patch cannot add an nls id, and the English text is what the
+		// non-localized build resolves to anyway. The error CODE is protocol
+		// rather than UI text, so it is written literally on both sides.
+		unpatched: /(\w+)\.push\(\{kind:"action",resource:(\w+),action:\{type:"chat\/toolCallReady",turnId:(\w+),toolCallId:(\w+)\.toolUseId,invocationMessage:(\w+)\.invocationMessage,\.\.\.\5\.toolInput!==void 0\?\{toolInput:\5\.toolInput\}:\{\},confirmed:"not-needed",\.\.\.(\w+)\?\{_meta:\6\}:\{\}\}\}\),\1\}/,
+		patched: /toolCallId:(\w+)\.toolUseId,result:\{success:!1,pastTenseMessage:\1\.toolName\+" failed"/,
+		build: (m, signals, chat, turnId, tracked, info, meta) =>
+			`${signals}.push({kind:"action",resource:${chat},action:{type:"chat/toolCallReady",turnId:${turnId},`
+			+ `toolCallId:${tracked}.toolUseId,invocationMessage:${info}.invocationMessage,`
+			+ `...${info}.toolInput!==void 0?{toolInput:${info}.toolInput}:{},confirmed:"not-needed",`
+			+ `...${meta}?{_meta:${meta}}:{}}}),`
+			+ `${tracked}.ownerless&&${signals}.push({kind:"action",resource:${chat},action:{type:"chat/toolCallComplete",`
+			+ `turnId:${turnId},toolCallId:${tracked}.toolUseId,result:{success:!1,`
+			+ `pastTenseMessage:${tracked}.toolName+" failed",`
+			+ `error:{message:"No client was connected to run "+${tracked}.toolName,code:"toolUnavailable"}}}}),`
+			+ `${signals}}`,
+	},
+	{
+		id: 'client-tool-ownerless-fail-subagent',
+		target: 'agenthost',
+		title: 'a subagent client tool call no window can run is never failed',
+		// Third of five. The same defect on the other producer: inner tool uses
+		// arrive pre-parsed on a synthesized `assistant` message rather than as
+		// streamed content blocks, so they never pass through
+		// `content_block_start` / `content_block_stop` and `-map-start` /
+		// `-map-stop` cannot see them. This site owns the whole start/ready pair
+		// for an inner call, and the owner is already resolved here, so the
+		// completion is emitted inline rather than through the active-block record.
+		//
+		// Nothing tags the parent here on purpose: the caller runs every signal
+		// this function returns through `tagWithParent`, so the completion picks
+		// up the same `parentToolCallId` as the start and ready beside it. Tagging
+		// it here as well would set the field twice with the same value and hide
+		// that the routing is the caller's job.
+		//
+		// Anchored across BOTH pushes rather than the ready alone, because the
+		// clientId this branches on is only named in the start push
+		// (`...clientId?{contributor:...}`), and re-deriving it would mean
+		// duplicating the owner lookup.
+		unpatched: /(\w+)\.push\(\{kind:"action",resource:(\w+),action:\{type:"chat\/toolCallStart",turnId:(\w+),toolCallId:(\w+)\.id,toolName:(\w+),displayName:(\w+),\.\.\.(\w+)\?\{contributor:\{kind:"client",clientId:\7\}\}:\{\},\.\.\.(\w+)\?\{_meta:\8\}:\{\}\}\}\),\1\.push\(\{kind:"action",resource:\2,action:\{type:"chat\/toolCallReady",turnId:\3,toolCallId:\4\.id,invocationMessage:(\w+)\?\6:(\w+)\(\5,\6,\4\.input\),\.\.\.(\w+)!==void 0\?\{toolInput:\11\}:\{\},confirmed:"not-needed"\}\}\);continue\}/,
+		patched: /toolCallId:\w+\.id,result:\{success:!1,pastTenseMessage:(\w+)\+" failed",error:\{message:"No client was connected to run "\+\1/,
+		build: (m, signals, chat, turnId, block, toolName, displayName, clientId, meta, isClientTool, invocationFor, toolInputStr) =>
+			`${signals}.push({kind:"action",resource:${chat},action:{type:"chat/toolCallStart",turnId:${turnId},`
+			+ `toolCallId:${block}.id,toolName:${toolName},displayName:${displayName},`
+			+ `...${clientId}?{contributor:{kind:"client",clientId:${clientId}}}:{},...${meta}?{_meta:${meta}}:{}}}),`
+			+ `${signals}.push({kind:"action",resource:${chat},action:{type:"chat/toolCallReady",turnId:${turnId},`
+			+ `toolCallId:${block}.id,invocationMessage:${isClientTool}?${displayName}:${invocationFor}(${toolName},${displayName},${block}.input),`
+			+ `...${toolInputStr}!==void 0?{toolInput:${toolInputStr}}:{},confirmed:"not-needed"}}),`
+			+ `${isClientTool}&&${clientId}===void 0&&${signals}.push({kind:"action",resource:${chat},`
+			+ `action:{type:"chat/toolCallComplete",turnId:${turnId},toolCallId:${block}.id,result:{success:!1,`
+			+ `pastTenseMessage:${toolName}+" failed",`
+			+ `error:{message:"No client was connected to run "+${toolName},code:"toolUnavailable"}}}});continue}`,
+	},
+	{
+		id: 'client-tool-ownerless-fail-session',
+		target: 'agenthost',
+		title: 'the SDK handler for a failed client tool call still parks forever',
+		// Fourth of five, and the one that actually ends the hang. `-map-stop` and
+		// `-subagent` render the call as failed, but the SDK's in-process MCP
+		// handler is a separate round trip: it parks a deferred on the pending
+		// client-tool registry and waits for a completion that, with no window to
+		// run the tool, is never going to arrive. Buffering the failure through
+		// `respondOrBuffer` means the handler's later `register` finds a result
+		// waiting and resolves immediately, whichever order the two arrive in.
+		//
+		// The tool call ids are recorded because `-permission` needs them, and the
+		// buffers are swept at `chat/turnComplete`: a permission mode that denies
+		// before execution never runs the MCP handler at all, so an unswept buffer
+		// would sit in the registry until the session was disposed and grow with
+		// every ownerless call. The sweep deletes straight out of `_earlyResults`
+		// rather than through the `discardBufferedResult` accessor upstream adds,
+		// so this entry stays self-contained: a separate accessor entry that
+		// failed to apply would turn this sweep into a TypeError on every turn.
+		//
+		// It hooks `_enrichSignalWithMcpContributor` rather than the
+		// `onDidProduceSignal` registration that calls it. Same instant (the
+		// enricher has exactly one call site, the session's own signal re-fire),
+		// but `replay-seen` already rewrites that registration, and anchoring
+		// there would make the two entries order-dependent in the FIXES array.
+		//
+		// The SDK's own `tool_result` still maps to a second ChatToolCallComplete
+		// for the same id later. That is left alone: the reducer and the tool-call
+		// tracker both ignore a completion for a call that already completed.
+		unpatched: /_enrichSignalWithMcpContributor\((\w+)\)\{if\(\1\.kind!=="action"\|\|\1\.action\.type!=="chat\/toolCallStart"\|\|\1\.action\.contributor!==void 0\)return \1;/,
+		// Deliberately not a bare `__ahOwnerless` test: `-permission` writes that
+		// same name, so a loose marker here would report this entry as already
+		// applied once that one had run and quietly skip it.
+		patched: /_enrichSignalWithMcpContributor\(\w+\)\{if\(\w+\.kind==="action"\)/,
+		build: (m, signal) =>
+			`_enrichSignalWithMcpContributor(${signal}){`
+			+ `if(${signal}.kind==="action"){`
+			+ `if(${signal}.action.type==="chat/turnComplete"){`
+			+ `if(this.__ahOwnerless){`
+			+ `for(let __ahId of this.__ahOwnerless)this._pendingClientToolCalls._earlyResults.delete(__ahId);`
+			+ `this.__ahOwnerless.clear()}}`
+			+ `else if(${signal}.action.type==="chat/toolCallComplete"&&${signal}.action.result?.error?.code==="toolUnavailable"){`
+			+ `this._logService.warn("[Claude:"+this.sessionId+"] client tool call "+${signal}.action.toolCallId`
+			+ `+" has no connected client; failing it immediately");`
+			+ `(this.__ahOwnerless??=new Set).add(${signal}.action.toolCallId);`
+			+ `this._pendingClientToolCalls.respondOrBuffer(${signal}.action.toolCallId,`
+			+ `{content:[{type:"text",text:${signal}.action.result.error.message}],isError:!0})}}`
+			+ `if(${signal}.kind!=="action"||${signal}.action.type!=="chat/toolCallStart"||${signal}.action.contributor!==void 0)return ${signal};`,
+	},
+	{
+		id: 'client-tool-ownerless-fail-permission',
+		target: 'agenthost',
+		title: 'the SDK still asks permission for a client tool call already failed',
+		// Fifth of five. `-session` answers the MCP handler, but the SDK asks
+		// permission through a different channel, and the host drops a permission
+		// ask for a call it has already failed without replying to it, so the ask
+		// itself becomes the new place the turn hangs. Short-circuit the ids
+		// `-session` recorded: allow, so the SDK proceeds and reads the buffered
+		// failure, and do it before `registerAndFire` so nothing is parked and no
+		// pending_confirmation reaches the client for a call that is already dead.
+		//
+		// Keyed off the tool call id rather than the permission mode. Gating on
+		// the mode was considered and rejected: the SDK documents `acceptEdits` as
+		// auto-accepting file edit operations only, so a client tool still reaches
+		// `canUseTool` in that mode, and skipping the answer there would restore
+		// the hang. The id test needs no such enumeration and is mode-independent.
+		//
+		// Nothing is written to the permission registry, deliberately. Buffering
+		// the approval there instead (the first shape this took) leaks in every
+		// mode that never calls `canUseTool`: the answer sits in the registry's
+		// early results until the session is disposed, and repeated ownerless
+		// calls grow it for the session lifetime.
+		//
+		// Also covers what `client-tool-no-host-confirm` cannot: that entry only
+		// allows a client tool an active client OWNS, so an ownerless one falls
+		// through to exactly this method.
+		// Mirrors microsoft/vscode#334037's companion change.
+		unpatched: /requestPermission\((\w+)\)\{return!this\._pipeline\|\|this\._pipeline\.isAborted\?Promise\.resolve\(!1\):this\._pendingPermissions\.registerAndFire\(\1\.toolUseID,/,
+		patched: /requestPermission\(\w+\)\{if\(this\.__ahOwnerless/,
+		build: (m, args) =>
+			`requestPermission(${args}){`
+			+ `if(this.__ahOwnerless&&this.__ahOwnerless.has(${args}.toolUseID))return Promise.resolve(!0);`
+			+ `return!this._pipeline||this._pipeline.isAborted?Promise.resolve(!1):`
+			+ `this._pendingPermissions.registerAndFire(${args}.toolUseID,`,
+	},
+	{
+		id: 'remote-working-directory-actions',
+		target: 'agenthost',
+		title: 'adding or removing a workspace folder from a container window is rejected by the host',
+		// `resolveSessionWorkingDirectoryAction` is the validator every dynamic
+		// working-directory action goes through, and it threw `Working directory
+		// must be a file URI` for anything that was not `file:`. The client
+		// dispatches the raw workspace-folder URIs, which in a dev-container
+		// window are `vscode-remote://dev-container+<hex>/...`, so every add,
+		// remove and replace after the session exists was rejected.
+		//
+		// `createSession` meanwhile accepted and stored those same URIs with no
+		// scheme check at all, which is why sessions come up with the right
+		// folders and only later edits fail. The two paths disagreeing is the
+		// actual defect; the create path is the one that matches how the rest of
+		// the system reads this state.
+		//
+		// Normalising to `file:` at ingress was considered and rejected. Host
+		// state is echoed back unmodified (the protocol client only unwraps
+		// agent-host URIs inbound and only wraps `file:` outbound), and the
+		// client compares the echoed set against its `vscode-remote:` workspace
+		// folders with extUri, in both `agentHostSessionListStore` and the
+		// working-directory synchronizer. A `file:` entry would match neither, so
+		// the session would drop out of the list and the synchronizer would
+		// re-add the folder on every reconcile.
+		//
+		// Both throw sites sit in one function here, so one shared predicate
+		// covers them, emitted as a sibling declaration rather than inlined twice
+		// so the two cannot drift. `Schemas` is already named at this site, so
+		// the scheme constants are read off it rather than hardcoded.
+		//
+		// LOCAL SCOPE, narrower than the upstream branch
+		// `fix/remote-working-directory-actions`. That branch also puts the
+		// predicate in `AgentService.createSession` and parses each
+		// `createSession.workingDirectories` value strictly at the protocol
+		// boundary. Both halves only ADD rejections: the first turns a currently
+		// accepted unsupported scheme into a throw, the second turns a
+		// scheme-less string from a generic provider-not-found error into
+		// InvalidParams. Neither unblocks anything here, and the first is a new
+		// failure mode on the create path, so only the reducer half is carried
+		// over. The upstream drift argument does not apply to a bundle that is
+		// re-derived from source on every VS Code update.
+		unpatched: /function ([\w$]+)\(([\w$]+),([\w$]+),([\w$]+)\)\{let ([\w$]+)=([\w$]+)\.parse\(\2\.directory,!0\);if\(\5\.scheme!==([\w$]+)\.file\)throw new Error\(`Working directory must be a file URI: \$\{\2\.directory\}`\);([\s\S]{0,600}?)let ([\w$]+)=\6\.parse\(\2\.replacement,!0\);if\(\9\.scheme!==\7\.file\)throw new Error\(`Working directory replacement must be a file URI: \$\{\2\.replacement\}`\);/,
+		patched: /__ahSupportedWorkingDirectory/,
+		build: (m, fn, action, dirs, capability, directory, uri, schemas, middle, replacement) =>
+			`function __ahSupportedWorkingDirectory(u){return u.scheme===${schemas}.file||u.scheme===${schemas}.vscodeRemote}`
+			+ `function ${fn}(${action},${dirs},${capability}){`
+			+ `let ${directory}=${uri}.parse(${action}.directory,!0);`
+			+ `if(!__ahSupportedWorkingDirectory(${directory}))`
+			+ 'throw new Error(`Working directory must be a file or vscode-remote URI: ${' + action + '.directory}`);'
+			+ middle
+			+ `let ${replacement}=${uri}.parse(${action}.replacement,!0);`
+			+ `if(!__ahSupportedWorkingDirectory(${replacement}))`
+			+ 'throw new Error(`Working directory replacement must be a file or vscode-remote URI: ${' + action + '.replacement}`);',
+	},
+	{
+		id: 'remote-folders-at-session-create',
+		target: 'workbench',
+		title: 'a session created from the chat handler in a container window gets no working directories at all',
+		// `_hostAddressableWorkingDirectories` drops any folder whose scheme, as
+		// the host will receive it, is not the scheme of the host's own
+		// `defaultDirectory`. Every host reports that as `file:`. A dev-container
+		// window's folders are `vscode-remote:` and the remote client's mapper
+		// only unwraps `vscode-agent-host:` URIs, so they arrive here still
+		// spelled `vscode-remote:` and every one of them is filtered out.
+		//
+		// The filter then falls back to `undefined`, so the session is created
+		// with no working directories and the host picks its own. Nothing
+		// recovers from that: the host treats the session as workspace-less, the
+		// working-directory synchronizer refuses to touch a session it did not
+		// see folders for, the session list's containment check matches nothing
+		// so the session never lists, and the same filtered set seeds the
+		// customization scope roots, which come up empty too.
+		//
+		// The comparison is wrong for this window specifically because
+		// `EditorRemoteAgentHostTransport` already rewrites `vscode-remote:`
+		// directories of the window's own authority to `file:` on createSession,
+		// createChat and the working-directory actions, and maps them back
+		// inbound. The other create path, the provisional session the chat input
+		// picker pre-creates, sends the raw folders through that transport and
+		// works; this handler path is taken whenever no provisional session
+		// exists at first send, for example when the picker never attached or the
+		// target folder was untrusted when it prewarmed.
+		//
+		// Keep a folder when its unwrapped scheme is the host's OR
+		// `vscode-remote:`, which preserves the filter's original intent: a
+		// scheme the host genuinely cannot address, such as a virtual `https:`
+		// repository, is still dropped, and a local window's `file:` folders are
+		// unaffected. This is the client-side counterpart of the agent host's
+		// `remote-working-directory-actions`, so both ends of createSession agree
+		// on which folders may be sent.
+		//
+		// The scheme is compared against the literal `"vscode-remote"` rather
+		// than a `Schemas` member because no `Schemas` identifier is named
+		// anywhere in this method, and reaching for one would need a second
+		// unanchored capture for no gain.
+		//
+		// Upstream branch fix/remote-folders-at-session-create.
+		unpatched: /_hostAddressableWorkingDirectories\(([\w$]+)\)\{let ([\w$]+)=this\._config\.connection\.initializeResult\.get\(\)\?\.defaultDirectory;if\(!\1\?\.length\|\|!\2\)return \1;let ([\w$]+)=([\w$]+)\.isUri\(\2\)\?\4\.revive\(\2\)\.scheme:\4\.parse\(\2\)\.scheme,([\w$]+)=\1\.filter\(([\w$]+)=>this\._config\.connection\.resourceUris\.toAgentHost\(\6\)\.scheme===\3\);/,
+		patched: /__ahDirScheme/,
+		build: (m, dirs, defaultDirectory, hostScheme, uri, addressable, directory) =>
+			`_hostAddressableWorkingDirectories(${dirs}){`
+			+ `let ${defaultDirectory}=this._config.connection.initializeResult.get()?.defaultDirectory;`
+			+ `if(!${dirs}?.length||!${defaultDirectory})return ${dirs};`
+			+ `let ${hostScheme}=${uri}.isUri(${defaultDirectory})?${uri}.revive(${defaultDirectory}).scheme:${uri}.parse(${defaultDirectory}).scheme,`
+			+ `${addressable}=${dirs}.filter(${directory}=>{`
+			+ `let __ahDirScheme=this._config.connection.resourceUris.toAgentHost(${directory}).scheme;`
+			+ `return __ahDirScheme===${hostScheme}||__ahDirScheme==="vscode-remote"});`,
+	},
+	{
+		id: 'subagent-observation-lifetime',
+		target: 'workbench',
+		title: 'a subagent turn hangs forever when its chat outlives the turn that spawned it',
+		// The client starts observing a subagent's chat as soon as it sees the
+		// spawning tool call, but the observation is owned by the disposable
+		// store of the PARENT TURN. `onTurnEnded` disposes that store, which
+		// releases the child chat subscription while the client's `subscribe`
+		// is still in flight; the server's post-await liveness check fails it
+		// and the protocol handler reports `Resource not found`. Nothing
+		// re-subscribes, so the subagent's chat is never observed again.
+		//
+		// That is the normal ordering for a background subagent, whose chat is
+		// created after its parent turn completes (measured at ~2s later on a
+		// real one). Client tool execution is gated on a claimant that only the
+		// chat observer sets (`_markToolCallRendered`), so the subagent's tool
+		// is never executed and its turn never closes: the visible symptom is a
+		// subagent turn that heartbeats forever. Mirrors microsoft/vscode#333931.
+		//
+		// The fix moves subagent observations off the parent turn's store. At
+		// turn end an observation whose child chat has not settled is handed to
+		// a handler-scoped map instead of being disposed, and is released when
+		// the subagent settles or when a live in-turn observation supersedes
+		// it. An observation whose subagent already finished is disposed exactly
+		// as before, so the common case is unchanged. The detached observer's
+		// progress sink is gated on `turnEnded`, because the parent's response
+		// is closed by then and `acceptResponseProgress` THROWS on a completed
+		// response. The claim and the subscription do not go through the sink,
+		// so gating it does not stop the subagent finishing.
+		//
+		// DELIBERATE REDUCTION, because this is a regex patch on a minified
+		// bundle. Upstream also sweeps the detached map when the backend session
+		// is torn down, and guards re-entrancy while that sweep runs. Both live
+		// at a third site far from these two, so neither is backported. The
+		// consequence is a leak with a known bound: if a session is closed while
+		// a subagent is still unsettled, that one observation and its chat
+		// subscription are retained until the window is closed. A retained
+		// subscription is much cheaper than a turn that never ends.
+		//
+		// Two sites, one entry, because they must move together: the context
+		// object (which stops being owned by the turn store, and gains the
+		// child-chat map and the `turnEnded` flag) and the single call that
+		// populates that map and wraps the sink. The ~13KB between them is
+		// captured and re-emitted verbatim.
+		unpatched: /\{observations:(\w+)\.add\(new (\w+)\)\}([\s\S]{0,14000}?)this\._observeSubagentSession\((\w+)\.sessionResource,\4\.backendSession,(\w+),(\w+),(\w+),(\w+),\4\.sink,(\w+),(\w+),(\w+),(\w+)\)/,
+		patched: /\{observations:new \w+,childChats:new Map,turnEnded:!1\}/,
+		build: (m, turnStore, disposableMap, mid, opts, toolCallId, childChatUri, rootInvocationId, invocation, observationStore, ctx, credits, model) =>
+			// The context object is built by an IIFE because the site is one
+			// declarator of a `let` chain: a comma expression there would assign
+			// the wrong value.
+			`(()=>{let _ahX={observations:new ${disposableMap},childChats:new Map,turnEnded:!1},`
+			// Settled means the child chat has run and has no active turn, which
+			// is the same test upstream uses to decide there is nothing left to watch.
+			+ `_ahS=(_ahU,_ahC)=>{let _ahT=this._getSessionState(_ahU,_ahC);return!!_ahT&&!_ahT.activeTurn&&_ahT.turns.length>0};`
+			+ `${turnStore}.add({dispose:()=>{`
+			+ `_ahX.turnEnded=!0;`
+			+ `let _ahM=this.__ahDetachedSubagentObs||(this.__ahDetachedSubagentObs=new Map);`
+			// Nothing to hand off to once the handler itself is going away: it
+			// disposes every chat subscription on the way out.
+			+ `if(!this._store.isDisposed)for(let _ahK of[..._ahX.observations.keys()]){`
+			+ `let _ahP=_ahX.childChats.get(_ahK);`
+			+ `if(!_ahP||_ahS(_ahP.s,_ahP.c))continue;`
+			+ `let _ahO=_ahX.observations.deleteAndLeak(_ahK);`
+			+ `if(!_ahO)continue;`
+			+ `_ahM.get(_ahP.c)?.dispose();_ahM.set(_ahP.c,_ahO);`
+			// The ref the observation already holds, read rather than acquired:
+			// acquiring one mid-teardown can throw.
+			+ `let _ahB=this._additionalChatSubscriptions.get(_ahP.c)?.object;`
+			+ `_ahB&&_ahO.add(_ahB.onDidChange(()=>{`
+			+ `_ahM.get(_ahP.c)===_ahO&&_ahS(_ahP.s,_ahP.c)&&(_ahM.delete(_ahP.c),_ahO.dispose())}))}`
+			// Whatever is left is settled, and is disposed exactly as before.
+			+ `_ahX.observations.dispose()}});return _ahX})()`
+			+ mid
+			// The child chat uri is only known here, so this is where the detach
+			// hook is told which chat each observation is watching.
+			+ `${ctx}.childChats.set(${toolCallId},{s:${opts}.backendSession.toString(),c:${childChatUri}});`
+			// A live in-turn observation supersedes the one an earlier turn left behind.
+			+ `this.__ahDetachedSubagentObs?.get(${childChatUri})?.dispose(),`
+			+ `this.__ahDetachedSubagentObs?.delete(${childChatUri});`
+			+ `this._observeSubagentSession(${opts}.sessionResource,${opts}.backendSession,${toolCallId},`
+			+ `${childChatUri},${rootInvocationId},${invocation},`
+			+ `_ahQ=>{${ctx}.turnEnded||${opts}.sink(_ahQ)},`
+			+ `${observationStore},${ctx},${credits},${model})`,
+	},
+	{
+		id: 'steer-keeps-tool-attribution',
+		target: 'agenthost',
+		title: 'a tool still running when a steer lands never completes',
+		// A steering message is injected with priority `now`, so the SDK emits a
+		// `result` for the preempted turn even though the protocol turn is not
+		// over. The pipeline already treats that result as intermediate and defers
+		// `ChatTurnComplete` to the final one. The mapper did not: `mapResult`
+		// cleared the tool_use attribution map and drained foreground subagent
+		// spawns on EVERY result, intermediate ones included. A tool still in
+		// flight when the steer landed therefore lost its attribution, its later
+		// `tool_result` hit the unknown-id path, no completion was emitted, and
+		// the tool showed Running for the rest of the session. A foreground
+		// subagent that call had spawned vanished from the registry the same way,
+		// so `subagent_started` was never announced and its inner signals stayed
+		// buffered.
+		//
+		// Upstream takes the cleanup out of `mapResult` and gives the router a
+		// `clearPendingTurnState` method the pipeline calls in the branch that
+		// fires `ChatTurnComplete`. That is two files; a regex patch gets one
+		// contiguous site, so the same semantics are reached from the pipeline
+		// alone. The two cleanup methods are shadowed on the very instances the
+		// router hands the mapper (`_mapperState` and `_subagents`, the same
+		// objects passed to `mapSDKMessageToAgentSignals`) for the duration of the
+		// routing call, and are then run explicitly once the queue reports the
+		// turn drained. Cleanup happens exactly once, on the final result, which
+		// is what upstream does; the mapper is left untouched.
+		//
+		// The shadow is an own property removed with `delete`, so the classes keep
+		// their prototype methods and nothing survives the message. A second
+		// consumer loop overlapping a rebind finds the shadow already installed,
+		// leaves it alone and skips the explicit run, which degrades to the
+		// unpatched behaviour for that one result rather than clearing twice. With
+		// no `_router` at all nothing is shadowed and the mapper clears as before.
+		//
+		// The match deliberately STOPS before
+		// `<completed>&&this._queue.isEmpty&&this._onDidProduceSignal.fire(...)`,
+		// which is `steering-promote`'s whole anchor. That expression is left byte
+		// for byte intact and this entry only inserts a statement ahead of it, so
+		// the two apply in either order and neither hides the other's site.
+		unpatched: /try\{await this\._router\.handle\((\w+),(\w+),\{turnDuration:(\w+),mode:this\._currentPermissionMode,clientContext:(\w+)\}\)\}catch\((\w+)\)\{this\._logService\.warn\(`\[ClaudeSdkPipeline:\$\{this\.sessionId\}\] router threw, skipping: \$\{\5\}`\)\}if\(\1\.type==="result"\)\{let (\w+)=this\._queue\.settleHead\(\);this\._logService\.info\(`\[Claude:\$\{this\.sessionId\}\] result for sdkUuid=\$\{\6\?\.sdkUuid\}`\),/,
+		patched: /__ahHeld/,
+		build: (m, msg, turn, duration, clientCtx, routerErr, completed) =>
+			`let __ahHeld;`
+			+ `if(${msg}.type==="result"&&this._router){`
+			+ `let __ahMs=this._router._mapperState,__ahSg=this._router._subagents;`
+			+ `__ahMs&&__ahSg&&!Object.prototype.hasOwnProperty.call(__ahMs,"clearPendingToolCalls")`
+			+ `&&(__ahHeld={s:__ahMs,g:__ahSg},__ahMs.clearPendingToolCalls=function(){},`
+			+ `__ahSg.drainForegroundSpawns=function(){return[]})}`
+			+ `try{await this._router.handle(${msg},${turn},{turnDuration:${duration},`
+			+ `mode:this._currentPermissionMode,clientContext:${clientCtx}})}`
+			+ `catch(${routerErr}){this._logService.warn(`
+			+ '`[ClaudeSdkPipeline:${this.sessionId}] router threw, skipping: ${' + routerErr + '}`)}'
+			+ `__ahHeld&&(delete __ahHeld.s.clearPendingToolCalls,delete __ahHeld.g.drainForegroundSpawns);`
+			+ `if(${msg}.type==="result"){let ${completed}=this._queue.settleHead();`
+			+ 'this._logService.info(`[Claude:${this.sessionId}] result for sdkUuid=${' + completed + '?.sdkUuid}`),'
+			+ `__ahHeld&&${completed}&&this._queue.isEmpty&&(__ahHeld.s.clearPendingToolCalls(this._logService),`
+			+ `__ahHeld.g.drainForegroundSpawns().forEach(__ahOrphan=>this._logService.warn(`
+			+ '`[ClaudeSdkPipeline] turn ended with pending subagent-spawning tool_use ${__ahOrphan.toolUseId}'
+			+ ' (agentId=${__ahOrphan.agentId??"<unresolved>"}); dropping cross-message state`))),',
+	},
+	{
+		id: 'reap-orphaned-session-data',
+		target: 'agenthost',
+		title: 'a pruned external session leaves its data directory behind forever',
+		// Discovery creates a data directory for every external session it lists,
+		// because seeding the read state writes through the session database and
+		// opening that database makes the directory. The 30-day startup prune then
+		// unregisters the stale row and stops there, so the directory outlives the
+		// only record that could ever name it: with the registry row gone nothing
+		// can match a directory back to a session again, and `cleanupOrphanedData`
+		// (which would) has no callers. Measured on this machine: 503 of 528
+		// session data directories were such empty shells.
+		//
+		// Deleting the pruned row's data as the row goes stops the leak growing.
+		// It does NOT reclaim the ones already there. That is the startup sweep
+		// half of the upstream change, and it is deliberately not backported here:
+		// it is a signature change on the data service plus a rewritten ownership
+		// test (base64url session fragment for peer chats, a derived subagent
+		// prefix, a per-directory database read for the chat-backing marker) plus
+		// a new startup hook, so it is several sites rather than one, and what it
+		// does is delete directories in bulk. That is not something to express as
+		// a regex against a bundle in daily use. The existing shells stay until
+		// the sweep ships upstream, costing disk only.
+		//
+		// `deleteSessionData` is the same call the ordinary session-delete path
+		// makes, with the same working-directories argument, so a pruned session
+		// reaches the `onWillDeleteSessionData` listeners exactly as a deleted one
+		// does. It tests existence first and swallows its own failures, so a row
+		// that never had a directory is a no-op and a locked directory warns
+		// rather than throwing out of the prune.
+		unpatched: /for\(let (\w+) of (\w+)\)await this\._sessionRegistry\.unregister\(\1\);\2\.length>0&&\(this\._invalidateSessionList\(\),this\._queueSessionListReconciliation\(\)\)/,
+		patched: /deleteSessionData\([\s\S]{0,140}?\),await this\._sessionRegistry\.unregister\(/,
+		build: (m, session, stale) =>
+			`for(let ${session} of ${stale})await this._sessionDataService.deleteSessionData(${session},`
+			+ `this._configurationService.getEffectiveWorkingDirectories(${session}.toString())),`
+			+ `await this._sessionRegistry.unregister(${session});`
+			+ `${stale}.length>0&&(this._invalidateSessionList(),this._queueSessionListReconciliation())`,
+	},
+	{
+		id: 'codex-progress-not-output-host',
+		target: 'agenthost',
+		title: 'MCP progress narration is persisted as the tool result',
+		// `mapMcpToolCallProgress` appended every `mcpToolCall/progress` message to
+		// `entry.output`, the same field real streamed output uses, and re-sent the
+		// whole growing accumulation as the tool call's content. Three consequences,
+		// all of them user-visible:
+		//
+		//   * `mapItemCompleted` falls back to `entry.output` when the MCP tool
+		//     returned nothing, so a tool that legitimately produces no output has
+		//     the progress narration persisted as its result.
+		//   * an interrupted turn gives the orphaned completion the same narration.
+		//   * each notification resent the entire accumulation, so a long call's
+		//     content grew quadratically.
+		//
+		// Progress is a status line, not output, so it now rides on
+		// `_meta.progressMessage` and the content carries only real output.
+		// Identical consecutive messages are coalesced, and the completion path
+		// drops its `|| entry.output` fallback: nothing writes `output` for an
+		// `mcpToolCall` item any more, and keeping the fallback would leave the one
+		// route by which narration could still reach the result.
+		//
+		// The two halves are one entry because they have to move together. Dropping
+		// the fallback alone still streams the narration as content; rewriting the
+		// mapper alone leaves a fallback reading an `output` that no longer
+		// accumulates, which is inert but pointless. The captured gap between them
+		// is re-emitted verbatim.
+		//
+		// Upstream also stores the start `_meta` on the shell and web_search entries
+		// so a progress notification landing on one of those cannot replace its
+		// `toolKind` bag (the reducer swaps the whole `_meta` whenever an action
+		// carries one). That is NOT backported and does not need to be: codex item
+		// ids are per item, an `mcpToolCall/progress` notification only ever
+		// resolves to the `mcpToolCall` entry of the same id, and this build's
+		// `mcpToolCall` branch of `mapItemStartedBody` emits `chat/toolCallStart`
+		// with no `_meta` at all, so there is no bag to replace. Verified in this
+		// bundle: that branch sets `{toolCallId,turnId,toolName,output:""}` and its
+		// start action carries only an optional `contributor`.
+		//
+		// The matching `progressMessage` key in `readToolCallMeta` is not backported
+		// either. Nothing in the agent host reads it, and the workbench half
+		// (`codex-progress-not-output-client`) reads `_meta.progressMessage` off the
+		// tool call directly, applying the same `typeof === "string"` guard the
+		// reader would.
+		unpatched: /function ([\w$]+)\(([\w$]+),([\w$]+)\)\{let ([\w$]+)=\2\.itemToToolCall\.get\(\3\.itemId\);return \4\?\(\4\.output=\[\4\.output,\3\.message\]\.filter\(Boolean\)\.join\(`\n`\),\[\{type:"chat\/toolCallContentChanged",turnId:\4\.turnId,toolCallId:\4\.toolCallId,content:\[\{type:"text",text:\4\.output\}\]\}\]\):\[\]\}([\s\S]{0,3400}?)=([\w$]+)\(([\w$]+)\.item\.result,\7\.item\.error\?\.message\)\|\|([\w$]+)\.output,/,
+		patched: /_meta:\{progressMessage:/,
+		build: (m, mapProgress, state, params, entry, gap, mcpToolOutput, doneParams, doneEntry) =>
+			`function ${mapProgress}(${state},${params}){`
+			+ `let ${entry}=${state}.itemToToolCall.get(${params}.itemId);`
+			+ `return!${entry}||${params}.message===${entry}.progressMessage?[]:`
+			+ `(${entry}.progressMessage=${params}.message,`
+			+ `[{type:"chat/toolCallContentChanged",turnId:${entry}.turnId,toolCallId:${entry}.toolCallId,`
+			+ `content:${entry}.output?[{type:"text",text:${entry}.output}]:[],`
+			+ `_meta:{progressMessage:${params}.message}}])}`
+			+ gap
+			+ `=${mcpToolOutput}(${doneParams}.item.result,${doneParams}.item.error?.message),`,
+	},
+	{
+		id: 'codex-progress-not-output-client',
+		target: 'workbench',
+		title: 'a running MCP call shows no progress, and a stale one becomes its past-tense label',
+		// Pairs with `codex-progress-not-output-host`, which moves codex MCP tool
+		// progress off `entry.output` and onto `_meta.progressMessage`. Nothing on
+		// the client reads that key, so on its own the host half is silent: the
+		// narration correctly stops being persisted as the result, and correctly
+		// stops being rendered, but nothing takes its place.
+		//
+		// The chat UI already has the channel for it. `ChatToolInvocation` keeps a
+		// `_progress` observable whose only writer is `acceptProgress`, and the
+		// running row renders its message. This feeds it from the tool call's
+		// `_meta` at the three points upstream does:
+		//
+		//   A  toolCallStateToInvocation   a client attaching mid-turn builds the
+		//                                  invocation from current state, so the
+		//                                  message has to be seeded there too.
+		//   B  updateRunningToolSpecificData   every subsequent Running update.
+		//   C  finalizeToolInvocation      clears the progress before the state
+		//                                  transition, because `didExecuteTool`
+		//                                  promotes `_progress.message` to
+		//                                  `pastTenseMessage` whenever the result
+		//                                  carries no `toolResultMessage`. The
+		//                                  agent-host adapter never sets one, so
+		//                                  without the clear the last progress
+		//                                  string becomes the finished row's label.
+		//
+		// All three are in one entry deliberately. A/B without C is worse than
+		// nothing: it is exactly the "stale narration becomes the past-tense label"
+		// defect, in the UI instead of the transcript. Anchoring them together
+		// makes the trio atomic, at the cost of failing closed if a future build
+		// reorders these three functions. The two gaps are re-emitted verbatim.
+		//
+		// The test is `typeof ... === "string"`, NOT truthiness. `progressMessage`
+		// is typed and validated as any string, and codex sends an empty message to
+		// clear a status line it set earlier; a truthy test drops that and leaves
+		// the stale text on screen. The mapper still coalesces on equality, and an
+		// entry's `progressMessage` starts undefined rather than empty, so a first
+		// empty message is a real change and still emits.
+		//
+		// `_meta.progressMessage` is read inline rather than through
+		// `readToolCallMeta`, which would need a fourth, distant edit in that
+		// reader for the sole purpose of copying one string through a
+		// `typeof === "string"` check that is cheaper to inline. Verified in this
+		// bundle: the reader is `function bM(s){let o=s._meta;...}`, the bag is
+		// flat, and the keys are unprefixed, so the two reads are equivalent.
+		// The `_meta` arrives because the reducer's existing
+		// `chat/toolCallContentChanged` case already spreads an action's `_meta`
+		// onto the tool call.
+		//
+		// Overlaps `toolcall-progress-render`, which writes the same channel from
+		// the elapsed-time heartbeat at the TOP of `updateRunningToolSpecificData`;
+		// site B sits below it and is untouched by that entry, and each tolerates
+		// the other being absent. If both ever fired for one call this one would
+		// win on a Running update, but they cannot: heartbeats come from the Claude
+		// SDK mapper and `progressMessage` from the codex mapper.
+		unpatched: /([\w$]+)\.status==="auth-required"&&([\w$]+)\.setAuthenticationRequired\(([\w$]+)\(\1,([\w$]+)\)\),([\s\S]{0,4200}?);let ([\w$]+)=([\w$]+)\(([\w$]+)\);if\(\6\)\{([\w$]+)\.toolSpecificData=\{kind:"subagent",isActive:([\s\S]{0,6000}?),toolResultDetails:([\w$]+)\}:void 0;return ([\w$]+)&&([\w$]+)\.cancelFromStreaming\(/,
+		patched: /_meta\?\.progressMessage=="string"/,
+		build: (m, tcA, invA, authServer, authArg, gapAB, subagent, subagentContent, tcB, invB, gapBC, details, cancelled, invC) => {
+			// Same shape at both live sites: only surface a message while the call
+			// is Running, and let an empty string through so it can clear.
+			const apply = (inv, tc) =>
+				`${tc}.status==="running"&&typeof ${tc}._meta?.progressMessage=="string"`
+				+ `&&${inv}.acceptProgress({message:${tc}._meta.progressMessage})`;
+			return `${tcA}.status==="auth-required"&&${invA}.setAuthenticationRequired(${authServer}(${tcA},${authArg})),`
+				+ `${apply(invA, tcA)},`
+				+ gapAB
+				+ `;${apply(invB, tcB)};`
+				+ `let ${subagent}=${subagentContent}(${tcB});if(${subagent}){${invB}.toolSpecificData={kind:"subagent",isActive:`
+				+ gapBC
+				+ `,toolResultDetails:${details}}:void 0;`
+				+ `${invC}.acceptProgress({message:void 0});`
+				+ `return ${cancelled}&&${invC}.cancelFromStreaming(`;
+		},
+	},
+	{
+		id: 'subscribe-cancelled-not-missing',
+		target: 'agenthost',
+		title: 'a client cancelling a subscribe is reported as a missing resource, at error level',
+		// `agentService.subscribe` throws `Subscription cancelled: <uri>` when its
+		// subscription is released while it waits for a pending subagent chat, and
+		// the protocol server's subscribe handler rewraps ANY non-ProtocolError as
+		// `Resource not found: <uri>`. `shouldLogFailedRequest` then lets that
+		// through at error level, because it only stays quiet for a NotFound on a
+		// file resource read.
+		//
+		// So a routine client cancellation is reported as a missing resource that
+		// exists and was registered correctly, and it points at a host registration
+		// bug when the observation lifetime on the client is what actually ended.
+		// That cost a real debugging session on this machine.
+		//
+		// Upstream adds `SubscriptionCancelledError extends ProtocolError`, throws
+		// it at all five sites that already signalled this concept, keys the
+		// handler on `instanceof`, and excludes it from `shouldLogFailedRequest`.
+		// A class cannot carry across the five throw sites here: they sit in two
+		// modules thousands of characters apart, and a patch is one contiguous
+		// edit. So this recognises the concept at the single point where it was
+		// being misreported, by message shape, and converts it there.
+		//
+		// The message shape is exact rather than fuzzy. All five sites emit the
+		// literal prefix `Subscription cancelled: `, and nothing else in this
+		// bundle produces that text (verified: 5 occurrences, all of them that
+		// throw). Four of the five funnel into this one catch, directly or through
+		// `_subscribeStateChannel` and `agentService.subscribe`; the fifth is the
+		// reconnect restore loop, whose own catch already logs at info and rewraps
+		// nothing, so it is unaffected either way. What is NOT reproduced is a
+		// discriminator other code could use: only this handler can tell the two
+		// apart, where upstream any caller can.
+		//
+		// The genuinely-unknown-resource path is provably untouched. The new branch
+		// is guarded on `!(err instanceof ProtocolError)` as well as the prefix, so
+		// every input that reaches the old code reaches the same arm of it: a
+		// ProtocolError is still rethrown as-is, and anything else still becomes
+		// `Resource not found` with the same code and the same error-level log.
+		// `Cannot subscribe to unknown resource` is a plain Error with a different
+		// message and still rewraps.
+		//
+		// Suppressing the error log needs `shouldLogFailedRequest` too, so the two
+		// sites are matched together with the gap between them re-emitted verbatim.
+		// They are coupled by an own property stamped on the error this catch
+		// builds, not by a second string test: nothing else can set it, so the
+		// helper's answer changes for exactly the objects this entry created. The
+		// property never reaches the wire, because the JSON-RPC error is built from
+		// `code`, `message` and `data` only.
+		//
+		// The rewrap reuses the handler's own not-found code, as upstream does, and
+		// for the same reason: the synced protocol has no cancellation code. The
+		// client therefore sees the same code as before and a truthful message.
+		unpatched: /function ([\w$]+)\(([\w$]+),([\w$]+),([\w$]+)\)\{return!\(\4 instanceof ([\w$]+)\)\|\|\4\.code!==([\w$]+)\.NotFound\|\|!([\w$]+)\(\2,\3\)\}([\s\S]{0,2600}?)\}catch\(([\w$]+)\)\{throw!([\w$]+)\.active&&([\w$]+)\.subscriptions\.get\(([\w$]+)\.uri\)===\10&&\11\.subscriptions\.delete\(\12\.uri\),\9 instanceof \5\?\9:new \5\(([\w$]+),`Resource not found: \$\{([\w$]+)\.channel\}`\)\}/,
+		patched: /__ahSubscribeCancelled/,
+		build: (m, shouldLog, method, params, err, ProtocolError, codes, isFileRead, gap, caught, pending, client, classified, notFoundCode, req) =>
+			`function ${shouldLog}(${method},${params},${err}){`
+			+ `if(${err}&&${err}.__ahSubscribeCancelled)return!1;`
+			+ `return!(${err} instanceof ${ProtocolError})||${err}.code!==${codes}.NotFound||!${isFileRead}(${method},${params})}`
+			+ gap
+			+ `}catch(${caught}){`
+			+ `if(!${pending}.active&&${client}.subscriptions.get(${classified}.uri)===${pending}){${client}.subscriptions.delete(${classified}.uri)}`
+			+ `if(!(${caught} instanceof ${ProtocolError})&&${caught} instanceof Error`
+			+ `&&typeof ${caught}.message=="string"&&${caught}.message.startsWith("Subscription cancelled: ")){`
+			+ `let __ahCancelled=new ${ProtocolError}(${notFoundCode},${caught}.message);`
+			+ `__ahCancelled.__ahSubscribeCancelled=!0;`
+			+ `this._logService.info(\`[ProtocolServer] Subscribe cancelled by client: \${${req}.channel}\`);`
+			+ `throw __ahCancelled}`
+			+ `if(${caught} instanceof ${ProtocolError})throw ${caught};`
+			+ `throw new ${ProtocolError}(${notFoundCode},\`Resource not found: \${${req}.channel}\`)}`,
+	},
+	{
+		id: 'client-tool-handler-never-throws',
+		target: 'agenthost',
+		title: 'a rejected client-tool wait escapes the MCP handler as a bare "Canceled"',
+		// The in-process MCP server that surfaces workbench client tools to the
+		// Claude SDK awaits the parked deferred with no try/catch, so a rejection
+		// escapes into the SDK's tool path instead of being answered as a tool
+		// result. Rejections are routine rather than theoretical: the pending
+		// registry rejects every parked request on `rejectAll`, which runs when the
+		// session rebinds a client and when it is disposed.
+		//
+		// The MCP SDK turns a thrown handler error into a bare tool error, so what
+		// reaches the model is "Canceled" with no tool name and no reason, and the
+		// turn continues on a result that explains nothing. Catching here produces
+		// the same `isError` shape the sibling branch a few characters earlier
+		// already uses for a missing `tool_use_id`, and the same shape the
+		// server-tool MCP server uses for its own failures.
+		//
+		// The handler is rewritten from a ternary into statements because the
+		// original body is a single `return <cond>?<errorResult>:awaitResult(id)`
+		// expression and `await` has to sit inside a `try`. The error branch is
+		// re-emitted verbatim from the captured identifiers, including the meta-key
+		// constant, so the message the SDK already produces is unchanged.
+		//
+		// Pairs with `pending-register-shares-deferred`, which removes one of the
+		// two sources of these rejections (a duplicate `register` for the same
+		// `tool_use_id`). Neither entry depends on the other: this one still has to
+		// answer the rebind and dispose sweeps, and that one is correct on its own.
+		// Also complements `client-tool-ownerless-fail-session`, which buffers a
+		// failure result so the handler resolves rather than parking; this covers
+		// the rejections that buffering cannot reach.
+		//
+		// MUST STAY AFTER `replay-args` IN THIS ARRAY, and it is, being appended at
+		// the end. `replay-args` rewrites the very call this wraps, widening it from
+		// `awaitResult(id)` to `awaitResult(id,def.name,input)`, and its own anchor
+		// pins the ternary plus the `})));return ...createSdkMcpServer(` tail that
+		// follows it. Turning the ternary into statements necessarily moves that
+		// tail, so applying this one first would leave `replay-args` unmatched.
+		// The array order already guarantees the right sequence; nothing else here
+		// touches the site. The argument list is captured whole and re-emitted
+		// verbatim rather than rebuilt, so the entry matches the bundle both before
+		// and after `replay-args` has widened it, which is what keeps
+		// `--only client-tool-handler-never-throws` correct on a pristine bundle.
+		unpatched: /async\(([\w$]+),([\w$]+)\)=>\{let ([\w$]+)=([\w$]+)\(\2\);return \3===void 0\?\{content:\[\{type:"text",text:`Client tool "\$\{([\w$]+)\.name\}" could not run: SDK omitted tool_use_id \(expected at extra\._meta\["\$\{([\w$]+)\}"\]\)\.`\}\],isError:!0\}:([\w$]+)\((\3(?:,[\w$]+(?:\.[\w$]+)?){0,3})\)\}/,
+		patched: /catch\(__ahClientToolError\)/,
+		build: (m, toolInput, extra, toolUseId, readToolUseId, def, metaKey, awaitResult, callArgs) =>
+			`async(${toolInput},${extra})=>{let ${toolUseId}=${readToolUseId}(${extra});`
+			+ `if(${toolUseId}===void 0)return{content:[{type:"text",`
+			+ `text:\`Client tool "\${${def}.name}" could not run: SDK omitted tool_use_id (expected at extra._meta["\${${metaKey}}"]).\`}],isError:!0};`
+			+ `try{return await ${awaitResult}(${callArgs})}`
+			+ `catch(__ahClientToolError){return{content:[{type:"text",`
+			+ `text:\`Client tool "\${${def}.name}" failed: \${__ahClientToolError instanceof Error?__ahClientToolError.message:String(__ahClientToolError)}\`}],isError:!0}}}`,
+	},
+	{
+		id: 'pending-register-shares-deferred',
+		target: 'agenthost',
+		title: 'a second wait on one pending request cancels the first waiter',
+		// `PendingRequestRegistry.register` parks a deferred under a key and hands
+		// back its promise. Registering a key that is already parked rejects the
+		// PREVIOUS deferred with a cancellation and replaces it, so the first
+		// waiter unwinds with "Canceled" even though the request it was waiting on
+		// is still live and will still be responded to. Only the last registrant
+		// can ever see the answer; every earlier one is failed on its behalf.
+		//
+		// Sharing the parked deferred instead means both waiters settle on the one
+		// `respond`, which is what a duplicated `tool_use_id` (an SDK retry, a
+		// replay, or a host bug) actually deserves. Nothing relied on the reject:
+		// every caller registers one key per request, and the `rejectAll` /
+		// `denyAll` sweeps used for abort and dispose are untouched by this entry.
+		//
+		// Deliberately narrow. The early-result branch above it is re-emitted
+		// verbatim and still wins, so `respondOrBuffer` keeps resolving a later
+		// `register` immediately; only the already-parked branch changes. That
+		// matters because `client-tool-ownerless-fail-session` depends on the
+		// buffered path, not on this one.
+		//
+		// The `CancellationError` constructor the old branch used is captured and
+		// then dropped from the output. It stays defined and is used elsewhere in
+		// the bundle, so leaving it unreferenced here is inert.
+		//
+		// This is the registry side of `client-tool-handler-never-throws`: it
+		// removes one source of the rejection that entry has to answer for. The
+		// other source, the rebind and dispose sweeps, is genuine, so both entries
+		// are worth having and neither is inert without the other.
+		unpatched: /register\(([\w$]+),\.\.\.([\w$]+)\)\{if\(this\._earlyResults\.has\(\1\)\)\{let ([\w$]+)=this\._earlyResults\.get\(\1\);return this\._earlyResults\.delete\(\1\),Promise\.resolve\(\3\)\}let ([\w$]+)=this\._entries\.get\(\1\);\4&&!\4\.deferred\.isSettled&&\4\.deferred\.error\(new ([\w$]+)\);let ([\w$]+)=new ([\w$]+);return this\._entries\.set\(\1,\{deferred:\6,metadata:\2\[0\]\}\),\6\.p\}/,
+		patched: /_entries\.get\([\w$]+\);if\([\w$]+&&![\w$]+\.deferred\.isSettled\)return/,
+		build: (m, key, metadata, buffered, existing, cancellationError, deferred, DeferredPromise) =>
+			`register(${key},...${metadata}){`
+			+ `if(this._earlyResults.has(${key})){let ${buffered}=this._earlyResults.get(${key});`
+			+ `return this._earlyResults.delete(${key}),Promise.resolve(${buffered})}`
+			+ `let ${existing}=this._entries.get(${key});`
+			+ `if(${existing}&&!${existing}.deferred.isSettled)return ${existing}.deferred.p;`
+			+ `let ${deferred}=new ${DeferredPromise};`
+			+ `return this._entries.set(${key},{deferred:${deferred},metadata:${metadata}[0]}),${deferred}.p}`,
+	},
+];
+
+function sha(text) {
+	return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+function docker(args) {
+	return execFileSync('docker', args, { encoding: 'utf8', maxBuffer: 1 << 28 });
+}
+
+function dockerAvailable() {
+	try { docker(['version', '--format', '{{.Server.Os}}']); return true; } catch { return false; }
+}
+
+/** Installed workbench bundles. Stable nests the bundle under a build-hash dir. */
+function workbenchTargets() {
+	const rel = 'resources/app/out/vs/workbench/workbench.desktop.main.js';
+	const roots = [];
+	if (process.platform === 'win32') {
+		const local = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
+		roots.push(
+			path.join(local, 'Programs', 'Microsoft VS Code'),
+			path.join(local, 'Programs', 'Microsoft VS Code Insiders'),
+			'C:\\Program Files\\Microsoft VS Code',
+		);
+	} else {
+		// WSL reaching the Windows install. The WSL username rarely matches the
+		// Windows one, so enumerate profiles rather than guessing.
+		const winUsers = '/mnt/c/Users';
+		if (fs.existsSync(winUsers)) {
+			for (const entry of fs.readdirSync(winUsers, { withFileTypes: true })) {
+				if (!entry.isDirectory()) { continue; }
+				const base = path.join(winUsers, entry.name, 'AppData/Local/Programs');
+				roots.push(
+					path.join(base, 'Microsoft VS Code'),
+					path.join(base, 'Microsoft VS Code Insiders'),
+				);
+			}
+		}
+		roots.push('/usr/share/code');
+	}
+	const found = [];
+	for (const root of roots) {
+		if (!fs.existsSync(root)) { continue; }
+		const direct = path.join(root, rel);
+		if (fs.existsSync(direct)) { found.push(direct); continue; }
+		for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+			if (!entry.isDirectory()) { continue; }
+			const nested = path.join(root, entry.name, rel);
+			if (fs.existsSync(nested)) { found.push(nested); }
+		}
+	}
+	return found;
+}
+
+/**
+ * Agent host bundles inside the shared `vscode` docker volume. Old server
+ * versions accumulate there; already-patched and non-matching ones are skipped,
+ * so listing them all is self-limiting and covers a freshly installed server.
+ */
+function agentHostTargets() {
+	if (!dockerAvailable()) { return []; }
+	let out;
+	try {
+		out = docker(['run', '--rm', '-v', `${VOLUME}:/vscode`, 'alpine', 'sh', '-c', `ls -1 ${VOLUME_GLOB} 2>/dev/null`]);
+	} catch { return []; }
+	return out.split('\n').map(l => l.trim()).filter(Boolean).map(p => `docker:${p}`);
+}
+
+const isDocker = (t) => t.startsWith('docker:');
+const dockerPath = (t) => t.slice('docker:'.length);
+
+// Files copied out of the volume land root-owned, so reads and writes use
+// separate names rather than fighting over one.
+function readTarget(target, io) {
+	if (!isDocker(target)) { return fs.readFileSync(target, 'utf8'); }
+	docker(['run', '--rm', '-v', `${VOLUME}:/vscode`, '-v', `${io}:/io`, 'alpine',
+		'cp', dockerPath(target), '/io/in.js']);
+	return fs.readFileSync(path.join(io, 'in.js'), 'utf8');
+}
+
+function writeTarget(target, text, io) {
+	if (!isDocker(target)) { fs.writeFileSync(target, text); return; }
+	fs.writeFileSync(path.join(io, 'out.js'), text);
+	docker(['run', '--rm', '-v', `${VOLUME}:/vscode`, '-v', `${io}:/io`, 'alpine',
+		'cp', '/io/out.js', dockerPath(target)]);
+}
+
+function backupExists(target, io) {
+	if (!isDocker(target)) { return fs.existsSync(target + BACKUP_SUFFIX); }
+	const out = docker(['run', '--rm', '-v', `${VOLUME}:/vscode`, 'alpine', 'sh', '-c',
+		`test -f ${dockerPath(target)}${BACKUP_SUFFIX} && echo yes || echo no`]);
+	return out.trim() === 'yes';
+}
+
+function copyInPlace(target, from, to) {
+	if (!isDocker(target)) { fs.copyFileSync(from, to); return; }
+	docker(['run', '--rm', '-v', `${VOLUME}:/vscode`, 'alpine', 'cp', from, to]);
+}
+
+/** A broken bundle bricks the app, so never install anything that will not parse. */
+function syntaxOk(text, io) {
+	const probe = path.join(io, 'probe.mjs');
+	fs.writeFileSync(probe, text);
+	try { execFileSync(process.execPath, ['--check', probe], { stdio: 'pipe' }); return true; }
+	catch { return false; }
+	finally { fs.rmSync(probe, { force: true }); }
+}
+
+/**
+ * Build hashes of the installed workbench bundles. A server bundle in the
+ * shared volume belongs to the running VS Code when its bin directory starts
+ * with one of these, which is how a live bundle is told from the superseded
+ * copies that pile up beside it.
+ */
+function installedBuildHashes(targets) {
+	const hashes = new Set();
+	for (const t of targets) {
+		if (isDocker(t) || /agentHostMain\.js$/.test(t)) { continue; }
+		for (const seg of String(t).split(/[\/]/)) {
+			if (/^[0-9a-f]{8,}$/i.test(seg)) { hashes.add(seg.toLowerCase()); }
+		}
+	}
+	return hashes;
+}
+
+/** Whether `label` is a bundle the installed VS Code actually loads. */
+function isLiveBundle(label, hashes) {
+	if (!/agentHostMain\.js$/.test(label)) { return true; }
+	const m = label.match(/\/bin\/[^/]+\/([0-9a-f]+)\//i);
+	if (!m) { return false; }
+	const bin = m[1].toLowerCase();
+	for (const h of hashes) { if (bin.startsWith(h)) { return true; } }
+	return false;
+}
+
+function main() {
+	const args = process.argv.slice(2);
+	const flag = (n) => args.includes(n);
+	const valueOf = (n) => { const i = args.indexOf(n); return i === -1 ? null : args[i + 1]; };
+
+	const only = new Set((valueOf('--only') ?? '').split(',').filter(Boolean));
+	// Leave a fix out of an otherwise full apply. `--revert` restores the whole
+	// backup, so dropping one fix means revert, then re-apply with this set.
+	const except = new Set((valueOf('--except') ?? '').split(',').filter(Boolean));
+	const mode = flag('--apply') ? 'apply' : flag('--revert') ? 'revert' : 'status';
+	const explicit = valueOf('--target');
+	const targets = explicit
+		? [explicit]
+		: [...workbenchTargets(), ...agentHostTargets()];
+
+	if (targets.length === 0) {
+		console.error('No bundles found. Is VS Code installed, and is docker running?');
+		process.exit(1);
+	}
+
+	const buildHashes = installedBuildHashes(targets);
+	const collected = [];
+	const io = fs.mkdtempSync(path.join(os.tmpdir(), 'vscodefix-'));
+	let failures = 0;
+	let skipped = 0;
+	try {
+		for (const target of targets) {
+			const kind = isDocker(target) || /agentHostMain\.js$/.test(target) ? 'agenthost' : 'workbench';
+			const label = isDocker(target) ? dockerPath(target) : target;
+			const header = `\n[${kind}] ${label}`;
+
+			let data;
+			try { data = readTarget(target, io); }
+			catch (err) { console.log(`${header}\n  unreadable: ${err.message}`); failures++; continue; }
+
+			const applicable = FIXES.filter(f => f.target === kind && (only.size === 0 || only.has(f.id)) && !except.has(f.id));
+			if (applicable.length === 0) { console.log(`${header}\n  no applicable fixes`); continue; }
+
+			// Superseded server versions pile up in the shared volume and match
+			// nothing. Stay quiet about them unless asked, so the output shows the
+			// handful of bundles that actually matter.
+			const stale = kind === 'agenthost' && !explicit
+				&& applicable.every(f => !f.patched.test(data) && data.match(new RegExp(f.unpatched.source, 'g')) === null);
+			if (stale && !flag('--verbose')) { skipped++; continue; }
+			console.log(header);
+
+			if (mode === 'revert') {
+				if (!backupExists(target, io)) { console.log('  no backup to restore'); continue; }
+				copyInPlace(target, label + BACKUP_SUFFIX, label);
+				console.log(`  reverted from ${BACKUP_SUFFIX}`);
+				continue;
+			}
+
+			let next = data;
+			const results = [];
+			for (const fix of applicable) {
+				if (fix.patched.test(next)) { results.push([fix, 'PATCHED']); continue; }
+				const hits = next.match(new RegExp(fix.unpatched.source, 'g'));
+				if (hits === null) { results.push([fix, 'site not found']); continue; }
+				if (hits.length !== 1) { results.push([fix, `ABORT: ${hits.length} occurrences`]); continue; }
+				if (mode === 'status') { results.push([fix, 'unpatched (patchable)']); continue; }
+				next = next.replace(fix.unpatched, fix.build);
+				results.push([fix, 'applying']);
+			}
+			for (const [fix, state] of results) { console.log(`  ${fix.id.padEnd(18)} ${state}`); }
+			collected.push({ label, kind, results });
+
+			if (mode === 'status' || next === data) { continue; }
+			if (!syntaxOk(next, io)) {
+				console.log('  ABORT: patched bundle fails a syntax check, nothing written');
+				failures++;
+				continue;
+			}
+			if (!backupExists(target, io)) {
+				copyInPlace(target, label, label + BACKUP_SUFFIX);
+				console.log(`  backup -> ${path.basename(label)}${BACKUP_SUFFIX}`);
+			}
+			writeTarget(target, next, io);
+			console.log(`  written (${sha(data)} -> ${sha(next)}). Restart VS Code fully.`);
+		}
+	} finally {
+		fs.rmSync(io, { recursive: true, force: true });
+	}
+	// A fix can stop matching after a VS Code update and quietly apply to the
+	// superseded copies only, where the aggregate counts still look healthy.
+	// Report that case against the bundle the running VS Code actually loads.
+	const liveGaps = [];
+	for (const fix of FIXES) {
+		const rows = collected.flatMap(c => c.results
+			.filter(([f]) => f.id === fix.id)
+			.map(([, state]) => ({ label: c.label, state, live: isLiveBundle(c.label, buildHashes) })));
+		const missing = rows.filter(r => r.live && r.state !== 'PATCHED' && r.state !== 'applying');
+		const elsewhere = rows.filter(r => !r.live && r.state === 'PATCHED').length;
+		if (missing.length > 0 && elsewhere > 0) { liveGaps.push({ fix, missing, elsewhere }); }
+	}
+	if (liveGaps.length > 0) {
+		console.log('\nLIVE BUNDLE CHECK');
+		for (const gap of liveGaps) {
+			console.log(`  ${gap.fix.id}: applied on ${gap.elsewhere} superseded bundle(s) but NOT on the bundle in use`);
+			for (const m of gap.missing) { console.log(`    ${m.state}: ${m.label}`); }
+		}
+		console.log('  Re-anchor these against the current bundle; the counts above hide the gap.');
+	}
+	if (skipped > 0) {
+		console.log(`\n(${skipped} superseded agent host bundle(s) matched nothing; --verbose to list)`);
+	}
+	process.exit(failures === 0 ? 0 : 1);
+}
+
+main();

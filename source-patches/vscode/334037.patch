@@ -1,0 +1,216 @@
+From 8f8f5925cb548a1f4e6cf3bb8aaddb2b419e03f3 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:28:23 -0400
+Subject: [PATCH 1/2] agentHost: let the workbench own confirmation for Claude
+ client tools
+
+The Claude SDK gates in-process MCP tools through canUseTool, so a
+workbench client tool (mcp__client__*) was routed through the generic
+pending_confirmation path even though the stream mapper had already
+readied it as a Running client execution. The extra host-side prompt
+regressed the tool call from Running back to PendingConfirmation, and
+the workbench rewrote that into a second ToolClientExecution request
+with no pre-approval, which is how a client tool could be readied and
+run twice (#330683).
+
+dispatchCanUseTool now allows client tools outright, after the
+interactive built-ins and before the server-tool auto-allow: the
+workbench confirms its own tools through requestConfirmation and
+preApproved, matching how the Copilot session skips the host permission
+for client tools. allowedTools is left alone because its semantics for
+in-process MCP tools under the plan and dontAsk modes are unverified.
+
+Adds a canUseTool test asserting that a client tool returns allow and
+produces no pending_confirmation signal.
+---
+ .../agentHost/node/claude/claudeCanUseTool.ts |  9 ++++++++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 19 +++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts b/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts
+index 12c33cbf54623..7dc3b689daf70 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts
+@@ -15,6 +15,7 @@ import { extractServerToolName } from './claudeServerToolMcpServer.js';
+ import { buildAskUserSessionInputQuestions, buildExitPlanModeConfirmationState, flattenAskUserAnswers, parseAskUserQuestionInput } from './claudeInteractiveTools.js';
+ import { CLAUDE_PLAN_DECLINED_MESSAGE, CLAUDE_QUESTION_CANCELLED_MESSAGE, CLAUDE_USER_DECLINED_MESSAGE } from './claudeToolDenial.js';
+ import { getClaudeConfirmationTitle, getClaudeInvocationMessage, getClaudePermissionKind, getClaudeToolDisplayName, getClaudeToolInputString, getClaudeToolPath, INTERACTIVE_CLAUDE_TOOLS, buildClaudeToolMeta } from './claudeToolDisplay.js';
++import { hasClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
+ 
+ /**
+  * Dependencies for {@link handleCanUseTool}. Kept narrow: a session
+@@ -71,7 +72,8 @@ export interface IClaudeCanUseToolOptions {
+  * ([sdk.d.ts:1558](../../../../../../extensions/copilot/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts#L1558))
+  * and only invokes `canUseTool` for tools it has decided the host
+  * needs to surface. The bridge additionally allows a server tool when its
+- * current session state has nothing to confirm. The interactive built-ins (`AskUserQuestion`,
++ * current session state has nothing to confirm, and any client tool, since the
++ * workbench confirms those itself. The interactive built-ins (`AskUserQuestion`,
+  * `ExitPlanMode`) are exempt from auto-approval and always reach
+  * `canUseTool` regardless of mode — their "permission" is itself the
+  * user-facing question.
+@@ -137,6 +139,11 @@ async function dispatchCanUseTool(
+ 		return handleInteractiveTool(deps, session, toolName, input, options);
+ 	}
+ 
++	if (hasClientToolNamePrefix(toolName)) {
++		// The workbench owns confirmation for its own client tools; a host-side prompt here would surface the call twice (#330683).
++		return { behavior: 'allow', updatedInput: input };
++	}
++
+ 	const serverToolName = extractServerToolName(toolName);
+ 	const serverToolHost = deps.serverToolHost;
+ 	if (serverToolName
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 12ba500c5b771..e148085b66e2e 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -6995,6 +6995,25 @@ suite('ClaudeAgent (Phase 7 §3.4 — _handleCanUseTool)', () => {
+ 		});
+ 	});
+ 
++	test('a client tool never reaches the pending_confirmation channel', async () => {
++		const { ctx, canUseTool } = await materialize();
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(signal => signals.push(signal)));
++		const input = { path: '/work/a.ts' };
++
++		const promise = canUseTool('mcp__client__editFile', input, makeOptions('tu_client_tool'));
++		await tick();
++		const pendingConfirmations = signals.filter(signal => signal.kind === 'pending_confirmation').length;
++		// Settles the parked request if the host wrongly prompted, so the test fails instead of hanging.
++		ctx.agent.respondToPermissionRequest('tu_client_tool', false);
++		const result = await promise;
++
++		assert.deepStrictEqual({ result, pendingConfirmations }, {
++			result: { behavior: 'allow', updatedInput: input },
++			pendingConfirmations: 0,
++		});
++	});
++
+ 	// Tests 3 and 4 (bypassPermissions / acceptEdits auto-allow) intentionally
+ 	// omitted: the SDK auto-approves under those modes BEFORE invoking
+ 	// `canUseTool`, so there is no host-side branch to exercise. See
+
+From 687dc8345d11961baab26b17b2ace76b6dcb28c5 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:46:47 -0400
+Subject: [PATCH 2/2] agentHost: only skip host confirmation for client tools a
+ window owns
+
+The early allow added for #330683 keyed on the mcp__client__ name
+prefix alone. Copilot review on #334037 pointed out that the SDK server
+map is built from the external MCP configuration and the in-process
+client server without a reserved-name check, so a workspace or user MCP
+server named client also emits mcp__client__* tools. When the window
+contributes no client tools that external server survives, and the
+prefix-only allow would skip confirmation for tools no window owns.
+
+dispatchCanUseTool now allows early only when the stripped tool name has
+an owner in the session's client-tool model, through a new hasClientTool
+accessor beside the other client-tool wrappers on ClaudeAgentSession.
+Anything carrying the prefix without an owner falls through to the
+existing MCP confirmation path unchanged. The mapper's own owner
+resolution is untouched.
+
+Reserving the server name client in _buildExternalMcpServers would be a
+further hardening and is left for a separate change.
+
+The positive test now registers the tool on an active client, and a
+negative test asserts that an unowned mcp__client__ tool still produces
+one pending_confirmation and denies when nobody approves it.
+---
+ .../node/claude/claudeAgentSession.ts         |  5 +++++
+ .../agentHost/node/claude/claudeCanUseTool.ts | 10 +++++-----
+ .../agentHost/test/node/claudeAgent.test.ts   | 20 ++++++++++++++++++-
+ 3 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 7ec7a0a50e79c..14f872d495971 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -1361,6 +1361,11 @@ export class ClaudeAgentSession extends Disposable {
+ 		return this.toolDiff.model.getTools(clientId);
+ 	}
+ 
++	/** Whether an active client of this session currently provides `toolName`. */
++	hasClientTool(toolName: string): boolean {
++		return this.toolDiff.model.ownerOf(toolName) !== undefined;
++	}
++
+ 	/** Remove a client's tool contribution from this session. */
+ 	removeClientTools(clientId: string): void {
+ 		this.toolDiff.model.removeClient(clientId);
+diff --git a/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts b/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts
+index 7dc3b689daf70..ad541beb496a6 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeCanUseTool.ts
+@@ -15,7 +15,7 @@ import { extractServerToolName } from './claudeServerToolMcpServer.js';
+ import { buildAskUserSessionInputQuestions, buildExitPlanModeConfirmationState, flattenAskUserAnswers, parseAskUserQuestionInput } from './claudeInteractiveTools.js';
+ import { CLAUDE_PLAN_DECLINED_MESSAGE, CLAUDE_QUESTION_CANCELLED_MESSAGE, CLAUDE_USER_DECLINED_MESSAGE } from './claudeToolDenial.js';
+ import { getClaudeConfirmationTitle, getClaudeInvocationMessage, getClaudePermissionKind, getClaudeToolDisplayName, getClaudeToolInputString, getClaudeToolPath, INTERACTIVE_CLAUDE_TOOLS, buildClaudeToolMeta } from './claudeToolDisplay.js';
+-import { hasClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
++import { hasClientToolNamePrefix, stripClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
+ 
+ /**
+  * Dependencies for {@link handleCanUseTool}. Kept narrow: a session
+@@ -72,8 +72,8 @@ export interface IClaudeCanUseToolOptions {
+  * ([sdk.d.ts:1558](../../../../../../extensions/copilot/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts#L1558))
+  * and only invokes `canUseTool` for tools it has decided the host
+  * needs to surface. The bridge additionally allows a server tool when its
+- * current session state has nothing to confirm, and any client tool, since the
+- * workbench confirms those itself. The interactive built-ins (`AskUserQuestion`,
++ * current session state has nothing to confirm, and a client tool an active client
++ * owns, since the workbench confirms those itself. The interactive built-ins (`AskUserQuestion`,
+  * `ExitPlanMode`) are exempt from auto-approval and always reach
+  * `canUseTool` regardless of mode — their "permission" is itself the
+  * user-facing question.
+@@ -139,8 +139,8 @@ async function dispatchCanUseTool(
+ 		return handleInteractiveTool(deps, session, toolName, input, options);
+ 	}
+ 
+-	if (hasClientToolNamePrefix(toolName)) {
+-		// The workbench owns confirmation for its own client tools; a host-side prompt here would surface the call twice (#330683).
++	if (hasClientToolNamePrefix(toolName) && session.hasClientTool(stripClientToolNamePrefix(toolName))) {
++		// The workbench confirms the client tools it owns (#330683); an external MCP server named "client" gets no such pass.
+ 		return { behavior: 'allow', updatedInput: input };
+ 	}
+ 
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index e148085b66e2e..c462e9cf14bf8 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -6996,7 +6996,8 @@ suite('ClaudeAgent (Phase 7 §3.4 — _handleCanUseTool)', () => {
+ 	});
+ 
+ 	test('a client tool never reaches the pending_confirmation channel', async () => {
+-		const { ctx, canUseTool } = await materialize();
++		const { ctx, canUseTool, sessionUri } = await materialize();
++		getOrCreateActiveClient(ctx.agent, defaultChatUri(sessionUri), 'client-1').tools = [{ name: 'editFile', inputSchema: { type: 'object' } }];
+ 		const signals: AgentSignal[] = [];
+ 		disposables.add(ctx.agent.onDidChatProgress(signal => signals.push(signal)));
+ 		const input = { path: '/work/a.ts' };
+@@ -7014,6 +7015,23 @@ suite('ClaudeAgent (Phase 7 §3.4 — _handleCanUseTool)', () => {
+ 		});
+ 	});
+ 
++	test('an mcp__client__ tool no window owns still prompts', async () => {
++		const { ctx, canUseTool } = await materialize();
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(signal => signals.push(signal)));
++
++		const promise = canUseTool('mcp__client__orphan', {}, makeOptions('tu_orphan_tool'));
++		await tick();
++		const pendingConfirmations = signals.filter(signal => signal.kind === 'pending_confirmation').length;
++		ctx.agent.respondToPermissionRequest('tu_orphan_tool', false);
++		const result = await promise;
++
++		assert.deepStrictEqual({ result, pendingConfirmations }, {
++			result: { behavior: 'deny', message: 'User declined' },
++			pendingConfirmations: 1,
++		});
++	});
++
+ 	// Tests 3 and 4 (bypassPermissions / acceptEdits auto-allow) intentionally
+ 	// omitted: the SDK auto-approves under those modes BEFORE invoking
+ 	// `canUseTool`, so there is no host-side branch to exercise. See

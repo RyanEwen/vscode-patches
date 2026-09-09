@@ -1,0 +1,103 @@
+From 5a6cf23a35f12d265c72ff657519cc7e26f47cea Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 20:33:06 -0400
+Subject: [PATCH 1/2] Report vision support for natively served Claude models
+
+A pasted image was attached, sent and understood, while the UI labelled it
+unsupported: the attachment rendered with a warning and "{model} does not
+support images".
+
+fromSdkModelInfo hardcoded supportsVision to false. The SDK's ModelInfo has no
+vision field, so that was standing in for "unknown", but nothing downstream
+treats it that way: the language model provider collapses the value to a
+boolean and the attachment widget takes it as authoritative, turning unknown
+into a claim that images are rejected.
+
+Every model this transport offers is a Claude model with image input, so that
+is what it now reports. The CAPI projection alongside it still reads the real
+capability.
+---
+ src/vs/platform/agentHost/node/claude/claudeAgent.ts    | 8 +++++++-
+ src/vs/platform/agentHost/test/node/claudeAgent.test.ts | 4 +++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index fbb9afc66aee6..994e4e4bd4fc5 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -167,7 +167,13 @@ export function fromSdkModelInfo(m: ModelInfo, provider: AgentProvider): IAgentM
+ 		// ids are SDK format end to end; `toSdkModelId` is identity at this seam.
+ 		id: m.value,
+ 		name: m.displayName,
+-		supportsVision: false,
++		// `ModelInfo` carries no vision capability, so this is the transport's
++		// answer rather than the model's: every row it offers is a Claude model,
++		// and image input is available across them. Reporting `false` was read as
++		// a positive claim downstream — the attachment renders with a warning and
++		// "{model} does not support images" — for images the model does receive.
++		// The CAPI projection above reads the real flag and is unaffected.
++		supportsVision: true,
+ 		...(configSchema ? { configSchema } : {}),
+ 	};
+ }
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index abc82e1abb1ac..27c692dc97e2c 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -1334,7 +1334,9 @@ suite('ClaudeAgent', () => {
+ 			provider: 'claude',
+ 			id: 'claude-sonnet-4-5-20250929',
+ 			name: 'Claude Sonnet 4.5',
+-			supportsVision: false,
++			// The SDK reports no vision capability; claiming the models lack it
++			// made the workbench label received images as unsupported.
++			supportsVision: true,
+ 			hasConfigSchema: true,
+ 			hasPolicyState: false,
+ 			hasMeta: false,
+
+From c6ea144e185565896af46d386efc3f49ec232a20 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:57:43 -0400
+Subject: [PATCH 2/2] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ src/vs/platform/agentHost/node/claude/claudeAgent.ts    | 7 +------
+ src/vs/platform/agentHost/test/node/claudeAgent.test.ts | 3 +--
+ 2 files changed, 2 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index 994e4e4bd4fc5..57fdc0139ceb0 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -167,12 +167,7 @@ export function fromSdkModelInfo(m: ModelInfo, provider: AgentProvider): IAgentM
+ 		// ids are SDK format end to end; `toSdkModelId` is identity at this seam.
+ 		id: m.value,
+ 		name: m.displayName,
+-		// `ModelInfo` carries no vision capability, so this is the transport's
+-		// answer rather than the model's: every row it offers is a Claude model,
+-		// and image input is available across them. Reporting `false` was read as
+-		// a positive claim downstream — the attachment renders with a warning and
+-		// "{model} does not support images" — for images the model does receive.
+-		// The CAPI projection above reads the real flag and is unaffected.
++		// The transport's answer, not the model's: every row it offers takes image input.
+ 		supportsVision: true,
+ 		...(configSchema ? { configSchema } : {}),
+ 	};
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 27c692dc97e2c..e7e45427a3c41 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -1334,8 +1334,7 @@ suite('ClaudeAgent', () => {
+ 			provider: 'claude',
+ 			id: 'claude-sonnet-4-5-20250929',
+ 			name: 'Claude Sonnet 4.5',
+-			// The SDK reports no vision capability; claiming the models lack it
+-			// made the workbench label received images as unsupported.
++			// Claiming the models lack vision made the workbench label received images unsupported.
+ 			supportsVision: true,
+ 			hasConfigSchema: true,
+ 			hasPolicyState: false,

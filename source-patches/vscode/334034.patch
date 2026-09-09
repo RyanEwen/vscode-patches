@@ -1,0 +1,1632 @@
+From 3efc665c2d79923f811ad8ad467933a080eb9f75 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 11:06:01 -0400
+Subject: [PATCH 1/2] agentPlugins: surface unreadable files in plugin
+ discovery
+
+The agent host runs inside the dev container with a file system
+provider for the file: scheme only, while a remote window addresses
+the same disk as vscode-remote://dev-container+... When such a URI
+reached the host's IFileService the read failed with ENOPRO, and the
+readJsonFile and pathExists helpers in pluginParsers.ts swallowed every
+error as "absent". A file system the host cannot address was therefore
+indistinguishable from a file that does not exist, which is why a whole
+cluster of namespace bugs (customizations, .mcp.json, CLAUDE.md, hooks
+and skills silently reading as missing in a remote window) stayed
+invisible for weeks.
+
+The helpers now classify the failure with toFileOperationResult: a
+genuinely missing file stays silent (FILE_NOT_FOUND, and also
+FILE_NOT_DIRECTORY, since a path under a regular file such as a file
+named .claude does not exist either), anything else is logged at warn
+level with the resource and the error message, and the helper still
+returns "absent" so discovery never crashes. The same swallow pattern
+around fileService.resolve in readSkills, readMarkdownComponents,
+readInstructionComponents, the Claude rule scan and the native plugin
+scan is replaced by a shared tryResolve helper with the same
+classification.
+
+The leaf helpers take the logger as a required, nullable parameter so
+every caller has to decide. The composite plugin readers that the
+workbench also calls take it as an optional trailing parameter and stay
+silent when it is omitted, which matches their previous behavior. On
+the agent host the logger is threaded from ClaudeAgentSession,
+ClaudeAgent, CopilotAgent and CodexAgent into the Claude hook, MCP,
+rule, skill and native plugin scans, SessionMcpDiscovery, the folder
+picker probe and parsePlugin.
+
+toFileSystemProviderErrorCode alone is not enough for this: FileService
+rethrows a missing file from resolve() as a FileOperationError with
+FILE_NOT_FOUND and wraps every readFile() error the same way, and a
+FileOperationError does not carry the "(FileSystemError)" name marker
+that function looks for.
+---
+ .../agentHost/node/claude/claudeAgent.ts      |   2 +-
+ .../node/claude/claudeAgentSession.ts         |  10 +-
+ .../node/claude/claudeFolderPickerCriteria.ts |   5 +-
+ .../claudeMultiRootCustomizationDiscovery.ts  |   6 +-
+ .../scan/claudeAgentSkillScan.ts              |  17 +--
+ .../customizations/scan/claudeHookScan.ts     |   4 +-
+ .../customizations/scan/claudeMcpScan.ts      |   4 +-
+ .../scan/claudeNativePluginScan.ts            |  43 +++----
+ .../customizations/scan/claudeRuleScan.ts     |  21 ++--
+ .../agentHost/node/codex/codexAgent.ts        |   4 +-
+ .../agentHost/node/copilot/copilotAgent.ts    |   4 +-
+ .../node/shared/sessionMcpDiscovery.ts        |  11 +-
+ .../claudeCommandSlashCompletion.test.ts      |   4 +-
+ .../claudeFolderPickerCriteria.test.ts        |   4 +-
+ ...udeMultiRootCustomizationDiscovery.test.ts |   2 +-
+ .../scan/claudeAgentSkillScan.test.ts         |  14 ++-
+ .../scan/claudeHookScan.test.ts               |  14 ++-
+ .../customizations/scan/claudeMcpScan.test.ts |  10 +-
+ .../scan/claudeRuleScan.test.ts               |   8 +-
+ .../node/shared/sessionMcpDiscovery.test.ts   |  13 ++-
+ .../agentPlugins/common/pluginParsers.ts      | 109 ++++++++++--------
+ .../test/common/pluginParsers.test.ts         |  77 ++++++++++++-
+ 22 files changed, 244 insertions(+), 142 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index dbb1d79a5b592..4a008e44f7dec 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -2610,7 +2610,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		if (!this._isMultiRootEnabled()) {
+ 			return undefined;
+ 		}
+-		return computeFolderPickerDecisionForRoots(workingDirectories, (directory, t) => claudeDirectoryQualifiesForPrimary(this._fileService, directory, this._environmentService.userHome, t), token);
++		return computeFolderPickerDecisionForRoots(workingDirectories, (directory, t) => claudeDirectoryQualifiesForPrimary(this._fileService, directory, this._environmentService.userHome, this._logService, t), token);
+ 	}
+ 
+ 	async startMcpServer(session: URI, id: string): Promise<void> {
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 7ec7a0a50e79c..64c077b55905b 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -509,7 +509,7 @@ export class ClaudeAgentSession extends Disposable {
+ 			this._logService,
+ 		));
+ 		store.add(watcher.onDidChange(() => this._onDidCustomizationsChange.fire()));
+-		this._mcpDiscovery = directories?.length ? store.add(new SessionMcpDiscovery(directories, this._fileService)) : undefined;
++		this._mcpDiscovery = directories?.length ? store.add(new SessionMcpDiscovery(directories, this._fileService, this._logService)) : undefined;
+ 		if (this._mcpDiscovery) {
+ 			store.add(this._mcpDiscovery.onDidChange(() => {
+ 				this.clientCustomizationsDiff.markDirty();
+@@ -912,7 +912,7 @@ export class ClaudeAgentSession extends Disposable {
+ 				continue;
+ 			}
+ 			try {
+-				const parsed = await parsePlugin(synced.pluginDir, this._fileService, primaryCwd, this._environmentService.userHome, synced.pluginDir);
++				const parsed = await parsePlugin(synced.pluginDir, this._fileService, primaryCwd, this._environmentService.userHome, synced.pluginDir, this._logService);
+ 				if (gitHubMcpServerConfiguration && parsed.mcpServers.some(definition => isGitHubMcpServerDefinition(definition, gitHubMcpServerConfiguration))) {
+ 					hasGitHubMcpServer = true;
+ 				}
+@@ -1493,9 +1493,9 @@ export class ClaudeAgentSession extends Disposable {
+ 		const userHome = this._environmentService.userHome;
+ 		const [multiRoot, rules, mcpServers, hooks] = await Promise.all([
+ 			discoverClaudeMultiRootCustomizations(this.workingDirectories, userHome, this._fileService, this._logService),
+-			scanClaudeRules(this.workingDirectory, userHome, this._fileService),
+-			scanClaudeMcpServers(this.workingDirectory, userHome, this._fileService),
+-			scanClaudeHooks(this.workingDirectory, userHome, this._fileService),
++			scanClaudeRules(this.workingDirectory, userHome, this._fileService, this._logService),
++			scanClaudeMcpServers(this.workingDirectory, userHome, this._fileService, this._logService),
++			scanClaudeHooks(this.workingDirectory, userHome, this._fileService, this._logService),
+ 		]);
+ 
+ 		// Post-materialize, the live SDK snapshot filters the disk set down to
+diff --git a/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts b/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts
+index c218a87c21f1d..e632b126f2deb 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts
+@@ -8,6 +8,7 @@ import { CancellationToken } from '../../../../base/common/cancellation.js';
+ import { joinPath } from '../../../../base/common/resources.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { IFileService } from '../../../files/common/files.js';
++import { ILogService } from '../../../log/common/log.js';
+ import { parseHooksJson, readJsonFile } from '../../../agentPlugins/common/pluginParsers.js';
+ 
+ /**
+@@ -27,13 +28,13 @@ import { parseHooksJson, readJsonFile } from '../../../agentPlugins/common/plugi
+  * rest; a cancelled {@link token} aborts them all. Missing or unreadable files
+  * count as "not qualifying".
+  */
+-export async function claudeDirectoryQualifiesForPrimary(fileService: IFileService, workingDirectory: URI, userHome: URI, token: CancellationToken = CancellationToken.None): Promise<boolean> {
++export async function claudeDirectoryQualifiesForPrimary(fileService: IFileService, workingDirectory: URI, userHome: URI, logService: ILogService, token: CancellationToken = CancellationToken.None): Promise<boolean> {
+ 	const probes: Array<() => Promise<boolean>> = [
+ 		() => fileService.exists(joinPath(workingDirectory, '.mcp.json')),
+ 		...['settings.json', 'settings.local.json'].map(fileName => {
+ 			const uri = joinPath(workingDirectory, '.claude', fileName);
+ 			return async (): Promise<boolean> => {
+-				const json = await readJsonFile(uri, fileService);
++				const json = await readJsonFile(uri, fileService, logService);
+ 				return json !== undefined && parseHooksJson(uri, json, workingDirectory, userHome).length > 0;
+ 			};
+ 		}),
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/claudeMultiRootCustomizationDiscovery.ts b/src/vs/platform/agentHost/node/claude/customizations/claudeMultiRootCustomizationDiscovery.ts
+index 24e05cb385e61..6a65f9fce5542 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/claudeMultiRootCustomizationDiscovery.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/claudeMultiRootCustomizationDiscovery.ts
+@@ -48,14 +48,14 @@ export async function discoverClaudeMultiRootCustomizations(
+ 	const roots = distinctClaudeWorkingDirectories(workingDirectories);
+ 	if (roots.length <= 1) {
+ 		const [discovered, nativePlugins] = await Promise.all([
+-			scanClaudeDiskCustomizations(roots[0], userHome, fileService),
++			scanClaudeDiskCustomizations(roots[0], userHome, fileService, logService),
+ 			scanClaudeNativePlugins(roots[0], userHome, fileService, logService),
+ 		]);
+ 		return { workingDirectories: roots, discovered, nativePlugins };
+ 	}
+ 	const [rootScopes, userScope, nativePlugins] = await Promise.all([
+-		Promise.all(roots.map((root, index) => scanClaudeCustomizationScope(root, fileService, index === 0))),
+-		scanClaudeCustomizationScope(userHome, fileService),
++		Promise.all(roots.map((root, index) => scanClaudeCustomizationScope(root, fileService, logService, index === 0))),
++		scanClaudeCustomizationScope(userHome, fileService, logService),
+ 		scanClaudeNativePluginsForRoots(roots, userHome, fileService, logService),
+ 	]);
+ 	const scopes = [...rootScopes, userScope];
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts
+index c4dffdc795c1b..3b1ae000fd72b 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts
+@@ -6,6 +6,7 @@
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { dirname } from '../../../../../../base/common/resources.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { ILogService } from '../../../../../log/common/log.js';
+ import { detectPluginFormat, readAgentComponents, readSkills, toParsedAgent, toParsedSkill, type INamedPluginResource, type IParsedAgent, type IParsedSkill } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { CustomizationType } from '../../../../common/state/protocol/channels-session/state.js';
+ 
+@@ -46,10 +47,10 @@ function collectByName<T extends INamedPluginResource>(into: Map<string, T>, ite
+  * {@link detectPluginFormat}) so it holds for Claude / Open Plugins /
+  * Copilot layouts and regardless of whether the plugin is enabled.
+  */
+-async function excludeNativePluginSkills<T extends INamedPluginResource>(skills: readonly T[], fileService: IFileService): Promise<T[]> {
++async function excludeNativePluginSkills<T extends INamedPluginResource>(skills: readonly T[], fileService: IFileService, logService: ILogService): Promise<T[]> {
+ 	const isPluginDir = await Promise.all(skills.map(async skill => {
+ 		const dir = dirname(skill.uri);
+-		const format = await detectPluginFormat(dir, fileService);
++		const format = await detectPluginFormat(dir, fileService, logService);
+ 		return fileService.exists(URI.joinPath(dir, format.manifestPath));
+ 	}));
+ 	return skills.filter((_, i) => !isPluginDir[i]);
+@@ -58,18 +59,19 @@ async function excludeNativePluginSkills<T extends INamedPluginResource>(skills:
+ export async function scanClaudeCustomizationScope(
+ 	scope: URI,
+ 	fileService: IFileService,
++	logService: ILogService,
+ 	includeCommands: boolean = true,
+ ): Promise<readonly (IParsedAgent | IParsedSkill)[]> {
+ 	const { agents: agentsDir, skills: skillsDir, commands: commandsDir } = scopeRoots(scope);
+ 	const [agentResources, skillResources, commandResources] = await Promise.all([
+-		readAgentComponents([agentsDir], fileService),
+-		readSkills(skillsDir, [skillsDir], fileService),
+-		includeCommands ? readAgentComponents([commandsDir], fileService) : [],
++		readAgentComponents([agentsDir], fileService, { logService }),
++		readSkills(skillsDir, [skillsDir], fileService, { logService }),
++		includeCommands ? readAgentComponents([commandsDir], fileService, { logService }) : [],
+ 	]);
+ 	const agents = new Map<string, IParsedAgent>();
+ 	const skills = new Map<string, IParsedSkill>();
+ 	collectByName(agents, agentResources.map(toParsedAgent));
+-	const standaloneSkills = await excludeNativePluginSkills(skillResources, fileService);
++	const standaloneSkills = await excludeNativePluginSkills(skillResources, fileService, logService);
+ 	collectByName(skills, standaloneSkills.map(toParsedSkill));
+ 	collectByName(skills, commandResources.map(toParsedSkill));
+ 	return [...agents.values(), ...skills.values()];
+@@ -98,6 +100,7 @@ export async function scanClaudeDiskCustomizations(
+ 	workingDirectory: URI | undefined,
+ 	userHome: URI,
+ 	fileService: IFileService,
++	logService: ILogService,
+ ): Promise<readonly (IParsedAgent | IParsedSkill)[]> {
+ 	// Project scope first so it wins precedence over user scope.
+ 	const scopes = workingDirectory ? [workingDirectory, userHome] : [userHome];
+@@ -105,7 +108,7 @@ export async function scanClaudeDiskCustomizations(
+ 	const skills = new Map<string, IParsedSkill>();
+ 
+ 	for (const scope of scopes) {
+-		const discovered = await scanClaudeCustomizationScope(scope, fileService);
++		const discovered = await scanClaudeCustomizationScope(scope, fileService, logService);
+ 		collectByName(agents, discovered.filter((item): item is IParsedAgent => item.customization.type === CustomizationType.Agent));
+ 		collectByName(skills, discovered.filter((item): item is IParsedSkill => item.customization.type === CustomizationType.Skill));
+ 	}
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeHookScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeHookScan.ts
+index 28059ce558491..6af83a55682ed 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeHookScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeHookScan.ts
+@@ -6,6 +6,7 @@
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { ResourceSet } from '../../../../../../base/common/map.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { ILogService } from '../../../../../log/common/log.js';
+ import { parseHooksJson, readJsonFile } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { type HookCustomization } from '../../../../common/state/protocol/channels-session/state.js';
+ 
+@@ -46,6 +47,7 @@ export async function scanClaudeHooks(
+ 	workingDirectory: URI | undefined,
+ 	userHome: URI,
+ 	fileService: IFileService,
++	logService: ILogService,
+ ): Promise<readonly HookCustomization[]> {
+ 	const result: HookCustomization[] = [];
+ 	const seen = new ResourceSet();
+@@ -57,7 +59,7 @@ export async function scanClaudeHooks(
+ 			continue;
+ 		}
+ 		seen.add(uri);
+-		const raw = await readJsonFile(uri, fileService);
++		const raw = await readJsonFile(uri, fileService, logService);
+ 		if (raw === undefined) {
+ 			continue;
+ 		}
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeMcpScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeMcpScan.ts
+index f57e7b52d265b..e073beb562284 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeMcpScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeMcpScan.ts
+@@ -5,6 +5,7 @@
+ 
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { ILogService } from '../../../../../log/common/log.js';
+ import { makeMcpServerCustomization, readJsonFile } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { McpServerStatus, type McpServerCustomization, type McpServerState } from '../../../../common/state/protocol/channels-session/state.js';
+ 
+@@ -53,11 +54,12 @@ export async function scanClaudeMcpServers(
+ 	workingDirectory: URI | undefined,
+ 	userHome: URI,
+ 	fileService: IFileService,
++	logService: ILogService,
+ ): Promise<readonly McpServerCustomization[]> {
+ 	const seen = new Set<string>();
+ 	const result: McpServerCustomization[] = [];
+ 	for (const uri of claudeMcpFiles(workingDirectory, userHome)) {
+-		const raw = await readJsonFile(uri, fileService);
++		const raw = await readJsonFile(uri, fileService, logService);
+ 		const servers = extractMcpServerMap(uri, raw);
+ 		if (!servers) {
+ 			continue;
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts
+index 70d0608192a9f..4d15ce90e8a5a 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts
+@@ -7,7 +7,7 @@ import { URI } from '../../../../../../base/common/uri.js';
+ import { ResourceSet } from '../../../../../../base/common/map.js';
+ import { IFileService } from '../../../../../files/common/files.js';
+ import { ILogService } from '../../../../../log/common/log.js';
+-import { detectPluginFormat, parsePlugin, readJsonFile, type IParsedPlugin } from '../../../../../agentPlugins/common/pluginParsers.js';
++import { detectPluginFormat, parsePlugin, readJsonFile, tryResolve, type IParsedPlugin } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { findMostSpecificClaudeWorkspaceRoot, selectEnabledClaudePluginIds } from '../claudeCustomizationPolicy.js';
+ 
+ /**
+@@ -47,9 +47,9 @@ function claudeSettingsFilesByPrecedence(workingDirectory: URI | undefined, user
+ 	return files;
+ }
+ 
+-async function readEnabledPlugins(uri: URI, fileService: IFileService): Promise<ReadonlyMap<string, boolean>> {
++async function readEnabledPlugins(uri: URI, fileService: IFileService, logService: ILogService): Promise<ReadonlyMap<string, boolean>> {
+ 	const result = new Map<string, boolean>();
+-	const raw = await readJsonFile(uri, fileService);
++	const raw = await readJsonFile(uri, fileService, logService);
+ 	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+ 		return result;
+ 	}
+@@ -69,7 +69,7 @@ async function readEnabledPlugins(uri: URI, fileService: IFileService): Promise<
+  * constraint), or an object (extended form) — all of which mean
+  * **enabled**; only `false` disables. Later scopes override earlier ones.
+  */
+-async function resolveEnabledPluginIds(workingDirectory: URI | undefined, userHome: URI, fileService: IFileService): Promise<string[]> {
++async function resolveEnabledPluginIds(workingDirectory: URI | undefined, userHome: URI, fileService: IFileService, logService: ILogService): Promise<string[]> {
+ 	const effective = new Map<string, boolean>();
+ 	const seenFiles = new ResourceSet();
+ 	for (const uri of claudeSettingsFilesByPrecedence(workingDirectory, userHome)) {
+@@ -77,7 +77,7 @@ async function resolveEnabledPluginIds(workingDirectory: URI | undefined, userHo
+ 			continue;
+ 		}
+ 		seenFiles.add(uri);
+-		const raw = await readJsonFile(uri, fileService);
++		const raw = await readJsonFile(uri, fileService, logService);
+ 		if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+ 			continue;
+ 		}
+@@ -119,8 +119,8 @@ function splitPluginId(id: string): { readonly plugin: string; readonly marketpl
+  * (`.plugin/plugin.json`), and Copilot (`plugin.json`) layouts — the same
+  * formats {@link parsePlugin} can parse — rather than only the Claude one.
+  */
+-async function hasManifest(dir: URI, fileService: IFileService): Promise<boolean> {
+-	const format = await detectPluginFormat(dir, fileService);
++async function hasManifest(dir: URI, fileService: IFileService, logService: ILogService): Promise<boolean> {
++	const format = await detectPluginFormat(dir, fileService, logService);
+ 	return fileService.exists(URI.joinPath(dir, format.manifestPath));
+ }
+ 
+@@ -129,14 +129,14 @@ async function hasManifest(dir: URI, fileService: IFileService): Promise<boolean
+  * workspace scope over the user scope. Accepts a candidate only when it
+  * holds a plugin manifest.
+  */
+-async function resolveSkillsDirRoot(plugin: string, workingDirectories: readonly URI[], userHome: URI, fileService: IFileService): Promise<URI | undefined> {
++async function resolveSkillsDirRoot(plugin: string, workingDirectories: readonly URI[], userHome: URI, fileService: IFileService, logService: ILogService): Promise<URI | undefined> {
+ 	const candidates: URI[] = [];
+ 	for (const workingDirectory of workingDirectories) {
+ 		candidates.push(URI.joinPath(workingDirectory, '.claude', 'skills', plugin));
+ 	}
+ 	candidates.push(URI.joinPath(userHome, '.claude', 'skills', plugin));
+ 	for (const candidate of candidates) {
+-		if (await hasManifest(candidate, fileService)) {
++		if (await hasManifest(candidate, fileService, logService)) {
+ 			return candidate;
+ 		}
+ 	}
+@@ -152,23 +152,18 @@ async function resolveSkillsDirRoot(plugin: string, workingDirectories: readonly
+  * version subdir). Returns `undefined` (caller warns + skips) when no
+  * manifest-bearing candidate is found.
+  */
+-async function resolveMarketplaceCacheRoot(plugin: string, marketplace: string, userHome: URI, fileService: IFileService): Promise<URI | undefined> {
++async function resolveMarketplaceCacheRoot(plugin: string, marketplace: string, userHome: URI, fileService: IFileService, logService: ILogService): Promise<URI | undefined> {
+ 	const base = URI.joinPath(userHome, '.claude', 'plugins', 'cache', marketplace, plugin);
+-	if (await hasManifest(base, fileService)) {
++	if (await hasManifest(base, fileService, logService)) {
+ 		return base;
+ 	}
+-	let stat;
+-	try {
+-		stat = await fileService.resolve(base);
+-	} catch {
+-		return undefined;
+-	}
+-	if (!stat.isDirectory || !stat.children) {
++	const stat = await tryResolve(base, fileService, logService);
++	if (!stat?.isDirectory || !stat.children) {
+ 		return undefined;
+ 	}
+ 	let best: { readonly uri: URI; readonly mtime: number; readonly name: string } | undefined;
+ 	for (const child of stat.children) {
+-		if (!child.isDirectory || !(await hasManifest(child.resource, fileService))) {
++		if (!child.isDirectory || !(await hasManifest(child.resource, fileService, logService))) {
+ 			continue;
+ 		}
+ 		const mtime = child.mtime ?? 0;
+@@ -203,7 +198,7 @@ export async function scanClaudeNativePlugins(
+ 	fileService: IFileService,
+ 	logService: ILogService,
+ ): Promise<readonly IResolvedNativePlugin[]> {
+-	const ids = await resolveEnabledPluginIds(workingDirectory, userHome, fileService);
++	const ids = await resolveEnabledPluginIds(workingDirectory, userHome, fileService, logService);
+ 	return resolveNativePlugins(ids, workingDirectory ? [workingDirectory] : [], userHome, fileService, logService);
+ }
+ 
+@@ -221,7 +216,7 @@ export async function scanClaudeNativePluginsForRoots(
+ 		);
+ 	}
+ 	settingsFiles.push(URI.joinPath(userHome, '.claude', 'settings.json'));
+-	const ids = selectEnabledClaudePluginIds(await Promise.all(settingsFiles.map(uri => readEnabledPlugins(uri, fileService))));
++	const ids = selectEnabledClaudePluginIds(await Promise.all(settingsFiles.map(uri => readEnabledPlugins(uri, fileService, logService))));
+ 	return resolveNativePlugins(ids, workingDirectories, userHome, fileService, logService);
+ }
+ 
+@@ -241,8 +236,8 @@ async function resolveNativePlugins(
+ 			continue;
+ 		}
+ 		const root = parts.marketplace === SKILLS_DIR_MARKETPLACE
+-			? await resolveSkillsDirRoot(parts.plugin, workingDirectories, userHome, fileService)
+-			: await resolveMarketplaceCacheRoot(parts.plugin, parts.marketplace, userHome, fileService);
++			? await resolveSkillsDirRoot(parts.plugin, workingDirectories, userHome, fileService, logService)
++			: await resolveMarketplaceCacheRoot(parts.plugin, parts.marketplace, userHome, fileService, logService);
+ 		if (!root) {
+ 			logService.warn(`[claudeNativePluginScan] could not resolve an on-disk root for enabled plugin '${id}'`);
+ 			continue;
+@@ -255,7 +250,7 @@ async function resolveNativePlugins(
+ 			const workspaceRoot = parts.marketplace === SKILLS_DIR_MARKETPLACE
+ 				? findMostSpecificClaudeWorkspaceRoot(root, workingDirectories)
+ 				: undefined;
+-			const parsed = await parsePlugin(root, fileService, workspaceRoot ?? workingDirectories[0], userHome, root);
++			const parsed = await parsePlugin(root, fileService, workspaceRoot ?? workingDirectories[0], userHome, root, logService);
+ 			result.push({ id, root, parsed });
+ 		} catch (err) {
+ 			logService.warn(`[claudeNativePluginScan] failed to parse plugin '${id}' at '${root.toString()}': ${err instanceof Error ? err.message : String(err)}`);
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeRuleScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeRuleScan.ts
+index ca07c707e58fb..875296e6c06a7 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeRuleScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeRuleScan.ts
+@@ -6,7 +6,8 @@
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { basename } from '../../../../../../base/common/resources.js';
+ import { IFileService } from '../../../../../files/common/files.js';
+-import { parseRuleFile, pathExists, type IParsedRule } from '../../../../../agentPlugins/common/pluginParsers.js';
++import { ILogService } from '../../../../../log/common/log.js';
++import { parseRuleFile, pathExists, tryResolve, type IParsedRule } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { CustomizationType } from '../../../../common/state/protocol/channels-session/state.js';
+ import { customizationId, type RuleCustomization } from '../../../../common/state/sessionState.js';
+ 
+@@ -42,27 +43,22 @@ export function claudeMemoryFiles(workingDirectory: URI | undefined, userHome: U
+  */
+ const MAX_RULE_SCAN_DEPTH = 32;
+ 
+-async function readMarkdownFilesRecursive(dir: URI, fileService: IFileService, seen = new Set<string>(), depth = 0): Promise<URI[]> {
++async function readMarkdownFilesRecursive(dir: URI, fileService: IFileService, logService: ILogService, seen = new Set<string>(), depth = 0): Promise<URI[]> {
+ 	const key = dir.toString();
+ 	if (depth > MAX_RULE_SCAN_DEPTH || seen.has(key)) {
+ 		return [];
+ 	}
+ 	seen.add(key);
+ 
+-	let stat;
+-	try {
+-		stat = await fileService.resolve(dir);
+-	} catch {
+-		return [];
+-	}
+-	if (!stat.isDirectory || !stat.children) {
++	const stat = await tryResolve(dir, fileService, logService);
++	if (!stat?.isDirectory || !stat.children) {
+ 		return [];
+ 	}
+ 
+ 	const files: URI[] = [];
+ 	for (const child of stat.children) {
+ 		if (child.isDirectory) {
+-			files.push(...await readMarkdownFilesRecursive(child.resource, fileService, seen, depth + 1));
++			files.push(...await readMarkdownFilesRecursive(child.resource, fileService, logService, seen, depth + 1));
+ 		} else if (child.isFile && child.resource.path.toLowerCase().endsWith('.md')) {
+ 			files.push(child.resource);
+ 		}
+@@ -87,12 +83,13 @@ export async function scanClaudeRules(
+ 	workingDirectory: URI | undefined,
+ 	userHome: URI,
+ 	fileService: IFileService,
++	logService: ILogService,
+ ): Promise<readonly IParsedRule[]> {
+ 	const result: IParsedRule[] = [];
+ 
+ 	// CLAUDE.md memory files — always-on, no path scoping, no frontmatter.
+ 	for (const uri of claudeMemoryFiles(workingDirectory, userHome)) {
+-		if (await pathExists(uri, fileService)) {
++		if (await pathExists(uri, fileService, logService)) {
+ 			const ruleUri = uri.toString();
+ 			const name = basename(uri);
+ 			const customization: RuleCustomization = {
+@@ -109,7 +106,7 @@ export async function scanClaudeRules(
+ 	// `.claude/rules/**\/*.md` — path-scoped when `paths` frontmatter present.
+ 	const scopes = workingDirectory ? [workingDirectory, userHome] : [userHome];
+ 	for (const scope of scopes) {
+-		const files = await readMarkdownFilesRecursive(URI.joinPath(scope, '.claude', 'rules'), fileService);
++		const files = await readMarkdownFilesRecursive(URI.joinPath(scope, '.claude', 'rules'), fileService, logService);
+ 		for (const uri of files) {
+ 			const parsed = await parseRuleFile(uri, fileService);
+ 			const ruleUri = uri.toString();
+diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+index 7a7a77019c5b6..a8f3bbd8192b6 100644
+--- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
++++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+@@ -2582,7 +2582,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		if (entry?.rootsSignature !== rootsSignature) {
+ 			entry?.dispose();
+ 			const store = new DisposableStore();
+-			const discovery = store.add(new SessionMcpDiscovery(roots, this._fileService));
++			const discovery = store.add(new SessionMcpDiscovery(roots, this._fileService, this._logService));
+ 			store.add(discovery.onDidChange(() => {
+ 				session.materializedMcpSig = undefined;
+ 				if (session.firstTurnSent) {
+@@ -6957,7 +6957,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			return { synced, parsed: undefined, input };
+ 		}
+ 		try {
+-			const parsed = await parsePlugin(synced.pluginDir, this._fileService, session.workingDirectory, this._environmentService.userHome, synced.pluginDir);
++			const parsed = await parsePlugin(synced.pluginDir, this._fileService, session.workingDirectory, this._environmentService.userHome, synced.pluginDir, this._logService);
+ 			const candidate = { ...synced.customization, children: parsedPluginChildren(parsed) };
+ 			const clientPlugins = input ? new Map([[input.uri, input]]) : undefined;
+ 			const resolution = resolveCustomizationEnablement(this._customizationEnablementService, session.configurationResource, [candidate], input?.childEnablement ? new Map([[input.uri, input.childEnablement]]) : undefined, clientPlugins);
+diff --git a/src/vs/platform/agentHost/node/copilot/copilotAgent.ts b/src/vs/platform/agentHost/node/copilot/copilotAgent.ts
+index 753277506abbe..5a3235353a04a 100644
+--- a/src/vs/platform/agentHost/node/copilot/copilotAgent.ts
++++ b/src/vs/platform/agentHost/node/copilot/copilotAgent.ts
+@@ -6053,7 +6053,7 @@ class PluginController extends Disposable {
+ 
+ 	public async tryParsePlugin(pluginDir: URI): Promise<IParsedPlugin | undefined> {
+ 		try {
+-			return await parsePlugin(pluginDir, this._fileService, undefined, this.getUserHome(), pluginDir);
++			return await parsePlugin(pluginDir, this._fileService, undefined, this.getUserHome(), pluginDir, this._logService);
+ 		} catch (error) {
+ 			this._logService.warn(`[Copilot:PluginController] Error parsing plugin '${pluginDir.toString()}': ${error instanceof Error ? error.message : String(error)}`);
+ 			return undefined;
+@@ -6484,7 +6484,7 @@ class SessionPluginController extends Disposable {
+ 		}
+ 		if (!this._sessionMcpDiscovery.value) {
+ 			const store = new DisposableStore();
+-			const discovery = store.add(new SessionMcpDiscovery([this._directory, ...this._additionalDirectories], this._fileService));
++			const discovery = store.add(new SessionMcpDiscovery([this._directory, ...this._additionalDirectories], this._fileService, this._logService));
+ 			store.add(discovery.onDidChange(() => this._publish(() => ({
+ 				type: ActionType.SessionCustomizationsChanged,
+ 				customizations: [...this.getCustomizations()],
+diff --git a/src/vs/platform/agentHost/node/shared/sessionMcpDiscovery.ts b/src/vs/platform/agentHost/node/shared/sessionMcpDiscovery.ts
+index 01ba1980e25a7..996b0f8ee3317 100644
+--- a/src/vs/platform/agentHost/node/shared/sessionMcpDiscovery.ts
++++ b/src/vs/platform/agentHost/node/shared/sessionMcpDiscovery.ts
+@@ -10,6 +10,7 @@ import { ResourceMap } from '../../../../base/common/map.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { makeMcpServerCustomization, normalizeMcpServerConfiguration, readJsonFile, resolveMcpServersMap, type IMcpServerDefinition } from '../../../agentPlugins/common/pluginParsers.js';
+ import type { IFileService } from '../../../files/common/files.js';
++import type { ILogService } from '../../../log/common/log.js';
+ 
+ class RootMcpDiscovery extends Disposable {
+ 
+@@ -29,6 +30,7 @@ class RootMcpDiscovery extends Disposable {
+ 	constructor(
+ 		private readonly _root: URI,
+ 		private readonly _fileService: IFileService,
++		private readonly _logService: ILogService,
+ 	) {
+ 		super();
+ 		this._definitionUri = URI.joinPath(_root, '.mcp.json');
+@@ -64,7 +66,7 @@ class RootMcpDiscovery extends Disposable {
+ 
+ 	private async _scan(): Promise<readonly IMcpServerDefinition[]> {
+ 		const definitions: IMcpServerDefinition[] = [];
+-		const raw = resolveMcpServersMap(await readJsonFile(this._definitionUri, this._fileService));
++		const raw = resolveMcpServersMap(await readJsonFile(this._definitionUri, this._fileService, this._logService));
+ 		if (!raw) {
+ 			return definitions;
+ 		}
+@@ -91,7 +93,7 @@ interface ISharedRootMcpDiscovery {
+ 
+ const sharedRootDiscoveries = new WeakMap<IFileService, ResourceMap<ISharedRootMcpDiscovery>>();
+ 
+-function acquireRootMcpDiscovery(root: URI, fileService: IFileService): { readonly discovery: RootMcpDiscovery; dispose(): void } {
++function acquireRootMcpDiscovery(root: URI, fileService: IFileService, logService: ILogService): { readonly discovery: RootMcpDiscovery; dispose(): void } {
+ 	let byRoot = sharedRootDiscoveries.get(fileService);
+ 	if (!byRoot) {
+ 		byRoot = new ResourceMap();
+@@ -99,7 +101,7 @@ function acquireRootMcpDiscovery(root: URI, fileService: IFileService): { readon
+ 	}
+ 	let entry = byRoot.get(root);
+ 	if (!entry) {
+-		entry = { discovery: new RootMcpDiscovery(root, fileService), refCount: 0 };
++		entry = { discovery: new RootMcpDiscovery(root, fileService, logService), refCount: 0 };
+ 		byRoot.set(root, entry);
+ 	}
+ 	entry.refCount++;
+@@ -140,10 +142,11 @@ export class SessionMcpDiscovery extends Disposable {
+ 	constructor(
+ 		workingDirectories: readonly URI[],
+ 		fileService: IFileService,
++		logService: ILogService,
+ 	) {
+ 		super();
+ 		this._roots = workingDirectories.map(root => {
+-			const acquired = this._register(acquireRootMcpDiscovery(root, fileService));
++			const acquired = this._register(acquireRootMcpDiscovery(root, fileService, logService));
+ 			this._register(acquired.discovery.onDidChange(() => {
+ 				void this._refreshFromSnapshots();
+ 			}));
+diff --git a/src/vs/platform/agentHost/test/node/customizations/claudeCommandSlashCompletion.test.ts b/src/vs/platform/agentHost/test/node/customizations/claudeCommandSlashCompletion.test.ts
+index a7496b3d4f9c9..fba331ef2aa2d 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/claudeCommandSlashCompletion.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/claudeCommandSlashCompletion.test.ts
+@@ -8,6 +8,7 @@ import { CancellationToken } from '../../../../../base/common/cancellation.js';
+ import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+ import { IFileService } from '../../../../files/common/files.js';
++import { NullLogService } from '../../../../log/common/log.js';
+ import { CompletionItem, CompletionItemKind } from '../../../common/state/protocol/commands.js';
+ import { MessageAttachmentKind } from '../../../common/state/sessionState.js';
+ import { AgentHostSkillCompletionProvider } from '../../../node/agentHostSkillCompletionProvider.js';
+@@ -29,6 +30,7 @@ suite('Claude .claude/commands → slash completion (end-to-end)', () => {
+ 
+ 	const disposables = new DisposableStore();
+ 	let fileService: IFileService;
++	const logService = new NullLogService();
+ 	const seed = (path: string, content = '') => seedFile(fileService, path, content);
+ 
+ 	setup(() => {
+@@ -51,7 +53,7 @@ suite('Claude .claude/commands → slash completion (end-to-end)', () => {
+ 	 * mock agent, and return the `/` completions for `text`.
+ 	 */
+ 	async function slashCompletions(text: string, sdk: ISdkResolvedCustomizations | undefined): Promise<readonly CompletionItem[]> {
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 		const customizations = buildDiscoveredCustomizations(discovered, [], [], [], workspace, userHome, sdk);
+ 
+ 		const agent = disposables.add(new MockAgent('mock'));
+diff --git a/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts b/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts
+index 750363c7d2c47..fb7857ddf70ce 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts
+@@ -9,6 +9,7 @@ import { Schemas } from '../../../../../base/common/network.js';
+ import { URI } from '../../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+ import { IFileService } from '../../../../files/common/files.js';
++import { NullLogService } from '../../../../log/common/log.js';
+ import { claudeDirectoryQualifiesForPrimary } from '../../../node/claude/claudeFolderPickerCriteria.js';
+ import { createInMemoryFileService, seedFile } from './claudeCustomizationTestUtils.js';
+ 
+@@ -16,6 +17,7 @@ suite('claudeDirectoryQualifiesForPrimary', () => {
+ 
+ 	const disposables = new DisposableStore();
+ 	let fileService: IFileService;
++	const logService = new NullLogService();
+ 	const userHome = URI.from({ scheme: Schemas.inMemory, path: '/home' });
+ 	const hooks = JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ type: 'command', command: 'echo hi' }] }] } });
+ 
+@@ -28,7 +30,7 @@ suite('claudeDirectoryQualifiesForPrimary', () => {
+ 	});
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+ 
+-	const qualifies = (path: string) => claudeDirectoryQualifiesForPrimary(fileService, URI.from({ scheme: Schemas.inMemory, path }), userHome);
++	const qualifies = (path: string) => claudeDirectoryQualifiesForPrimary(fileService, URI.from({ scheme: Schemas.inMemory, path }), userHome, logService);
+ 
+ 	test('qualifies on an .mcp.json manifest or a non-empty hooks block, and ignores empty/disabled hooks', async () => {
+ 		await seedFile(fileService, '/mcp/.mcp.json', '{}');
+diff --git a/src/vs/platform/agentHost/test/node/customizations/claudeMultiRootCustomizationDiscovery.test.ts b/src/vs/platform/agentHost/test/node/customizations/claudeMultiRootCustomizationDiscovery.test.ts
+index df0acde0816c0..cb99597c8fdef 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/claudeMultiRootCustomizationDiscovery.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/claudeMultiRootCustomizationDiscovery.test.ts
+@@ -50,7 +50,7 @@ suite('claudeMultiRootCustomizationDiscovery', () => {
+ 		]);
+ 		const logService = new NullLogService();
+ 		const [expectedDiscovered, expectedPlugins, actual] = await Promise.all([
+-			scanClaudeDiskCustomizations(rootA, userHome, fileService),
++			scanClaudeDiskCustomizations(rootA, userHome, fileService, logService),
+ 			scanClaudeNativePlugins(rootA, userHome, fileService, logService),
+ 			discoverClaudeMultiRootCustomizations([rootA], userHome, fileService, logService),
+ 		]);
+diff --git a/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts b/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts
+index 910e609724b80..ee1bf68a20b74 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts
+@@ -7,6 +7,7 @@ import assert from 'assert';
+ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { NullLogService } from '../../../../../log/common/log.js';
+ import { CustomizationType } from '../../../../common/state/protocol/state.js';
+ import { scanClaudeDiskCustomizations } from '../../../../node/claude/customizations/scan/claudeAgentSkillScan.js';
+ import { claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
+@@ -16,6 +17,7 @@ suite('claudeAgentSkillScan', () => {
+ 
+ 	const disposables = new DisposableStore();
+ 	let fileService: IFileService;
++	const logService = new NullLogService();
+ 	const seed = (path: string, content = '') => seedFile(fileService, path, content);
+ 
+ 	setup(() => {
+@@ -33,7 +35,7 @@ suite('claudeAgentSkillScan', () => {
+ 		// Slash commands are a variant of skills (spec §3) — discovered as Skill kind.
+ 		const command = await seed('/workspace/.claude/commands/c.md', '---\nname: c-cmd\ndescription: Command C\n---\nbody');
+ 
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 		const actual = discovered
+ 			.map(d => ({ type: d.customization.type, uri: d.uri.toString(), name: d.name, description: d.description }))
+ 			.sort((a, b) => a.uri.localeCompare(b.uri));
+@@ -49,7 +51,7 @@ suite('claudeAgentSkillScan', () => {
+ 		await seed('/workspace/.claude/skills/s/SKILL.md', '---\nname: skill\nuser-invocable: false\ndisable-model-invocation: true\n---\nbody');
+ 		await seed('/workspace/.claude/commands/c.md', '---\nname: command\nuser-invocable: false\ndisable-model-invocation: true\n---\nbody');
+ 
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(discovered.map(item => ({
+ 			name: item.name,
+@@ -65,7 +67,7 @@ suite('claudeAgentSkillScan', () => {
+ 		const skill = await seed('/workspace/.claude/skills/dup/SKILL.md', '---\nname: dup\ndescription: The skill\n---\nbody');
+ 		await seed('/workspace/.claude/commands/dup.md', '---\nname: dup\ndescription: The command\n---\nbody');
+ 
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			discovered.map(d => ({ type: d.customization.type, uri: d.uri.toString(), name: d.name, description: d.description })),
+@@ -77,7 +79,7 @@ suite('claudeAgentSkillScan', () => {
+ 		const projectAgent = await seed('/workspace/.claude/agents/dup.md', '---\nname: dup\ndescription: project\n---\nbody');
+ 		await seed('/home/.claude/agents/dup.md', '---\nname: dup\ndescription: user\n---\nbody');
+ 
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 		const dup = discovered.filter(d => d.name === 'dup');
+ 
+ 		assert.strictEqual(dup.length, 1);
+@@ -94,7 +96,7 @@ suite('claudeAgentSkillScan', () => {
+ 		await seed('/workspace/.claude/skills/tg/.claude-plugin/plugin.json', JSON.stringify({ name: 'tg' }));
+ 		await seed('/workspace/.claude/skills/tg/SKILL.md', '---\nname: tg\ndescription: plugin\n---\nbody');
+ 
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			discovered.filter(d => d.customization.type === CustomizationType.Skill).map(d => ({ name: d.name, uri: d.uri.toString() })),
+@@ -112,7 +114,7 @@ suite('claudeAgentSkillScan', () => {
+ 			name: 'compatible',
+ 		}));
+ 
+-		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService);
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			discovered.map(d => ({ name: d.name, uri: d.uri.toString() })),
+diff --git a/src/vs/platform/agentHost/test/node/customizations/scan/claudeHookScan.test.ts b/src/vs/platform/agentHost/test/node/customizations/scan/claudeHookScan.test.ts
+index 8d1fb880d9f84..7098e5b6feb69 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/scan/claudeHookScan.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/scan/claudeHookScan.test.ts
+@@ -7,6 +7,7 @@ import assert from 'assert';
+ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { NullLogService } from '../../../../../log/common/log.js';
+ import { CustomizationType } from '../../../../common/state/protocol/state.js';
+ import { scanClaudeHooks } from '../../../../node/claude/customizations/scan/claudeHookScan.js';
+ import { claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
+@@ -15,6 +16,7 @@ suite('claudeHookScan', () => {
+ 
+ 	const disposables = new DisposableStore();
+ 	let fileService: IFileService;
++	const logService = new NullLogService();
+ 	const seed = (path: string, content = '') => seedFile(fileService, path, content);
+ 
+ 	setup(() => {
+@@ -35,7 +37,7 @@ suite('claudeHookScan', () => {
+ 			hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo start' }] }] },
+ 		}));
+ 
+-		const hooks = await scanClaudeHooks(workspace, userHome, fileService);
++		const hooks = await scanClaudeHooks(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			hooks.map(h => ({ type: h.type, uri: h.uri })),
+@@ -51,7 +53,7 @@ suite('claudeHookScan', () => {
+ 			hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo stop' }] }] },
+ 		}));
+ 
+-		const hooks = await scanClaudeHooks(workspace, userHome, fileService);
++		const hooks = await scanClaudeHooks(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(hooks.map(h => h.uri), [local.toString()]);
+ 	});
+@@ -62,7 +64,7 @@ suite('claudeHookScan', () => {
+ 			hooks: { PostToolUse: [{ hooks: [{ type: 'command', command: 'echo hi' }] }] },
+ 		}));
+ 
+-		const hooks = await scanClaudeHooks(workspace, userHome, fileService);
++		const hooks = await scanClaudeHooks(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(hooks, []);
+ 	});
+@@ -70,7 +72,7 @@ suite('claudeHookScan', () => {
+ 	test('a settings file without a hooks block yields no entry', async () => {
+ 		await seed('/workspace/.claude/settings.json', JSON.stringify({ model: 'x', permissions: { allow: [] } }));
+ 
+-		const hooks = await scanClaudeHooks(workspace, userHome, fileService);
++		const hooks = await scanClaudeHooks(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(hooks, []);
+ 	});
+@@ -84,7 +86,7 @@ suite('claudeHookScan', () => {
+ 			hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo stop' }] }] },
+ 		}));
+ 
+-		const hooks = await scanClaudeHooks(undefined, userHome, fileService);
++		const hooks = await scanClaudeHooks(undefined, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(hooks.map(h => h.uri), [user.toString()]);
+ 	});
+@@ -97,7 +99,7 @@ suite('claudeHookScan', () => {
+ 		// When the user opens their home directory as the workspace, the
+ 		// project and user scopes resolve to the same settings file — it must
+ 		// not surface twice.
+-		const hooks = await scanClaudeHooks(userHome, userHome, fileService);
++		const hooks = await scanClaudeHooks(userHome, userHome, fileService, logService);
+ 
+ 		assert.strictEqual(hooks.length, 1);
+ 	});
+diff --git a/src/vs/platform/agentHost/test/node/customizations/scan/claudeMcpScan.test.ts b/src/vs/platform/agentHost/test/node/customizations/scan/claudeMcpScan.test.ts
+index 8cdf2bc8314d8..36d3994f2769b 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/scan/claudeMcpScan.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/scan/claudeMcpScan.test.ts
+@@ -8,6 +8,7 @@ import { isCustomizationEnabled } from '../../../../common/customizationEnableme
+ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { NullLogService } from '../../../../../log/common/log.js';
+ import { CustomizationType, McpServerStatus } from '../../../../common/state/protocol/state.js';
+ import { scanClaudeMcpServers } from '../../../../node/claude/customizations/scan/claudeMcpScan.js';
+ import { claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
+@@ -16,6 +17,7 @@ suite('claudeMcpScan', () => {
+ 
+ 	const disposables = new DisposableStore();
+ 	let fileService: IFileService;
++	const logService = new NullLogService();
+ 	const seed = (path: string, content = '') => seedFile(fileService, path, content);
+ 
+ 	setup(() => {
+@@ -34,7 +36,7 @@ suite('claudeMcpScan', () => {
+ 			mcpServers: { srv: { command: 'node', args: ['s.js'] } },
+ 		}));
+ 
+-		const servers = await scanClaudeMcpServers(workspace, userHome, fileService);
++		const servers = await scanClaudeMcpServers(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			servers.map(s => ({ type: s.type, uri: s.uri, name: s.name, enabled: isCustomizationEnabled(s), state: s.state })),
+@@ -44,19 +46,19 @@ suite('claudeMcpScan', () => {
+ 
+ 	test('scans a flat .mcp.json server map', async () => {
+ 		const mcp = await seed('/workspace/.mcp.json', JSON.stringify({ flatSrv: { command: 'x' } }));
+-		const servers = await scanClaudeMcpServers(workspace, userHome, fileService);
++		const servers = await scanClaudeMcpServers(workspace, userHome, fileService, logService);
+ 		assert.deepStrictEqual(servers.map(s => ({ uri: s.uri, name: s.name })), [{ uri: mcp.toString(), name: 'flatSrv' }]);
+ 	});
+ 
+ 	test('settings.json without an mcpServers block yields no servers', async () => {
+ 		await seed('/workspace/.claude/settings.json', JSON.stringify({ model: 'x', permissions: { allow: [] } }));
+-		const servers = await scanClaudeMcpServers(workspace, userHome, fileService);
++		const servers = await scanClaudeMcpServers(workspace, userHome, fileService, logService);
+ 		assert.deepStrictEqual(servers, []);
+ 	});
+ 
+ 	test('ignores array-valued MCP entries', async () => {
+ 		await seed('/workspace/.mcp.json', JSON.stringify({ bad: [1, 2], good: { command: 'x' } }));
+-		const servers = await scanClaudeMcpServers(workspace, userHome, fileService);
++		const servers = await scanClaudeMcpServers(workspace, userHome, fileService, logService);
+ 		assert.deepStrictEqual(servers.map(s => s.name), ['good']);
+ 	});
+ });
+diff --git a/src/vs/platform/agentHost/test/node/customizations/scan/claudeRuleScan.test.ts b/src/vs/platform/agentHost/test/node/customizations/scan/claudeRuleScan.test.ts
+index ff48366a7a4b0..42e91f3105960 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/scan/claudeRuleScan.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/scan/claudeRuleScan.test.ts
+@@ -7,6 +7,7 @@ import assert from 'assert';
+ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+ import { IFileService } from '../../../../../files/common/files.js';
++import { NullLogService } from '../../../../../log/common/log.js';
+ import { CustomizationType } from '../../../../common/state/protocol/state.js';
+ import { scanClaudeRules } from '../../../../node/claude/customizations/scan/claudeRuleScan.js';
+ import { claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
+@@ -15,6 +16,7 @@ suite('claudeRuleScan', () => {
+ 
+ 	const disposables = new DisposableStore();
+ 	let fileService: IFileService;
++	const logService = new NullLogService();
+ 	const seed = (path: string, content = '') => seedFile(fileService, path, content);
+ 
+ 	setup(() => {
+@@ -32,7 +34,7 @@ suite('claudeRuleScan', () => {
+ 		const dotMem = await seed('/workspace/.claude/CLAUDE.md', '# project .claude memory');
+ 		const localMem = await seed('/workspace/CLAUDE.local.md', '# personal memory');
+ 
+-		const rules = await scanClaudeRules(workspace, userHome, fileService);
++		const rules = await scanClaudeRules(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			rules
+@@ -51,7 +53,7 @@ suite('claudeRuleScan', () => {
+ 		const scoped = await seed('/workspace/.claude/rules/scoped.md', '---\nname: scoped-rule\ndescription: Only for src\npaths:\n  - "src/**"\n  - "lib/**"\n---\nbody');
+ 		const always = await seed('/workspace/.claude/rules/always.md', '# applies everywhere');
+ 
+-		const rules = await scanClaudeRules(workspace, userHome, fileService);
++		const rules = await scanClaudeRules(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			rules
+@@ -68,7 +70,7 @@ suite('claudeRuleScan', () => {
+ 		const projectNested = await seed('/workspace/.claude/rules/frontend/ui.md', '# ui rule');
+ 		const userRule = await seed('/home/.claude/rules/global.md', '# global rule');
+ 
+-		const rules = await scanClaudeRules(workspace, userHome, fileService);
++		const rules = await scanClaudeRules(workspace, userHome, fileService, logService);
+ 
+ 		assert.deepStrictEqual(
+ 			rules.map(r => r.uri.toString()).sort(),
+diff --git a/src/vs/platform/agentHost/test/node/shared/sessionMcpDiscovery.test.ts b/src/vs/platform/agentHost/test/node/shared/sessionMcpDiscovery.test.ts
+index 01dc1f51986d1..845e8536d59d0 100644
+--- a/src/vs/platform/agentHost/test/node/shared/sessionMcpDiscovery.test.ts
++++ b/src/vs/platform/agentHost/test/node/shared/sessionMcpDiscovery.test.ts
+@@ -55,6 +55,7 @@ suite('SessionMcpDiscovery', () => {
+ 
+ 	const store = new DisposableStore();
+ 	let fileService: TestFileService;
++	const logService = new NullLogService();
+ 	const primary = URI.from({ scheme: Schemas.inMemory, path: '/primary' });
+ 	const additional = URI.from({ scheme: Schemas.inMemory, path: '/additional' });
+ 
+@@ -85,7 +86,7 @@ suite('SessionMcpDiscovery', () => {
+ 			}
+ 		});
+ 
+-		const discovery = store.add(new SessionMcpDiscovery([primary, additional], fileService));
++		const discovery = store.add(new SessionMcpDiscovery([primary, additional], fileService, logService));
+ 		const definitions = await discovery.refresh();
+ 
+ 		assert.deepStrictEqual(definitions.map(definition => definition.name), ['duplicate', 'primary', 'additional']);
+@@ -103,7 +104,7 @@ suite('SessionMcpDiscovery', () => {
+ 			}
+ 		});
+ 
+-		const discovery = store.add(new SessionMcpDiscovery([primary], fileService));
++		const discovery = store.add(new SessionMcpDiscovery([primary], fileService, logService));
+ 		const [definition] = await discovery.refresh();
+ 
+ 		assert.strictEqual(definition.configuration.type, McpServerType.LOCAL);
+@@ -113,7 +114,7 @@ suite('SessionMcpDiscovery', () => {
+ 
+ 	test('ignores malformed files and refreshes after an exact file change', async () => {
+ 		await fileService.writeFile(URI.joinPath(primary, '.mcp.json'), VSBuffer.fromString('{ malformed'));
+-		const discovery = store.add(new SessionMcpDiscovery([primary], fileService));
++		const discovery = store.add(new SessionMcpDiscovery([primary], fileService, logService));
+ 		assert.deepStrictEqual(await discovery.refresh(), []);
+ 
+ 		const changed = Event.toPromise(discovery.onDidChange);
+@@ -127,7 +128,7 @@ suite('SessionMcpDiscovery', () => {
+ 
+ 	test('removes definitions when a workspace config is deleted', async () => {
+ 		await write(primary, { mcpServers: { server: { command: 'server' } } });
+-		const discovery = store.add(new SessionMcpDiscovery([primary], fileService));
++		const discovery = store.add(new SessionMcpDiscovery([primary], fileService, logService));
+ 		assert.deepStrictEqual((await discovery.refresh()).map(definition => definition.name), ['server']);
+ 
+ 		const changed = Event.toPromise(discovery.onDidChange);
+@@ -142,8 +143,8 @@ suite('SessionMcpDiscovery', () => {
+ 		await write(primary, { mcpServers: { server: { command: 'server' } } });
+ 		const firstStore = store.add(new DisposableStore());
+ 		const secondStore = store.add(new DisposableStore());
+-		const first = firstStore.add(new SessionMcpDiscovery([primary], fileService));
+-		const second = secondStore.add(new SessionMcpDiscovery([primary], fileService));
++		const first = firstStore.add(new SessionMcpDiscovery([primary], fileService, logService));
++		const second = secondStore.add(new SessionMcpDiscovery([primary], fileService, logService));
+ 
+ 		assert.strictEqual(fileService.watcherCount(primary), 1);
+ 		assert.deepStrictEqual((await first.refresh()).map(definition => definition.name), ['server']);
+diff --git a/src/vs/platform/agentPlugins/common/pluginParsers.ts b/src/vs/platform/agentPlugins/common/pluginParsers.ts
+index 0e88228ea2eb2..5d428d86fe66a 100644
+--- a/src/vs/platform/agentPlugins/common/pluginParsers.ts
++++ b/src/vs/platform/agentPlugins/common/pluginParsers.ts
+@@ -10,8 +10,9 @@ import { basename, extname, isEqualOrParent, joinPath, normalizePath, isEqual as
+ import { escapeRegExpCharacters } from '../../../base/common/strings.js';
+ import { hasKey, Mutable } from '../../../base/common/types.js';
+ import { URI } from '../../../base/common/uri.js';
+-import { IFileService } from '../../files/common/files.js';
++import { FileOperationResult, IFileService, IFileStat, toFileOperationResult } from '../../files/common/files.js';
+ import { parseFrontMatter } from '../../../base/common/yaml.js';
++import { ILogService } from '../../log/common/log.js';
+ import { IMcpRemoteServerConfiguration, IMcpServerConfiguration, IMcpStdioServerConfiguration, McpServerType } from '../../mcp/common/mcpPlatformTypes.js';
+ import { CustomizationType, McpServerStatus, type AgentCustomization, type HookCustomization, type McpServerCustomization, type RuleCustomization, type SkillCustomization } from '../../agentHost/common/state/protocol/state.js';
+ import { DEFAULT_MCP_APP } from '../../agentHost/common/state/protocol/mcpAppDefaults.js';
+@@ -220,28 +221,28 @@ const AGENT_PLUGIN_FORMAT: IPluginFormatConfig = {
+ 	},
+ };
+ 
+-export async function detectPluginFormat(pluginUri: URI, fileService: IFileService): Promise<IPluginFormatConfig> {
++export async function detectPluginFormat(pluginUri: URI, fileService: IFileService, logService?: ILogService): Promise<IPluginFormatConfig> {
+ 	if (await readAgentPluginManifest(pluginUri, fileService)) {
+ 		return AGENT_PLUGIN_FORMAT;
+ 	}
+-	if (await pathExists(joinPath(pluginUri, '.plugin', 'plugin.json'), fileService)) {
++	if (await pathExists(joinPath(pluginUri, '.plugin', 'plugin.json'), fileService, logService)) {
+ 		return OPEN_PLUGIN_FORMAT;
+ 	}
+ 
+ 	const isInClaudeDirectory = pluginUri.path.split('/').includes('.claude');
+-	if (isInClaudeDirectory || await pathExists(joinPath(pluginUri, '.claude-plugin', 'plugin.json'), fileService)) {
++	if (isInClaudeDirectory || await pathExists(joinPath(pluginUri, '.claude-plugin', 'plugin.json'), fileService, logService)) {
+ 		return CLAUDE_FORMAT;
+ 	}
+ 
+ 	return COPILOT_FORMAT;
+ }
+ 
+-export async function readPluginManifest(pluginUri: URI, format: IPluginFormatConfig, fileService: IFileService): Promise<Record<string, unknown> | undefined> {
++export async function readPluginManifest(pluginUri: URI, format: IPluginFormatConfig, fileService: IFileService, logService?: ILogService): Promise<Record<string, unknown> | undefined> {
+ 	if (format.format === PluginFormat.AgentPlugin) {
+ 		const manifest = await readAgentPluginManifest(pluginUri, fileService);
+ 		return manifest ? { ...manifest } : undefined;
+ 	}
+-	const json = await readJsonFile(joinPath(pluginUri, format.manifestPath), fileService);
++	const json = await readJsonFile(joinPath(pluginUri, format.manifestPath), fileService, logService);
+ 	return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : undefined;
+ }
+ 
+@@ -882,24 +883,39 @@ export function interpolateHookPluginRoot(
+ // Filesystem helpers
+ // ---------------------------------------------------------------------------
+ 
+-export async function readJsonFile(uri: URI, fileService: IFileService): Promise<unknown | undefined> {
++/** Logs a failed read unless the resource is simply missing (or sits under a file), so a file system the host cannot address is not mistaken for an absent file. */
++function warnUnlessMissing(resource: URI, error: unknown, logService: ILogService | undefined): void {
++	const result = error instanceof Error ? toFileOperationResult(error) : undefined;
++	if (result === FileOperationResult.FILE_NOT_FOUND || result === FileOperationResult.FILE_NOT_DIRECTORY) {
++		return;
++	}
++	logService?.warn(`[pluginParsers] Failed to read '${resource.toString()}': ${error instanceof Error ? error.message : String(error)}`);
++}
++
++export async function readJsonFile(uri: URI, fileService: IFileService, logService: ILogService | undefined): Promise<unknown | undefined> {
+ 	try {
+ 		const fileContents = await fileService.readFile(uri);
+ 		return parseJSONC(fileContents.value.toString());
+-	} catch {
++	} catch (error) {
++		warnUnlessMissing(uri, error, logService);
+ 		return undefined;
+ 	}
+ }
+ 
+-export async function pathExists(resource: URI, fileService: IFileService): Promise<boolean> {
++/** Resolves a resource, returning `undefined` when it is missing or unreadable. */
++export async function tryResolve(resource: URI, fileService: IFileService, logService: ILogService | undefined): Promise<IFileStat | undefined> {
+ 	try {
+-		await fileService.resolve(resource);
+-		return true;
+-	} catch {
+-		return false;
++		return await fileService.resolve(resource);
++	} catch (error) {
++		warnUnlessMissing(resource, error, logService);
++		return undefined;
+ 	}
+ }
+ 
++export async function pathExists(resource: URI, fileService: IFileService, logService: ILogService | undefined): Promise<boolean> {
++	return await tryResolve(resource, fileService, logService) !== undefined;
++}
++
+ // ---------------------------------------------------------------------------
+ // Component readers
+ // ---------------------------------------------------------------------------
+@@ -912,8 +928,9 @@ export async function readSkills(
+ 	pluginRoot: URI,
+ 	dirs: readonly URI[],
+ 	fileService: IFileService,
+-	options?: { readonly childDirectoriesOnly?: boolean; readonly containmentRoot?: URI },
++	options?: { readonly childDirectoriesOnly?: boolean; readonly containmentRoot?: URI; readonly logService?: ILogService },
+ ): Promise<readonly ISkillPluginResource[]> {
++	const logService = options?.logService;
+ 	const seen = new Set<string>();
+ 	const skills: ISkillPluginResource[] = [];
+ 
+@@ -941,26 +958,20 @@ export async function readSkills(
+ 	await Promise.all(dirs.map(async dir => {
+ 		if (!options?.childDirectoriesOnly) {
+ 			const skillMd = URI.joinPath(dir, 'SKILL.md');
+-			if (await pathExists(skillMd, fileService)) {
++			if (await pathExists(skillMd, fileService, logService)) {
+ 				await addSkill(basename(dir), skillMd);
+ 				return;
+ 			}
+ 		}
+ 
+-		let stat;
+-		try {
+-			stat = await fileService.resolve(dir);
+-		} catch {
+-			return;
+-		}
+-
+-		if (!stat.isDirectory || !stat.children) {
++		const stat = await tryResolve(dir, fileService, logService);
++		if (!stat?.isDirectory || !stat.children) {
+ 			return;
+ 		}
+ 
+ 		await Promise.all(stat.children.map(async child => {
+ 			const childSkillMd = URI.joinPath(child.resource, 'SKILL.md');
+-			if (await pathExists(childSkillMd, fileService)) {
++			if (await pathExists(childSkillMd, fileService, logService)) {
+ 				await addSkill(basename(child.resource), childSkillMd);
+ 			}
+ 		}));
+@@ -968,7 +979,7 @@ export async function readSkills(
+ 
+ 	if (!options?.childDirectoriesOnly && skills.length === 0) {
+ 		const rootSkillMd = URI.joinPath(pluginRoot, 'SKILL.md');
+-		if (await pathExists(rootSkillMd, fileService)) {
++		if (await pathExists(rootSkillMd, fileService, logService)) {
+ 			await addSkill(basename(pluginRoot), rootSkillMd);
+ 		}
+ 	}
+@@ -977,10 +988,10 @@ export async function readSkills(
+ 	return skills;
+ }
+ 
+-export async function readPluginSkills(pluginRoot: URI, dirs: readonly URI[], format: IPluginFormatConfig, fileService: IFileService): Promise<readonly ISkillPluginResource[]> {
++export async function readPluginSkills(pluginRoot: URI, dirs: readonly URI[], format: IPluginFormatConfig, fileService: IFileService, logService?: ILogService): Promise<readonly ISkillPluginResource[]> {
+ 	return readSkills(pluginRoot, dirs, fileService, format.format === PluginFormat.AgentPlugin
+-		? { childDirectoriesOnly: true, containmentRoot: pluginRoot }
+-		: undefined);
++		? { childDirectoriesOnly: true, containmentRoot: pluginRoot, logService }
++		: { logService });
+ }
+ 
+ async function isResolvedWithin(root: URI, resource: URI, fileService: IFileService): Promise<boolean> {
+@@ -998,7 +1009,7 @@ async function isResolvedWithin(root: URI, resource: URI, fileService: IFileServ
+ export async function readMarkdownComponents(
+ 	dirs: readonly URI[],
+ 	fileService: IFileService,
+-	options?: { readonly containmentRoot?: URI },
++	options?: { readonly containmentRoot?: URI; readonly logService?: ILogService },
+ ): Promise<readonly INamedPluginResource[]> {
+ 	const seen = new Set<string>();
+ 	const items: INamedPluginResource[] = [];
+@@ -1014,10 +1025,8 @@ export async function readMarkdownComponents(
+ 	};
+ 
+ 	for (const dir of dirs) {
+-		let stat;
+-		try {
+-			stat = await fileService.resolve(dir);
+-		} catch {
++		const stat = await tryResolve(dir, fileService, options?.logService);
++		if (!stat) {
+ 			continue;
+ 		}
+ 
+@@ -1064,7 +1073,7 @@ function getInstructionFileName(resource: URI): string | undefined {
+ export async function readInstructionComponents(
+ 	dirs: readonly URI[],
+ 	fileService: IFileService,
+-	options?: { readonly containmentRoot?: URI },
++	options?: { readonly containmentRoot?: URI; readonly logService?: ILogService },
+ ): Promise<readonly INamedPluginResource[]> {
+ 	const seen = new Set<string>();
+ 	const items: INamedPluginResource[] = [];
+@@ -1080,10 +1089,8 @@ export async function readInstructionComponents(
+ 	};
+ 
+ 	for (const dir of dirs) {
+-		let stat;
+-		try {
+-			stat = await fileService.resolve(dir);
+-		} catch {
++		const stat = await tryResolve(dir, fileService, options?.logService);
++		if (!stat) {
+ 			continue;
+ 		}
+ 
+@@ -1122,7 +1129,7 @@ export async function readInstructionComponents(
+ export async function readAgentComponents(
+ 	dirs: readonly URI[],
+ 	fileService: IFileService,
+-	options?: { readonly containmentRoot?: URI },
++	options?: { readonly containmentRoot?: URI; readonly logService?: ILogService },
+ ): Promise<readonly IAgentPluginResource[]> {
+ 	const files = await readMarkdownComponents(dirs, fileService, options);
+ 	if (files.length === 0) {
+@@ -1226,12 +1233,13 @@ async function readHooks(
+ 	fileService: IFileService,
+ 	workspaceRoot: URI | undefined,
+ 	userHome: URI,
++	logService: ILogService | undefined,
+ ): Promise<readonly IParsedHookGroup[]> {
+ 	for (const hookPath of paths) {
+ 		if (formatConfig.format === PluginFormat.AgentPlugin && !await isResolvedWithin(pluginUri, hookPath, fileService)) {
+ 			continue;
+ 		}
+-		const json = await readJsonFile(hookPath, fileService);
++		const json = await readJsonFile(hookPath, fileService, logService);
+ 		if (!json) {
+ 			continue;
+ 		}
+@@ -1246,13 +1254,14 @@ async function readMcpServers(
+ 	paths: readonly URI[],
+ 	formatConfig: IPluginFormatConfig,
+ 	fileService: IFileService,
++	logService: ILogService | undefined,
+ ): Promise<readonly IMcpServerDefinition[]> {
+ 	const merged = new Map<string, IMcpServerDefinition>();
+ 	for (const mcpPath of paths) {
+ 		if (formatConfig.format === PluginFormat.AgentPlugin && !await isResolvedWithin(pluginUri, mcpPath, fileService)) {
+ 			continue;
+ 		}
+-		const json = await readJsonFile(mcpPath, fileService);
++		const json = await readJsonFile(mcpPath, fileService, logService);
+ 		for (const def of parseMcpServerDefinitionMap(mcpPath, json, pluginUri, formatConfig)) {
+ 			if (!merged.has(def.name)) {
+ 				merged.set(def.name, def);
+@@ -1267,8 +1276,9 @@ export async function readPluginMcpServers(
+ 	paths: readonly URI[],
+ 	format: IPluginFormatConfig,
+ 	fileService: IFileService,
++	logService?: ILogService,
+ ): Promise<readonly IMcpServerDefinition[]> {
+-	return readMcpServers(pluginUri, paths, format, fileService);
++	return readMcpServers(pluginUri, paths, format, fileService, logService);
+ }
+ 
+ export function parseMcpServerDefinitionMap(
+@@ -1322,11 +1332,12 @@ export async function parsePlugin(
+ 	workspaceRoot: URI | undefined,
+ 	userHome: URI,
+ 	boundaryUri?: URI,
++	logService?: ILogService,
+ ): Promise<IParsedPlugin> {
+-	const formatConfig = await detectPluginFormat(pluginUri, fileService);
++	const formatConfig = await detectPluginFormat(pluginUri, fileService, logService);
+ 
+ 	// Read manifest
+-	const manifest = await readPluginManifest(pluginUri, formatConfig, fileService);
++	const manifest = await readPluginManifest(pluginUri, formatConfig, fileService, logService);
+ 	if (formatConfig.requiresManifest && !manifest) {
+ 		throw new Error(`Plugin manifest '${joinPath(pluginUri, formatConfig.manifestPath).toString()}' is missing`);
+ 	}
+@@ -1364,13 +1375,13 @@ export async function parsePlugin(
+ 	const [hooks, mcpServers, skills, agents, instructions] = await Promise.all([
+ 		embeddedHooks.length > 0
+ 			? Promise.resolve(embeddedHooks)
+-			: readHooks(pluginUri, hookDirs, formatConfig, fileService, workspaceRoot, userHome),
++			: readHooks(pluginUri, hookDirs, formatConfig, fileService, workspaceRoot, userHome, logService),
+ 		embeddedMcp.length > 0
+ 			? Promise.resolve(embeddedMcp)
+-			: readPluginMcpServers(pluginUri, mcpDirs, formatConfig, fileService),
+-		readPluginSkills(pluginUri, skillDirs, formatConfig, fileService),
+-		readAgentComponents(agentDirs, fileService, formatConfig.format === PluginFormat.AgentPlugin ? { containmentRoot: pluginUri } : undefined),
+-		readInstructionComponents(instructionDirs, fileService, formatConfig.format === PluginFormat.AgentPlugin ? { containmentRoot: pluginUri } : undefined),
++			: readPluginMcpServers(pluginUri, mcpDirs, formatConfig, fileService, logService),
++		readPluginSkills(pluginUri, skillDirs, formatConfig, fileService, logService),
++		readAgentComponents(agentDirs, fileService, formatConfig.format === PluginFormat.AgentPlugin ? { containmentRoot: pluginUri, logService } : { logService }),
++		readInstructionComponents(instructionDirs, fileService, formatConfig.format === PluginFormat.AgentPlugin ? { containmentRoot: pluginUri, logService } : { logService }),
+ 	]);
+ 
+ 	return {
+diff --git a/src/vs/platform/agentPlugins/test/common/pluginParsers.test.ts b/src/vs/platform/agentPlugins/test/common/pluginParsers.test.ts
+index 111864a3a5f12..0a17950db547c 100644
+--- a/src/vs/platform/agentPlugins/test/common/pluginParsers.test.ts
++++ b/src/vs/platform/agentPlugins/test/common/pluginParsers.test.ts
+@@ -10,7 +10,7 @@ import { Schemas } from '../../../../base/common/network.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+ import { FileService } from '../../../files/common/fileService.js';
+-import { FileSystemProviderCapabilities } from '../../../files/common/files.js';
++import { createFileSystemProviderError, FileSystemProviderCapabilities, FileSystemProviderErrorCode } from '../../../files/common/files.js';
+ import { InMemoryFileSystemProvider } from '../../../files/common/inMemoryFilesystemProvider.js';
+ import { NullLogService } from '../../../log/common/log.js';
+ import { McpServerType } from '../../../mcp/common/mcpPlatformTypes.js';
+@@ -34,7 +34,9 @@ import {
+ 	toParsedAgent,
+ 	toParsedSkill,
+ 	parsePlugin,
++	pathExists,
+ 	PluginFormat,
++	readJsonFile,
+ } from '../../common/pluginParsers.js';
+ import { AGENT_PLUGIN_MCP_SCHEMA, AGENT_PLUGIN_SCHEMA } from '../../common/agentPluginParser.js';
+ 
+@@ -759,6 +761,79 @@ suite('pluginParsers', () => {
+ 		});
+ 	});
+ 
++	// ---- readJsonFile / pathExists --------------------------------------
++
++	suite('readJsonFile / pathExists', () => {
++
++		class CapturingLogService extends NullLogService {
++			readonly warnings: string[] = [];
++			override warn(message: string): void {
++				this.warnings.push(message);
++			}
++		}
++
++		const store = new DisposableStore();
++		let fileService: FileService;
++		let logService: CapturingLogService;
++
++		setup(() => {
++			logService = new CapturingLogService();
++			fileService = store.add(new FileService(new NullLogService()));
++			store.add(fileService.registerProvider(Schemas.inMemory, store.add(new InMemoryFileSystemProvider())));
++		});
++
++		teardown(() => store.clear());
++
++		async function probe(uri: URI) {
++			return {
++				json: await readJsonFile(uri, fileService, logService),
++				exists: await pathExists(uri, fileService, logService),
++				warnings: logService.warnings.map(warning => warning.includes(uri.toString())),
++			};
++		}
++
++		function registerFailingProvider(scheme: string, code: FileSystemProviderErrorCode): void {
++			class FailingProvider extends InMemoryFileSystemProvider {
++				override async stat(): Promise<never> {
++					throw createFileSystemProviderError(code, code);
++				}
++				override async readFile(): Promise<never> {
++					throw createFileSystemProviderError(code, code);
++				}
++			}
++			store.add(fileService.registerProvider(scheme, store.add(new FailingProvider())));
++		}
++
++		test('a present file is parsed without a warning', async () => {
++			const uri = URI.from({ scheme: Schemas.inMemory, path: '/present.json' });
++			await fileService.writeFile(uri, VSBuffer.fromString('{ "a": 1 }'));
++			assert.deepStrictEqual(await probe(uri), { json: { a: 1 }, exists: true, warnings: [] });
++		});
++
++		test('a missing file is absent without a warning', async () => {
++			const uri = URI.from({ scheme: Schemas.inMemory, path: '/missing.json' });
++			assert.deepStrictEqual(await probe(uri), { json: undefined, exists: false, warnings: [] });
++		});
++
++		test('a scheme without a provider is absent but warned about', async () => {
++			const uri = URI.from({ scheme: Schemas.vscodeRemote, authority: 'dev-container+abc', path: '/workspace/.mcp.json' });
++			assert.deepStrictEqual(await probe(uri), { json: undefined, exists: false, warnings: [true, true] });
++			assert.ok(logService.warnings.every(warning => warning.includes('ENOPRO')), logService.warnings.join('\n'));
++		});
++
++		test('a permission error is absent but warned about', async () => {
++			registerFailingProvider('denied', FileSystemProviderErrorCode.NoPermissions);
++			const uri = URI.from({ scheme: 'denied', path: '/secret.json' });
++			assert.deepStrictEqual(await probe(uri), { json: undefined, exists: false, warnings: [true, true] });
++		});
++
++		test('a path under a file is absent without a warning', async () => {
++			registerFailingProvider('enotdir', FileSystemProviderErrorCode.FileNotADirectory);
++			const uri = URI.from({ scheme: 'enotdir', path: '/.claude/settings.json' });
++			assert.deepStrictEqual(await probe(uri), { json: undefined, exists: false, warnings: [] });
++		});
++	});
++
+ 	// ---- parseHooksJson -------------------------------------------------
+ 
+ 	suite('parseHooksJson', () => {
+
+From 7ae56009363a9da421666440ff32b2fb87ffbca3 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:45:01 -0400
+Subject: [PATCH 2/2] agentPlugins: route the remaining manifest probes through
+ pathExists
+
+Three probes on the agent host still used IFileService.exists(), which
+turns a permission failure into false and rejects outright when the
+resource's scheme has no provider: the .mcp.json check in the Claude
+folder-picker criteria, the manifest check that decides whether a
+.claude/skills/<name> directory is a native plugin rather than a
+standalone skill, and the manifest check used to resolve an enabled
+native plugin's root. An unreadable manifest was therefore treated as
+absent without the warning the previous commit introduced, and an
+unaddressable working directory made the folder-picker probe and
+native plugin resolution reject instead of falling back.
+
+They now go through pathExists with the threaded logger, so a missing
+file stays silent and every other failure is warned about and treated
+as absent. detectPluginFormat additionally probes plugin.json before
+calling readAgentPluginManifest, whose own exists() call would
+otherwise reject on a missing provider one line before the probes
+above are reached.
+
+createInMemoryFileService in the customization test utilities accepts
+a provider so a test can inject failures, and a CapturingLogService
+there is shared by the new tests.
+---
+ .../node/claude/claudeFolderPickerCriteria.ts |  4 +--
+ .../scan/claudeAgentSkillScan.ts              |  4 +--
+ .../scan/claudeNativePluginScan.ts            |  4 +--
+ .../claudeCustomizationTestUtils.ts           | 13 +++++++--
+ .../claudeFolderPickerCriteria.test.ts        | 14 +++++++++-
+ .../scan/claudeAgentSkillScan.test.ts         | 28 +++++++++++++++++--
+ .../scan/claudeNativePluginScan.test.ts       | 18 +++++++++++-
+ .../agentPlugins/common/pluginParsers.ts      |  3 +-
+ 8 files changed, 75 insertions(+), 13 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts b/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts
+index e632b126f2deb..25efca4e6f9a0 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeFolderPickerCriteria.ts
+@@ -9,7 +9,7 @@ import { joinPath } from '../../../../base/common/resources.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { IFileService } from '../../../files/common/files.js';
+ import { ILogService } from '../../../log/common/log.js';
+-import { parseHooksJson, readJsonFile } from '../../../agentPlugins/common/pluginParsers.js';
++import { parseHooksJson, pathExists, readJsonFile } from '../../../agentPlugins/common/pluginParsers.js';
+ 
+ /**
+  * Whether a Claude working directory carries configuration that pins it as the
+@@ -30,7 +30,7 @@ import { parseHooksJson, readJsonFile } from '../../../agentPlugins/common/plugi
+  */
+ export async function claudeDirectoryQualifiesForPrimary(fileService: IFileService, workingDirectory: URI, userHome: URI, logService: ILogService, token: CancellationToken = CancellationToken.None): Promise<boolean> {
+ 	const probes: Array<() => Promise<boolean>> = [
+-		() => fileService.exists(joinPath(workingDirectory, '.mcp.json')),
++		() => pathExists(joinPath(workingDirectory, '.mcp.json'), fileService, logService),
+ 		...['settings.json', 'settings.local.json'].map(fileName => {
+ 			const uri = joinPath(workingDirectory, '.claude', fileName);
+ 			return async (): Promise<boolean> => {
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts
+index 3b1ae000fd72b..9c6a146129857 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeAgentSkillScan.ts
+@@ -7,7 +7,7 @@ import { URI } from '../../../../../../base/common/uri.js';
+ import { dirname } from '../../../../../../base/common/resources.js';
+ import { IFileService } from '../../../../../files/common/files.js';
+ import { ILogService } from '../../../../../log/common/log.js';
+-import { detectPluginFormat, readAgentComponents, readSkills, toParsedAgent, toParsedSkill, type INamedPluginResource, type IParsedAgent, type IParsedSkill } from '../../../../../agentPlugins/common/pluginParsers.js';
++import { detectPluginFormat, pathExists, readAgentComponents, readSkills, toParsedAgent, toParsedSkill, type INamedPluginResource, type IParsedAgent, type IParsedSkill } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { CustomizationType } from '../../../../common/state/protocol/channels-session/state.js';
+ 
+ /**
+@@ -51,7 +51,7 @@ async function excludeNativePluginSkills<T extends INamedPluginResource>(skills:
+ 	const isPluginDir = await Promise.all(skills.map(async skill => {
+ 		const dir = dirname(skill.uri);
+ 		const format = await detectPluginFormat(dir, fileService, logService);
+-		return fileService.exists(URI.joinPath(dir, format.manifestPath));
++		return pathExists(URI.joinPath(dir, format.manifestPath), fileService, logService);
+ 	}));
+ 	return skills.filter((_, i) => !isPluginDir[i]);
+ }
+diff --git a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts
+index 4d15ce90e8a5a..b80aa038e104d 100644
+--- a/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts
++++ b/src/vs/platform/agentHost/node/claude/customizations/scan/claudeNativePluginScan.ts
+@@ -7,7 +7,7 @@ import { URI } from '../../../../../../base/common/uri.js';
+ import { ResourceSet } from '../../../../../../base/common/map.js';
+ import { IFileService } from '../../../../../files/common/files.js';
+ import { ILogService } from '../../../../../log/common/log.js';
+-import { detectPluginFormat, parsePlugin, readJsonFile, tryResolve, type IParsedPlugin } from '../../../../../agentPlugins/common/pluginParsers.js';
++import { detectPluginFormat, parsePlugin, pathExists, readJsonFile, tryResolve, type IParsedPlugin } from '../../../../../agentPlugins/common/pluginParsers.js';
+ import { findMostSpecificClaudeWorkspaceRoot, selectEnabledClaudePluginIds } from '../claudeCustomizationPolicy.js';
+ 
+ /**
+@@ -121,7 +121,7 @@ function splitPluginId(id: string): { readonly plugin: string; readonly marketpl
+  */
+ async function hasManifest(dir: URI, fileService: IFileService, logService: ILogService): Promise<boolean> {
+ 	const format = await detectPluginFormat(dir, fileService, logService);
+-	return fileService.exists(URI.joinPath(dir, format.manifestPath));
++	return pathExists(URI.joinPath(dir, format.manifestPath), fileService, logService);
+ }
+ 
+ /**
+diff --git a/src/vs/platform/agentHost/test/node/customizations/claudeCustomizationTestUtils.ts b/src/vs/platform/agentHost/test/node/customizations/claudeCustomizationTestUtils.ts
+index c0b22b023d425..8fdbe91763f37 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/claudeCustomizationTestUtils.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/claudeCustomizationTestUtils.ts
+@@ -21,13 +21,22 @@ export const claudeTestUserHome = URI.from({ scheme: Schemas.inMemory, path: '/h
+ /**
+  * Creates a {@link FileService} backed by an in-memory provider for the
+  * `inmemory` scheme, registering both with `disposables` for cleanup.
++ * Pass a `provider` subclass to inject failures.
+  */
+-export function createInMemoryFileService(disposables: DisposableStore): IFileService {
++export function createInMemoryFileService(disposables: DisposableStore, provider: InMemoryFileSystemProvider = new InMemoryFileSystemProvider()): IFileService {
+ 	const fileService = disposables.add(new FileService(new NullLogService()));
+-	disposables.add(fileService.registerProvider(Schemas.inMemory, disposables.add(new InMemoryFileSystemProvider())));
++	disposables.add(fileService.registerProvider(Schemas.inMemory, disposables.add(provider)));
+ 	return fileService;
+ }
+ 
++/** A {@link NullLogService} that records `warn` messages for assertions. */
++export class CapturingLogService extends NullLogService {
++	readonly warnings: string[] = [];
++	override warn(message: string): void {
++		this.warnings.push(message);
++	}
++}
++
+ /** Writes `content` to the in-memory `path` and returns its URI. */
+ export async function seedFile(fileService: IFileService, path: string, content = ''): Promise<URI> {
+ 	const uri = URI.from({ scheme: Schemas.inMemory, path });
+diff --git a/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts b/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts
+index fb7857ddf70ce..0722fbb828972 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/claudeFolderPickerCriteria.test.ts
+@@ -11,7 +11,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
+ import { IFileService } from '../../../../files/common/files.js';
+ import { NullLogService } from '../../../../log/common/log.js';
+ import { claudeDirectoryQualifiesForPrimary } from '../../../node/claude/claudeFolderPickerCriteria.js';
+-import { createInMemoryFileService, seedFile } from './claudeCustomizationTestUtils.js';
++import { CapturingLogService, createInMemoryFileService, seedFile } from './claudeCustomizationTestUtils.js';
+ 
+ suite('claudeDirectoryQualifiesForPrimary', () => {
+ 
+@@ -58,4 +58,16 @@ suite('claudeDirectoryQualifiesForPrimary', () => {
+ 			nothing: false,
+ 		});
+ 	});
++
++	test('a working directory without a file system provider does not qualify and is warned about rather than rejected', async () => {
++		const log = new CapturingLogService();
++		const remote = URI.from({ scheme: Schemas.vscodeRemote, authority: 'dev-container+abc', path: '/workspace' });
++
++		const qualifies = await claudeDirectoryQualifiesForPrimary(fileService, remote, userHome, log);
++
++		assert.deepStrictEqual({
++			qualifies,
++			warned: ['.mcp.json', '.claude/settings.json', '.claude/settings.local.json'].map(name => log.warnings.some(warning => warning.includes(URI.joinPath(remote, name).toString()))),
++		}, { qualifies: false, warned: [true, true, true] });
++	});
+ });
+diff --git a/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts b/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts
+index ee1bf68a20b74..fd5e91c23d999 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/scan/claudeAgentSkillScan.test.ts
+@@ -5,12 +5,14 @@
+ 
+ import assert from 'assert';
+ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
++import { URI } from '../../../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+-import { IFileService } from '../../../../../files/common/files.js';
++import { createFileSystemProviderError, FileSystemProviderErrorCode, IFileService, IStat } from '../../../../../files/common/files.js';
++import { InMemoryFileSystemProvider } from '../../../../../files/common/inMemoryFilesystemProvider.js';
+ import { NullLogService } from '../../../../../log/common/log.js';
+ import { CustomizationType } from '../../../../common/state/protocol/state.js';
+ import { scanClaudeDiskCustomizations } from '../../../../node/claude/customizations/scan/claudeAgentSkillScan.js';
+-import { claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
++import { CapturingLogService, claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
+ import { AGENT_PLUGIN_SCHEMA } from '../../../../../agentPlugins/common/agentPluginParser.js';
+ 
+ suite('claudeAgentSkillScan', () => {
+@@ -121,4 +123,26 @@ suite('claudeAgentSkillScan', () => {
+ 			[{ name: 'helper', uri: agent.toString() }],
+ 		);
+ 	});
++
++	test('a skill whose plugin manifest cannot be read is still surfaced, and the failure is warned about', async () => {
++		class ManifestDeniedProvider extends InMemoryFileSystemProvider {
++			override async stat(resource: URI): Promise<IStat> {
++				if (resource.path.endsWith('/.claude-plugin/plugin.json')) {
++					throw createFileSystemProviderError('denied', FileSystemProviderErrorCode.NoPermissions);
++				}
++				return super.stat(resource);
++			}
++		}
++		fileService = createInMemoryFileService(disposables, new ManifestDeniedProvider());
++		const log = new CapturingLogService();
++		const skill = await seed('/workspace/.claude/skills/s/SKILL.md', '---\nname: s\ndescription: S\n---\nbody');
++		const manifest = URI.joinPath(workspace, '.claude', 'skills', 's', '.claude-plugin', 'plugin.json');
++
++		const discovered = await scanClaudeDiskCustomizations(workspace, userHome, fileService, log);
++
++		assert.deepStrictEqual({
++			skills: discovered.filter(d => d.customization.type === CustomizationType.Skill).map(d => d.uri.toString()),
++			warnings: log.warnings.filter(warning => warning.includes(manifest.toString())).length,
++		}, { skills: [skill.toString()], warnings: 1 });
++	});
+ });
+diff --git a/src/vs/platform/agentHost/test/node/customizations/scan/claudeNativePluginScan.test.ts b/src/vs/platform/agentHost/test/node/customizations/scan/claudeNativePluginScan.test.ts
+index e75ac5278a6ad..8a5b80aa9b394 100644
+--- a/src/vs/platform/agentHost/test/node/customizations/scan/claudeNativePluginScan.test.ts
++++ b/src/vs/platform/agentHost/test/node/customizations/scan/claudeNativePluginScan.test.ts
+@@ -5,11 +5,13 @@
+ 
+ import assert from 'assert';
+ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
++import { Schemas } from '../../../../../../base/common/network.js';
++import { URI } from '../../../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+ import { NullLogService } from '../../../../../log/common/log.js';
+ import { IFileService } from '../../../../../files/common/files.js';
+ import { scanClaudeNativePlugins, scanClaudeNativePluginsForRoots } from '../../../../node/claude/customizations/scan/claudeNativePluginScan.js';
+-import { claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
++import { CapturingLogService, claudeTestUserHome as userHome, claudeTestWorkspace as workspace, createInMemoryFileService, seedFile } from '../claudeCustomizationTestUtils.js';
+ 
+ suite('claudeNativePluginScan', () => {
+ 
+@@ -232,4 +234,18 @@ suite('claudeNativePluginScan', () => {
+ 
+ 		assert.deepStrictEqual(plugins.map(p => p.id), ['ok@m']);
+ 	});
++
++	test('a workspace without a file system provider is warned about and resolution falls back to the user-home candidate', async () => {
++		const log = new CapturingLogService();
++		const remote = URI.from({ scheme: Schemas.vscodeRemote, authority: 'dev-container+abc', path: '/workspace' });
++		await seed('/home/.claude/settings.json', JSON.stringify({ enabledPlugins: { 'p@skills-dir': true } }));
++		await seed('/home/.claude/skills/p/.claude-plugin/plugin.json', manifest('p'));
++
++		const plugins = await scanClaudeNativePlugins(remote, userHome, fileService, log);
++
++		assert.deepStrictEqual({
++			roots: plugins.map(p => p.root.toString()),
++			warnedAboutWorkspace: log.warnings.some(warning => warning.includes(URI.joinPath(remote, '.claude', 'skills', 'p').toString())),
++		}, { roots: [URI.joinPath(userHome, '.claude', 'skills', 'p').toString()], warnedAboutWorkspace: true });
++	});
+ });
+diff --git a/src/vs/platform/agentPlugins/common/pluginParsers.ts b/src/vs/platform/agentPlugins/common/pluginParsers.ts
+index 5d428d86fe66a..0c5db9695bee1 100644
+--- a/src/vs/platform/agentPlugins/common/pluginParsers.ts
++++ b/src/vs/platform/agentPlugins/common/pluginParsers.ts
+@@ -222,7 +222,8 @@ const AGENT_PLUGIN_FORMAT: IPluginFormatConfig = {
+ };
+ 
+ export async function detectPluginFormat(pluginUri: URI, fileService: IFileService, logService?: ILogService): Promise<IPluginFormatConfig> {
+-	if (await readAgentPluginManifest(pluginUri, fileService)) {
++	// Probe first: exists() inside readAgentPluginManifest rejects on a missing provider and hides permission errors.
++	if (await pathExists(joinPath(pluginUri, AGENT_PLUGIN_FORMAT.manifestPath), fileService, logService) && await readAgentPluginManifest(pluginUri, fileService)) {
+ 		return AGENT_PLUGIN_FORMAT;
+ 	}
+ 	if (await pathExists(joinPath(pluginUri, '.plugin', 'plugin.json'), fileService, logService)) {

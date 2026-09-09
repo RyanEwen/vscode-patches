@@ -1,0 +1,340 @@
+From 13a9ed1c70dd409da2b448393658b1078680f530 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 15:49:43 -0400
+Subject: [PATCH 1/3] Resolve a client tool to the client that is still there
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A tool call is stamped with an owning clientId from ownerOf, which without a
+caller preference returned the first-inserted contributor. A window reload
+connects with a new clientId while the departed client's entry can still be
+present, so every later call was stamped with a client that had gone away and
+failed on arrival — permanently, not for the grace window.
+
+The host is both right and wrong about this at once: the "another active client
+provides it" advice reads state.activeClients and sees the live client, while
+ownerOf reads the tool model and answers with the dead one. Retrying, as the
+advice suggests, resolves to the same departed client.
+
+The model now tracks the most recent contributor and prefers it when the caller
+expresses none. A reconnecting window re-pushes its tools, so the newest
+contributor is the one most recently known to be alive. An explicit preference
+still wins, and removing the latest contributor falls back to whoever remains.
+
+Two tests asserted the first-inserted default, which is what produced the bug,
+and are updated. Coverage added for the reconnect case and the fallback.
+---
+ .../claudeSessionClientToolsModel.ts          | 24 +++++++++++++--
+ .../claudeSessionClientToolsModel.test.ts     | 29 +++++++++++++++----
+ 2 files changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
+index df21a7efaa01c..e4b47bd9a24f9 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
+@@ -34,8 +34,16 @@ export class SessionClientToolsModel {
+ 	);
+ 	readonly merged: IObservable<readonly ToolDefinition[]> = this._merged;
+ 
++	/**
++	 * The client that most recently contributed tools. A reconnecting window
++	 * arrives with a new `clientId` and re-pushes its tool list, so this is the
++	 * contributor most recently known to be alive.
++	 */
++	private _latestContributor: string | undefined;
++
+ 	/** Replace `clientId`'s contributed tools (full replacement). */
+ 	setTools(clientId: string, tools: readonly ToolDefinition[]): void {
++		this._latestContributor = clientId;
+ 		this._toolSet.set(clientId, tools);
+ 		this._merged.set(this._toolSet.merged(), undefined);
+ 	}
+@@ -47,14 +55,26 @@ export class SessionClientToolsModel {
+ 
+ 	/** Remove a client's tool contribution. */
+ 	removeClient(clientId: string): void {
++		if (this._latestContributor === clientId) {
++			this._latestContributor = undefined;
++		}
+ 		if (this._toolSet.delete(clientId)) {
+ 			this._merged.set(this._toolSet.merged(), undefined);
+ 		}
+ 	}
+ 
+-	/** The `clientId` that owns the tool named `toolName`, or `undefined`. */
++	/**
++	 * The `clientId` that owns the tool named `toolName`, or `undefined`.
++	 *
++	 * Without a caller-supplied preference the most recent contributor wins
++	 * rather than the first-inserted one. A window reload connects with a new
++	 * `clientId` and re-pushes the same tools, and the departed client's entry
++	 * can outlive it here — resolving to the older entry stamps tool calls with
++	 * a client that is gone, and those fail on arrival for the life of the
++	 * session.
++	 */
+ 	ownerOf(toolName: string, preferredClientId?: string): string | undefined {
+-		return this._toolSet.ownerOf(toolName, preferredClientId);
++		return this._toolSet.ownerOf(toolName, preferredClientId ?? this._latestContributor);
+ 	}
+ }
+ 
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
+index ef18fa3bbcc00..2c3deb33de3e0 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
+@@ -117,7 +117,7 @@ suite('SessionClientToolsDiff', () => {
+ 		diff.model.setTools('c1', [tool({ name: 'shared', description: 'from c1' }), tool({ name: 'a' })]);
+ 		diff.model.setTools('c2', [tool({ name: 'shared', description: 'from c2' }), tool({ name: 'b' })]);
+ 		assert.deepStrictEqual(diff.model.merged.get().map(t => t.name), ['shared', 'a', 'b']);
+-		assert.strictEqual(diff.model.ownerOf('shared'), 'c1', 'first-inserted client wins the shared name');
++		assert.strictEqual(diff.model.ownerOf('shared'), 'c2', 'the most recent contributor owns the shared name');
+ 	});
+ 
+ 	test('ownerOf prefers the requested client when it provides the shared tool', () => {
+@@ -126,15 +126,34 @@ suite('SessionClientToolsDiff', () => {
+ 		diff.model.setTools('c2', [tool({ name: 'shared', description: 'from c2' })]);
+ 		assert.deepStrictEqual({
+ 			defaultOwner: diff.model.ownerOf('shared'),
+-			preferredOwner: diff.model.ownerOf('shared', 'c2'),
++			preferredOwner: diff.model.ownerOf('shared', 'c1'),
+ 			missingPreferredOwner: diff.model.ownerOf('shared', 'missing'),
+ 		}, {
+-			defaultOwner: 'c1',
+-			preferredOwner: 'c2',
+-			missingPreferredOwner: 'c1',
++			defaultOwner: 'c2',
++			preferredOwner: 'c1',
++			missingPreferredOwner: 'c2',
+ 		});
+ 	});
+ 
++	test('a reconnected client owns the tools it re-pushed, even while the old entry lingers', () => {
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('old-client', [tool({ name: 'openBrowserPage' })]);
++		// The window reloads and reconnects with a new id, re-pushing the same
++		// tools. The departed client's entry has not been cleaned up yet.
++		diff.model.setTools('new-client', [tool({ name: 'openBrowserPage' })]);
++
++		assert.strictEqual(diff.model.ownerOf('openBrowserPage'), 'new-client');
++	});
++
++	test('ownership falls back to a remaining client once the latest contributor is removed', () => {
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('c1', [tool({ name: 'shared' })]);
++		diff.model.setTools('c2', [tool({ name: 'shared' })]);
++		diff.model.removeClient('c2');
++
++		assert.strictEqual(diff.model.ownerOf('shared'), 'c1');
++	});
++
+ 	test('removeClient drops that client and re-flips dirty when the merged set changes', () => {
+ 		const diff = disposables.add(new SessionClientToolsDiff());
+ 		diff.model.setTools('c1', [tool({ name: 'a' })]);
+
+From 562b5653ee2eee65b7d5e7d76175a1aefa4ec596 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 16:50:22 -0400
+Subject: [PATCH 2/3] Track contributor recency as an order, not a single id
+
+Review feedback: clearing the latest contributor on removal fell back to
+insertion order, which is the behaviour this change exists to avoid. With
+three clients, removing the newest resolved to the oldest.
+
+Recency is now an ordered list, so removing a contributor falls back to the
+next most recent. Re-contributing moves a client back to the front, which
+matters because a reconnect re-pushes a structurally identical tool list and
+the merged observable dedupes that write.
+
+Tests cover three contributors removed newest-first, and re-contribution.
+---
+ .../claudeSessionClientToolsModel.ts          | 33 ++++++++++++++-----
+ .../claudeSessionClientToolsModel.test.ts     | 28 ++++++++++++++++
+ 2 files changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
+index e4b47bd9a24f9..1dd82e07cf619 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
+@@ -35,19 +35,29 @@ export class SessionClientToolsModel {
+ 	readonly merged: IObservable<readonly ToolDefinition[]> = this._merged;
+ 
+ 	/**
+-	 * The client that most recently contributed tools. A reconnecting window
+-	 * arrives with a new `clientId` and re-pushes its tool list, so this is the
+-	 * contributor most recently known to be alive.
++	 * Contributors in recency order, most recent first. A reconnecting window
++	 * arrives with a new `clientId` and re-pushes its tool list, so the front of
++	 * this list is the contributor most recently known to be alive. Kept as an
++	 * order rather than a single id so that removing one falls back to the next
++	 * most recent rather than to insertion order.
+ 	 */
+-	private _latestContributor: string | undefined;
++	private readonly _recency: string[] = [];
+ 
+ 	/** Replace `clientId`'s contributed tools (full replacement). */
+ 	setTools(clientId: string, tools: readonly ToolDefinition[]): void {
+-		this._latestContributor = clientId;
++		this._touch(clientId);
+ 		this._toolSet.set(clientId, tools);
+ 		this._merged.set(this._toolSet.merged(), undefined);
+ 	}
+ 
++	private _touch(clientId: string): void {
++		const existing = this._recency.indexOf(clientId);
++		if (existing !== -1) {
++			this._recency.splice(existing, 1);
++		}
++		this._recency.unshift(clientId);
++	}
++
+ 	/** This client's contributed tools (empty when absent). */
+ 	getTools(clientId: string): readonly ToolDefinition[] {
+ 		return this._toolSet.get(clientId);
+@@ -55,8 +65,9 @@ export class SessionClientToolsModel {
+ 
+ 	/** Remove a client's tool contribution. */
+ 	removeClient(clientId: string): void {
+-		if (this._latestContributor === clientId) {
+-			this._latestContributor = undefined;
++		const existing = this._recency.indexOf(clientId);
++		if (existing !== -1) {
++			this._recency.splice(existing, 1);
+ 		}
+ 		if (this._toolSet.delete(clientId)) {
+ 			this._merged.set(this._toolSet.merged(), undefined);
+@@ -74,7 +85,13 @@ export class SessionClientToolsModel {
+ 	 * session.
+ 	 */
+ 	ownerOf(toolName: string, preferredClientId?: string): string | undefined {
+-		return this._toolSet.ownerOf(toolName, preferredClientId ?? this._latestContributor);
++		const candidates = preferredClientId ? [preferredClientId, ...this._recency] : this._recency;
++		for (const clientId of candidates) {
++			if (this._toolSet.get(clientId).some(tool => tool.name === toolName)) {
++				return clientId;
++			}
++		}
++		return this._toolSet.ownerOf(toolName, preferredClientId);
+ 	}
+ }
+ 
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
+index 2c3deb33de3e0..2fa0b9eb21ff7 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
+@@ -154,6 +154,34 @@ suite('SessionClientToolsDiff', () => {
+ 		assert.strictEqual(diff.model.ownerOf('shared'), 'c1');
+ 	});
+ 
++	test('with several contributors, removing the latest falls back to the next most recent', () => {
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('c1', [tool({ name: 'shared' })]);
++		diff.model.setTools('c2', [tool({ name: 'shared' })]);
++		diff.model.setTools('c3', [tool({ name: 'shared' })]);
++
++		assert.strictEqual(diff.model.ownerOf('shared'), 'c3');
++
++		// Not c1: insertion order is what stamped tool calls with a client that
++		// had gone away in the first place.
++		diff.model.removeClient('c3');
++		assert.strictEqual(diff.model.ownerOf('shared'), 'c2');
++
++		diff.model.removeClient('c2');
++		assert.strictEqual(diff.model.ownerOf('shared'), 'c1');
++	});
++
++	test('re-contributing moves a client back to the front of the order', () => {
++		const diff = disposables.add(new SessionClientToolsDiff());
++		diff.model.setTools('c1', [tool({ name: 'shared' })]);
++		diff.model.setTools('c2', [tool({ name: 'shared' })]);
++		// A reconnect re-pushes an identical list, which the merged observable
++		// dedupes — recency must still update.
++		diff.model.setTools('c1', [tool({ name: 'shared' })]);
++
++		assert.strictEqual(diff.model.ownerOf('shared'), 'c1');
++	});
++
+ 	test('removeClient drops that client and re-flips dirty when the merged set changes', () => {
+ 		const diff = disposables.add(new SessionClientToolsDiff());
+ 		diff.model.setTools('c1', [tool({ name: 'a' })]);
+
+From 50a270cd573c76beeefcc56cb4e132a44f18c793 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:56:59 -0400
+Subject: [PATCH 3/3] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ .../clientTools/claudeSessionClientToolsModel.ts  | 15 ++++-----------
+ .../claudeSessionClientToolsModel.test.ts         |  9 +++------
+ 2 files changed, 7 insertions(+), 17 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
+index 1dd82e07cf619..af528ebaf2175 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeSessionClientToolsModel.ts
+@@ -36,10 +36,8 @@ export class SessionClientToolsModel {
+ 
+ 	/**
+ 	 * Contributors in recency order, most recent first. A reconnecting window
+-	 * arrives with a new `clientId` and re-pushes its tool list, so the front of
+-	 * this list is the contributor most recently known to be alive. Kept as an
+-	 * order rather than a single id so that removing one falls back to the next
+-	 * most recent rather than to insertion order.
++	 * arrives with a new `clientId`, so removing one falls back to the next most
++	 * recent rather than to insertion order.
+ 	 */
+ 	private readonly _recency: string[] = [];
+ 
+@@ -76,13 +74,8 @@ export class SessionClientToolsModel {
+ 
+ 	/**
+ 	 * The `clientId` that owns the tool named `toolName`, or `undefined`.
+-	 *
+-	 * Without a caller-supplied preference the most recent contributor wins
+-	 * rather than the first-inserted one. A window reload connects with a new
+-	 * `clientId` and re-pushes the same tools, and the departed client's entry
+-	 * can outlive it here — resolving to the older entry stamps tool calls with
+-	 * a client that is gone, and those fail on arrival for the life of the
+-	 * session.
++	 * The most recent contributor wins: a departed client can outlive its reload
++	 * here, and stamping calls with it fails them for the life of the session.
+ 	 */
+ 	ownerOf(toolName: string, preferredClientId?: string): string | undefined {
+ 		const candidates = preferredClientId ? [preferredClientId, ...this._recency] : this._recency;
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
+index 2fa0b9eb21ff7..05010a5b892f2 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeSessionClientToolsModel.test.ts
+@@ -138,8 +138,7 @@ suite('SessionClientToolsDiff', () => {
+ 	test('a reconnected client owns the tools it re-pushed, even while the old entry lingers', () => {
+ 		const diff = disposables.add(new SessionClientToolsDiff());
+ 		diff.model.setTools('old-client', [tool({ name: 'openBrowserPage' })]);
+-		// The window reloads and reconnects with a new id, re-pushing the same
+-		// tools. The departed client's entry has not been cleaned up yet.
++		// The window reloads with a new id; the departed entry is not cleaned up yet.
+ 		diff.model.setTools('new-client', [tool({ name: 'openBrowserPage' })]);
+ 
+ 		assert.strictEqual(diff.model.ownerOf('openBrowserPage'), 'new-client');
+@@ -162,8 +161,7 @@ suite('SessionClientToolsDiff', () => {
+ 
+ 		assert.strictEqual(diff.model.ownerOf('shared'), 'c3');
+ 
+-		// Not c1: insertion order is what stamped tool calls with a client that
+-		// had gone away in the first place.
++		// Not c1: insertion order is what stamped calls with a client that had gone.
+ 		diff.model.removeClient('c3');
+ 		assert.strictEqual(diff.model.ownerOf('shared'), 'c2');
+ 
+@@ -175,8 +173,7 @@ suite('SessionClientToolsDiff', () => {
+ 		const diff = disposables.add(new SessionClientToolsDiff());
+ 		diff.model.setTools('c1', [tool({ name: 'shared' })]);
+ 		diff.model.setTools('c2', [tool({ name: 'shared' })]);
+-		// A reconnect re-pushes an identical list, which the merged observable
+-		// dedupes — recency must still update.
++		// The merged observable dedupes an identical re-push, so recency must still update.
+ 		diff.model.setTools('c1', [tool({ name: 'shared' })]);
+ 
+ 		assert.strictEqual(diff.model.ownerOf('shared'), 'c1');

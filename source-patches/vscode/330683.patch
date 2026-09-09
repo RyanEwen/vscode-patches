@@ -1,0 +1,179 @@
+From 731cca613e0c597a96d65430e5c2ffb229a96ea5 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 28 Aug 2026 12:27:44 -0400
+Subject: [PATCH] Do not run a client tool twice when a tool call is readied
+ twice
+
+---
+ .../agentHost/agentHostSessionHandler.ts      | 28 ++++++-
+ .../agentHostClientTools.test.ts              | 83 +++++++++++++++++++
+ 2 files changed, 108 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index f36879f5ff5a0..31e7641b2ee65 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -2479,6 +2479,10 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		);
+ 
+ 		const startedClientToolCalls = new Set<string>();
++		// Armed synchronously; `startedClientToolCalls` only arms after an await.
++		const inFlightClientToolCalls = new Map<string, string>();
++		const executionSignature = (request: ClientToolExecutionRequest): string =>
++			JSON.stringify([request.toolCall.toolName, request.toolCall.toolInput ?? null]);
+ 		const clientToolExecutions = new Map<string, { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }>();
+ 		const releaseClientToolExecution = (key: string, execution: { readonly source: CancellationTokenSource; readonly retain: IDisposable; activeAttempts: number }) => {
+ 			if (clientToolExecutions.get(key) !== execution) {
+@@ -2553,8 +2557,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 						unobservedTimer.clear();
+ 						return;
+ 					}
+-
+-					if (startedClientToolCalls.has(key)) {
++					if (startedClientToolCalls.has(key) || inFlightClientToolCalls.get(key) === executionSignature(request)) {
+ 						startedRequest = request;
+ 						unobservedTimer.clear();
+ 						return;
+@@ -2577,6 +2580,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 					}
+ 					const execute = (contextSessionResource: URI | undefined) => {
+ 						startedRequest = request;
++						const inFlightSignature = executionSignature(request);
++						inFlightClientToolCalls.set(key, inFlightSignature);
+ 						unobservedTimer.clear();
+ 						const requestGeneration = generation;
+ 						execution.activeAttempts++;
+@@ -2584,7 +2589,20 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 							request,
+ 							contextSessionResource,
+ 							execution.source.token,
+-							() => requestGeneration === generation && (invocationStarted || equals(request$.read(undefined), request)),
++							() => {
++								if (requestGeneration !== generation) {
++									return false;
++								}
++								if (invocationStarted) {
++									return true;
++								}
++								// Judge staleness the way the coalescing check above does, or an
++								// approval-only change strands the attempt it declined to restart.
++								const current = request$.read(undefined);
++								return current.kind === SessionInputRequestKind.ToolClientExecution
++									&& current.clientId === this._config.connection.clientId
++									&& executionSignature(current) === inFlightSignature;
++							},
+ 							() => {
+ 								if (requestGeneration === generation) {
+ 									invocationStarted = true;
+@@ -2592,6 +2610,10 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 								}
+ 							},
+ 						).finally(() => {
++							// Only clear our own entry; a superseding attempt may already have replaced it.
++							if (inFlightClientToolCalls.get(key) === inFlightSignature) {
++								inFlightClientToolCalls.delete(key);
++							}
+ 							execution.activeAttempts--;
+ 							const invocation = this._clientToolInvocations.get(key);
+ 							if (execution.activeAttempts === 0 && invocation && IChatToolInvocation.isComplete(invocation)) {
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts
+index c38792400de2b..b3d7bc6792ab9 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts
+@@ -1252,6 +1252,45 @@ suite('AgentHostClientTools', () => {
+ 			});
+ 		});
+ 
++		test('runs once when the same tool call is readied twice before invocation starts', async () => {
++			// Two `ChatToolCallReady` actions arrive before `resolveToolInput` settles.
++			const firstInputURI = URI.parse('session-db:/tool-input-1');
++			const input = { uri: firstInputURI.toString(), contentType: 'application/json' };
++			const inputRead = new DeferredPromise<{ data: string; encoding: ContentEncoding }>();
++			const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
++			connection.resourceReadResponses.set(firstInputURI.toString(), inputRead.p);
++
++			const sessionResource = URI.parse('agent-host-copilot:/session-1');
++			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
++			const chatURI = URI.parse(buildDefaultChatUri(backendSession));
++
++			applyReferencedRunTask(connection, chatURI, input, ToolCallConfirmationReason.NotNeeded);
++			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
++
++			const readyPayload = {
++				toolCallId: 'tool-call-1',
++				toolName: 'runTask',
++				displayName: 'Run Task',
++				invocationMessage: 'Run Task',
++				toolInput: input,
++			};
++			// Both readies land while the referenced input read is still pending.
++			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', readyPayload);
++			applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', readyPayload);
++			await timeout(0);
++			inputRead.complete({ data: '{"task":"only"}', encoding: ContentEncoding.Utf8 });
++			await timeout(0);
++			await timeout(0);
++
++			assert.deepStrictEqual({
++				invocations: toolsService.invokedToolCalls.length,
++				parameters: toolsService.invokedToolCalls[0]?.parameters,
++			}, {
++				invocations: 1,
++				parameters: { task: 'only' },
++			});
++		});
++
+ 		test('does not re-execute when the request changes after invocation starts', async () => {
+ 			const invokeResult = new DeferredPromise<IToolResult>();
+ 			const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testRunTaskTool], { invokeResult });
+@@ -1296,6 +1335,50 @@ suite('AgentHostClientTools', () => {
+ 			});
+ 		});
+ 
++		test('coalesces ready variants that differ only in approval while input is pending', async () => {
++			const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
++			const sessionResource = URI.parse('agent-host-copilot:/session-1');
++			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
++			const chatURI = URI.parse(buildDefaultChatUri(backendSession));
++			const inputURI = URI.parse('session-db:/tool-input-race');
++			const toolInput = { uri: inputURI.toString(), contentType: 'application/json' };
++			const inputRead = new DeferredPromise<{ data: string; encoding: ContentEncoding }>();
++			connection.resourceReadResponses.set(inputURI.toString(), inputRead.p);
++
++			applyReferencedRunTask(connection, chatURI, toolInput, ToolCallConfirmationReason.NotNeeded);
++			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
++
++			// Both readies arrive while the referenced input is still resolving, so
++			// neither attempt has reached markInvocationStarted.
++			for (const confirmed of [ToolCallConfirmationReason.NotNeeded, ToolCallConfirmationReason.Setting]) {
++				applyRunningClientExecution(connection, chatURI.toString(), 'turn-1', {
++					toolCallId: 'tool-call-1',
++					toolName: 'runTask',
++					displayName: 'Run Task',
++					invocationMessage: 'Run Task',
++					toolInput,
++					confirmed,
++				});
++				await timeout(0);
++			}
++			assert.strictEqual(toolsService.invokedToolCalls.length, 0, 'nothing runs while the input is unresolved');
++
++			inputRead.complete({ data: '{"task":"race"}', encoding: ContentEncoding.Utf8 });
++			for (let tick = 0; tick < 10; tick++) { await timeout(0); }
++
++			assert.deepStrictEqual({
++				reads: connection.resourceReadUris.length,
++				raceInvocations: toolsService.invokedToolCalls.map(call => call.parameters),
++				raceCompletions: connection.dispatchedActions.filter(entry => isChatAction(entry.action)
++					&& entry.action.type === ActionType.ChatToolCallComplete
++					&& entry.action.toolCallId === 'tool-call-1').length,
++			}, {
++				reads: 1,
++				raceInvocations: [{ task: 'race' }],
++				raceCompletions: 1,
++			});
++		});
++
+ 		test('settles local and protocol state when referenced input cannot be read', async () => {
+ 			const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testRunTaskTool]);
+ 			const sessionResource = URI.parse('agent-host-copilot:/session-1');

@@ -1,0 +1,177 @@
+From 572b3a275002b8c439f14a16829460a009c51346 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 20 Aug 2026 19:28:45 -0400
+Subject: [PATCH 1/3] Replay the user's prompt without the host's added context
+
+resolvePromptToContentBlocks sends a turn as several text blocks: the
+user's prompt first, then whatever the host composed for the model, such
+as the rendered attachment representations and the reference reminder.
+The replay mapper joins every text block back into one string, so a turn
+reconstructed from the SDK transcript presents that context as words the
+user typed.
+
+The result is visible in two places. A restored conversation shows the
+ambient context inside the user's own message, which is why it appears
+only on returning to a session and never while the turn is live. And a
+session title seeded from the first turn inherits it, leaving sessions
+named after the context blurb rather than the request.
+
+Take the prompt block alone. The remaining blocks are host-composed and
+regenerated every turn, so replaying them is wrong regardless of how
+they render.
+---
+ .../node/claude/claudeReplayMapper.ts         |  8 +++++-
+ .../test/node/claudeReplayMapper.test.ts      | 28 +++++++++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+index 5522564e786fd..4cbb8a6ffa30e 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+@@ -168,7 +168,13 @@ function parseUserMessage(msg: SessionMessage, timestamp: string | undefined): P
+ 	}
+ 	// Mixed or text-only: text wins — matches prior behavior where tool_results
+ 	// in a text-bearing envelope are dropped (they should already have been delivered).
+-	return { kind: 'user-text', uuid: msg.uuid, text: textBlocks.map(b => b.text).join('\n'), timestamp };
++	//
++	// Only the first block is the user's prompt. `resolvePromptToContentBlocks`
++	// appends host-composed context after it (attachment representations and the
++	// reference reminder), which is ambient and regenerated every turn. Joining
++	// those back in replays them as words the user typed, so they surface in the
++	// restored transcript and in titles derived from the first turn.
++	return { kind: 'user-text', uuid: msg.uuid, text: textBlocks[0].text, timestamp };
+ }
+ 
+ function parseAssistantMessage(msg: SessionMessage, timestamp: string | undefined): ParsedSessionMessage | undefined {
+diff --git a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+index 3cb068acebf8f..84b0929e82c79 100644
+--- a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+@@ -106,6 +106,34 @@ suite('claudeReplayMapper', () => {
+ 		}
+ 	});
+ 
++	test('replays the user prompt without the host-composed context blocks', () => {
++		// resolvePromptToContentBlocks sends the prompt first and appends the
++		// attachment representations and reference reminder as sibling blocks.
++		const messages: SessionMessage[] = [
++			{
++				type: 'user',
++				uuid: 'u1',
++				session_id: 'sess-1',
++				parent_tool_use_id: null,
++				parent_agent_id: null,
++				message: {
++					role: 'user',
++					content: [
++						{ type: 'text', text: 'read package.json' },
++						{ type: 'text', text: 'No browser pages are currently shared with you.' },
++						{ type: 'text', text: '<system-reminder>\nThe user provided the following references:\n- /w/a.ts\n</system-reminder>' },
++					],
++				},
++			} as SessionMessage,
++			makeAssistantText('a1', 'done'),
++		];
++
++		const turns = mapSessionMessagesToTurns(messages, session, logService);
++
++		assert.strictEqual(turns.length, 1);
++		assert.strictEqual(turns[0].message.text, 'read package.json');
++	});
++
+ 	test('restores turn timing from persisted message timestamps', () => {
+ 		const messages: SessionMessage[] = [
+ 			makeUser('u1', 'hello', '2026-07-09T18:00:00.000Z'),
+
+From 212155dffb518a01e236c93b2ab9d0677ce1626d Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 20 Aug 2026 19:40:49 -0400
+Subject: [PATCH 2/3] Cover the attachment-only turn and shorten the note
+
+An attachment-only send leaves the first block empty, so state that it
+replays as an empty prompt rather than borrowing the context as its
+text, and keep the inline note to one line per the coding guidelines.
+---
+ .../node/claude/claudeReplayMapper.ts         |  7 +----
+ .../test/node/claudeReplayMapper.test.ts      | 26 +++++++++++++++++++
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+index 4cbb8a6ffa30e..533c7d9f1728b 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+@@ -168,12 +168,7 @@ function parseUserMessage(msg: SessionMessage, timestamp: string | undefined): P
+ 	}
+ 	// Mixed or text-only: text wins — matches prior behavior where tool_results
+ 	// in a text-bearing envelope are dropped (they should already have been delivered).
+-	//
+-	// Only the first block is the user's prompt. `resolvePromptToContentBlocks`
+-	// appends host-composed context after it (attachment representations and the
+-	// reference reminder), which is ambient and regenerated every turn. Joining
+-	// those back in replays them as words the user typed, so they surface in the
+-	// restored transcript and in titles derived from the first turn.
++	// Only the first block is the prompt; the rest is host-composed context.
+ 	return { kind: 'user-text', uuid: msg.uuid, text: textBlocks[0].text, timestamp };
+ }
+ 
+diff --git a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+index 84b0929e82c79..0feb99c3d6059 100644
+--- a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+@@ -134,6 +134,32 @@ suite('claudeReplayMapper', () => {
+ 		assert.strictEqual(turns[0].message.text, 'read package.json');
+ 	});
+ 
++	test('an attachment-only turn replays as an empty prompt', () => {
++		// Sending attachments with no typed text leaves the first block empty.
++		const messages: SessionMessage[] = [
++			{
++				type: 'user',
++				uuid: 'u1',
++				session_id: 'sess-1',
++				parent_tool_use_id: null,
++				parent_agent_id: null,
++				message: {
++					role: 'user',
++					content: [
++						{ type: 'text', text: '' },
++						{ type: 'text', text: 'No browser pages are currently shared with you.' },
++					],
++				},
++			} as SessionMessage,
++			makeAssistantText('a1', 'done'),
++		];
++
++		const turns = mapSessionMessagesToTurns(messages, session, logService);
++
++		assert.strictEqual(turns.length, 1);
++		assert.strictEqual(turns[0].message.text, '');
++	});
++
+ 	test('restores turn timing from persisted message timestamps', () => {
+ 		const messages: SessionMessage[] = [
+ 			makeUser('u1', 'hello', '2026-07-09T18:00:00.000Z'),
+
+From afbd7f82c12f26189129b8732ed1bf3f3032ad64 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 21 Aug 2026 19:03:46 -0400
+Subject: [PATCH 3/3] Shorten the replay test setup note to one line
+
+---
+ src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+index 0feb99c3d6059..709d34ebd00b2 100644
+--- a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+@@ -107,8 +107,7 @@ suite('claudeReplayMapper', () => {
+ 	});
+ 
+ 	test('replays the user prompt without the host-composed context blocks', () => {
+-		// resolvePromptToContentBlocks sends the prompt first and appends the
+-		// attachment representations and reference reminder as sibling blocks.
++		// resolvePromptToContentBlocks puts the prompt first, then the host-composed blocks.
+ 		const messages: SessionMessage[] = [
+ 			{
+ 				type: 'user',

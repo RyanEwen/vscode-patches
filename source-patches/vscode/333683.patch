@@ -1,0 +1,224 @@
+From 32a4f2a0d502064a2864c91be190c624b6371949 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 31 Aug 2026 19:24:53 -0400
+Subject: [PATCH 1/2] Watch agent host customizations on the host's own
+ filesystem
+
+---
+ .../platform/agentHost/common/agentHostUri.ts | 12 +++++++
+ .../node/claude/claudeAgentSession.ts         |  7 ++--
+ .../agentHostFileSystemProvider.test.ts       | 35 ++++++++++++++++++-
+ 3 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostUri.ts b/src/vs/platform/agentHost/common/agentHostUri.ts
+index a0343f26f1897..08f0c83c840ea 100644
+--- a/src/vs/platform/agentHost/common/agentHostUri.ts
++++ b/src/vs/platform/agentHost/common/agentHostUri.ts
+@@ -190,6 +190,18 @@ export function createAgentHostResourceUriMapper(connectionAuthority: string): I
+ 	};
+ }
+ 
++/**
++ * Reinterprets a client-namespace URI as a path on the machine this host runs
++ * on. The host reaches its own filesystem through `file:`, so a window's
++ * `vscode-remote:` URI resolves to no provider here.
++ */
++export function toHostLocalUri(resource: URI): URI {
++	if (resource.scheme !== Schemas.vscodeRemote) {
++		return resource;
++	}
++	return URI.file(resource.fsPath).with({ query: resource.query, fragment: resource.fragment });
++}
++
+ /**
+  * Strips the redundant `ws://` scheme from an address. The transport layer
+  * already defaults to `ws://`, so only `wss://` needs to be preserved.
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 87c826ce5c1c2..4debc809d82a7 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -3,6 +3,7 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { toHostLocalUri } from '../../common/agentHostUri.js';
+ import type { McpServerConfig, OnElicitation, Options, PermissionMode, SDKUserMessage, WarmQuery } from '@anthropic-ai/claude-agent-sdk';
+ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+ import { Sequencer } from '../../../../base/common/async.js';
+@@ -499,15 +500,17 @@ export class ClaudeAgentSession extends Disposable {
+ 	}
+ 
+ 	private _watchCustomizations(directories: readonly URI[] | undefined): void {
++		// Both watchers below read this host's own filesystem.
++		const roots = directories?.map(toHostLocalUri);
+ 		const store = new DisposableStore();
+ 		const watcher = store.add(new ClaudeCustomizationWatcher(
+-			directories,
++			roots,
+ 			this._environmentService.userHome,
+ 			this._fileService,
+ 			this._logService,
+ 		));
+ 		store.add(watcher.onDidChange(() => this._onDidCustomizationsChange.fire()));
+-		this._mcpDiscovery = directories?.length ? store.add(new SessionMcpDiscovery(directories, this._fileService)) : undefined;
++		this._mcpDiscovery = roots?.length ? store.add(new SessionMcpDiscovery(roots, this._fileService)) : undefined;
+ 		if (this._mcpDiscovery) {
+ 			store.add(this._mcpDiscovery.onDidChange(() => {
+ 				this.clientCustomizationsDiff.markDirty();
+diff --git a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+index a77b525df53be..9cbc6c3c98259 100644
+--- a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+@@ -3,6 +3,7 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { Schemas } from '../../../../base/common/network.js';
+ import assert from 'assert';
+ import { timeout } from '../../../../base/common/async.js';
+ import { VSBuffer } from '../../../../base/common/buffer.js';
+@@ -12,7 +13,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
+ import { FileChangeType, FilePermission, FileSystemProviderErrorCode, FileType, IFileChange, toFileSystemProviderErrorCode } from '../../../files/common/files.js';
+ import { AgentHostFileSystemProvider, agentHostRemotePath, agentHostUri, type IRemoteFilesystemConnection } from '../../common/agentHostFileSystemProvider.js';
+ import { remoteAgentHostSessionTypeId } from '../../common/agentHostSessionType.js';
+-import { AGENT_HOST_LABEL_FORMATTER, AGENT_HOST_SCHEME, agentHostAuthority, createAgentHostResourceUriMapper, fromAgentHostUri, identityAgentHostResourceUriMapper, isAgentHostContentRefUri, toAgentHostContentUri, toAgentHostUri } from '../../common/agentHostUri.js';
++import { AGENT_HOST_LABEL_FORMATTER, AGENT_HOST_SCHEME, agentHostAuthority, createAgentHostResourceUriMapper, fromAgentHostUri, identityAgentHostResourceUriMapper, isAgentHostContentRefUri, toAgentHostContentUri, toAgentHostUri, toHostLocalUri } from '../../common/agentHostUri.js';
+ import { ContentEncoding, ResourceType, type CreateResourceWatchParams, type ResourceCopyParams, type ResourceListResult, type ResourceMkdirParams, type ResourceReadResult, type ResourceRequestParams, type ResourceRequestResult, type ResourceResolveParams, type ResourceResolveResult } from '../../common/state/protocol/commands.js';
+ import { AhpErrorCodes } from '../../common/state/protocol/errors.js';
+ import { ProtocolError } from '../../common/state/sessionProtocol.js';
+@@ -232,6 +233,38 @@ suite('toAgentHostUri / fromAgentHostUri', () => {
+ 	});
+ });
+ 
++suite('toHostLocalUri', () => {
++
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('a window remote URI becomes a path this host can open', () => {
++		const fromWindow = URI.from({ scheme: Schemas.vscodeRemote, authority: 'dev-container+abc', path: '/workspace/app' });
++
++		const local = toHostLocalUri(fromWindow);
++
++		assert.strictEqual(local.scheme, Schemas.file);
++		assert.strictEqual(local.path, '/workspace/app');
++		assert.strictEqual(local.authority, '');
++	});
++
++	test('anything the host can already open is left alone', () => {
++		const file = URI.file('/workspace/app');
++		const wrapped = toAgentHostUri(URI.file('/workspace/app'), 'my-server');
++
++		assert.strictEqual(toHostLocalUri(file).toString(), file.toString());
++		assert.strictEqual(toHostLocalUri(wrapped).toString(), wrapped.toString());
++	});
++
++	test('query and fragment survive, since callers key off them', () => {
++		const fromWindow = URI.from({ scheme: Schemas.vscodeRemote, authority: 'dev-container+abc', path: '/w/a.ts', query: 'q=1', fragment: 'L4' });
++
++		const local = toHostLocalUri(fromWindow);
++
++		assert.strictEqual(local.query, 'q=1');
++		assert.strictEqual(local.fragment, 'L4');
++	});
++});
++
+ suite('AGENT_HOST_LABEL_FORMATTER', () => {
+ 
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+
+From 82db55c2d659fa136c80ba503dfde3e45e75ac67 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 31 Aug 2026 23:15:29 -0400
+Subject: [PATCH 2/2] Compare MCP root identity in the host-local namespace
+
+---
+ .../node/claude/claudeAgentSession.ts         |  6 ++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 47 +++++++++++++++++++
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 4debc809d82a7..2d9c70f9384a5 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -882,6 +882,8 @@ export class ClaudeAgentSession extends Disposable {
+ 
+ 	private async _buildExternalMcpServers(gitHubMcpServerConfiguration: IMcpServerConfiguration | undefined): Promise<{ readonly servers: Record<string, McpServerConfig>; readonly deniedServers: readonly ClaudeDeniedMcpServerSpec[] }> {
+ 		const primaryCwd = this.workingDirectory;
++		// Discovery roots are host-local, so compare identities in that namespace.
++		const primaryRoot = primaryCwd && toHostLocalUri(primaryCwd);
+ 		if (!primaryCwd) {
+ 			return { servers: {}, deniedServers: [] };
+ 		}
+@@ -896,12 +898,12 @@ export class ClaudeAgentSession extends Disposable {
+ 		const deniedServers: ClaudeDeniedMcpServerSpec[] = [];
+ 		for (const definition of discoveredDefinitions) {
+ 			if (discoveredEnablement.get(definition.customization.id) !== true) {
+-				if (definition.defaultCwd && isEqual(definition.defaultCwd, primaryCwd)) {
++				if (definition.defaultCwd && primaryRoot && isEqual(definition.defaultCwd, primaryRoot)) {
+ 					deniedServers.push(toClaudeDeniedMcpServer(definition));
+ 				}
+ 				continue;
+ 			}
+-			if (definition.defaultCwd && isEqual(definition.defaultCwd, primaryCwd)) {
++			if (definition.defaultCwd && primaryRoot && isEqual(definition.defaultCwd, primaryRoot)) {
+ 				continue;
+ 			}
+ 			definitions.set(definition.name, definition);
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 5a97f83094385..5007dfb462bd3 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -8689,6 +8689,53 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		});
+ 	});
+ 
++	test('a remote primary root still gates its own workspace MCP servers', async () => {
++		const pm = new FakeAgentPluginManager();
++		const { agent, sdk, fileService, stateManager, configService } = buildCtxWith(pm);
++		configService.updateRootConfig({ [AgentHostClaudeMultiRootEnabledConfigKey]: true });
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		// The window addresses the primary root in its own namespace; the files
++		// live on this host, where discovery reads them.
++		const primary = URI.from({ scheme: Schemas.vscodeRemote, authority: 'dev-container+abc', path: '/primary' });
++		await fileService.writeFile(URI.joinPath(URI.file('/primary'), '.mcp.json'), VSBuffer.fromString(JSON.stringify({
++			'primary-enabled': { type: 'http', url: 'https://primary-enabled.example.com/mcp' },
++			'primary-disabled': { type: 'http', url: 'https://primary-disabled.example.com/mcp' },
++		})));
++		const created = await createSession(agent, { workingDirectories: [primary] });
++		const chat = defaultChatUri(created.session);
++		// Identify the servers by the host-local path discovery resolves them at.
++		const mcpFile = URI.joinPath(URI.file('/primary'), '.mcp.json');
++		const customizations = [
++			makeMcpServerCustomization(mcpFile, 'primary-enabled'),
++			makeMcpServerCustomization(mcpFile, 'primary-disabled'),
++		];
++		publishReducerCustomizations(stateManager, created.session, customizations);
++		const disabled = customizations.find(customization => customization.type === CustomizationType.McpServer && customization.name === 'primary-disabled');
++		assert.ok(disabled);
++		stateManager.dispatchServerAction(created.session.toString(), {
++			type: ActionType.SessionCustomizationToggled,
++			id: disabled.id,
++			enablement: [{ kind: CustomizationEnablementKind.Session, enabled: false }],
++		});
++
++		sdk.supportedAgentsResult = [];
++		sdk.mcpServerStatusResult = [];
++		sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++		await agent.chats.sendMessage(chat, 'first', [primary], undefined, 'turn-1', undefined, undefined, chatContext(chat));
++
++		const options = sdk.capturedStartupOptions[0];
++		const settings = options.settings;
++		assert.ok(settings && typeof settings !== 'string');
++		assert.deepStrictEqual({
++			// The primary root's own servers are implicit, never injected.
++			explicitServers: Object.keys(options.mcpServers ?? {}).sort(),
++			deniedServers: settings.deniedMcpServers,
++		}, {
++			explicitServers: ['github-mcp-server'],
++			deniedServers: [{ serverName: 'primary-disabled' }],
++		});
++	});
++
+ 	test('workspace MCP enablement gates SDK startup and rebuilds after re-enable', async () => {
+ 		const pm = new FakeAgentPluginManager();
+ 		const { agent, sdk, fileService, stateManager, configService } = buildCtxWith(pm);

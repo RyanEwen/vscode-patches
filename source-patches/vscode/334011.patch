@@ -1,0 +1,185 @@
+From bdad2c57ebee8c17b80f9798d6f6514354a747a5 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 11:05:49 -0400
+Subject: [PATCH] agentHost: make chat/turnStarted reducer idempotent
+
+The chat subscription keeps an optimistic overlay: every action the client
+dispatches is applied locally, held in the pending list, and replayed on top
+of the confirmed state each time a confirmed action arrives. A pending action
+is only retired when the server echoes it back with the client's own
+clientSeq, and some paths never echo, so a turn start can stay pending for
+the whole turn.
+
+That was harmless for most cases, but the ChatTurnStarted reducer case
+unconditionally rebuilt activeTurn with an empty responseParts array. Once
+the start was confirmed by another path, every replay wiped the streamed
+content again, so the response looked blank for as long as the start stayed
+pending. This is the mechanism behind microsoft/vscode#332087.
+
+ChatTurnStarted now returns the state unchanged when its turnId is already
+the active turn, or already appears in the completed turns (the turn ended
+and was confirmed through a snapshot). A replayed start therefore never
+resets a turn in progress and never resurrects a finished turn as an empty
+active one. Restarting a finished turn remains ChatTurnResume's job.
+
+The other client-dispatchable chat cases were audited and are already
+idempotent: they either guard on a status the first application leaves
+behind (tool call transitions, turn cancel and resume, input completion,
+pending message removal) or assign the same value on every application
+(content, draft, working directories, pending message set, reorder, input
+answers). ChatTruncated is already idempotent as well; a test locks that in.
+
+The reducer is synced from the agent-host-protocol repo, so the same change
+is made there on a matching branch with fixtures. Tests cover the replay at
+the reducer level and the stranded turn start at the subscription level.
+---
+ .../state/protocol/channels-chat/reducer.ts   |  5 ++
+ .../test/common/agentSubscription.test.ts     | 30 ++++++++-
+ .../agentHost/test/node/reducers.test.ts      | 66 ++++++++++++++++++-
+ 3 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts b/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts
+index 5cf707cfc1f3c..a1c91dc62c3cd 100644
+--- a/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts
++++ b/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts
+@@ -337,6 +337,11 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+ 		// ── Turn Lifecycle ────────────────────────────────────────────────────
+ 
+ 		case ActionType.ChatTurnStarted: {
++			const alreadyStarted = state.activeTurn?.id === action.turnId
++				|| state.turns.some(turn => turn.id === action.turnId);
++			if (alreadyStarted) {
++				return state;
++			}
+ 			let next: ChatState = {
+ 				...state,
+ 				activeTurn: {
+diff --git a/src/vs/platform/agentHost/test/common/agentSubscription.test.ts b/src/vs/platform/agentHost/test/common/agentSubscription.test.ts
+index 706885b378e4d..f906034ec6f34 100644
+--- a/src/vs/platform/agentHost/test/common/agentSubscription.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentSubscription.test.ts
+@@ -9,7 +9,7 @@ import { DisposableStore } from '../../../../base/common/lifecycle.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+ import { buildAnnotationsUri } from '../../common/annotationsUri.js';
+-import { ActionType, type ActionEnvelope, type ClientChangesetAction } from '../../common/state/sessionActions.js';
++import { ActionType, type ActionEnvelope, type ChatTurnStartedAction, type ClientChangesetAction } from '../../common/state/sessionActions.js';
+ import { AutomationOperation, AutomationRunOriginKind, AutomationRunStatus, ChangesetStatus, MessageKind, ResponsePartKind, SessionLifecycle, SessionStatus, TerminalClaimKind, TerminalLifecycleStatus, TurnState, type AnnotationsState, type AutomationRunState, type AutomationState, type ChangesetState, type ErrorInfo, type RootState, type SessionState, type SessionSummary, type TerminalState, type Turn } from '../../common/state/protocol/state.js';
+ import { AUTOMATION_CATALOG_URI, buildDefaultChatUri, createChatState, createDefaultChatSummary, getTurnError, ROOT_STATE_URI, StateComponents, type ChatState } from '../../common/state/sessionState.js';
+ import { AgentSubscriptionManager, AutomationCatalogSubscription, AutomationRunSubscription, ChangesetStateSubscription, ChatStateSubscription, isActionEnvelopeRelevantToSubscriptionUris, RootStateSubscription, SessionStateSubscription, TerminalStateSubscription } from '../../common/state/agentSubscription.js';
+@@ -730,6 +730,34 @@ suite('ChatStateSubscription', () => {
+ 			turns: [{ id: 'turn-1', state: TurnState.Complete }],
+ 		});
+ 	});
++
++	test('stranded optimistic turn start does not reset a confirmed streaming turn', () => {
++		const sub = createSub();
++		sub.handleSnapshot(makeChatState(chatUri), 0);
++		const turnStarted: ChatTurnStartedAction = {
++			type: ActionType.ChatTurnStarted,
++			turnId: 'turn-1',
++			startedAt: '2025-01-01T00:00:00.000Z',
++			message: { text: 'hello', origin: { kind: MessageKind.User } },
++		};
++
++		sub.applyOptimistic(turnStarted);
++		sub.receiveEnvelope(makeEnvelope(turnStarted, 1, undefined));
++		sub.receiveEnvelope(makeEnvelope({
++			type: ActionType.ChatResponsePart,
++			turnId: 'turn-1',
++			part: { kind: ResponsePartKind.Markdown, id: 'part-1', content: 'Hel' },
++		}, 2, undefined));
++		sub.receiveEnvelope(makeEnvelope({ type: ActionType.ChatDelta, turnId: 'turn-1', partId: 'part-1', content: 'lo' }, 3, undefined));
++
++		assert.deepStrictEqual({
++			pendingActions: sub.getPendingActions().length,
++			responseParts: (sub.value as ChatState | undefined)?.activeTurn?.responseParts,
++		}, {
++			pendingActions: 1,
++			responseParts: [{ kind: ResponsePartKind.Markdown, id: 'part-1', content: 'Hello' }],
++		});
++	});
+ });
+ 
+ // TerminalStateSubscription
+diff --git a/src/vs/platform/agentHost/test/node/reducers.test.ts b/src/vs/platform/agentHost/test/node/reducers.test.ts
+index dbb4eecd14284..f8b0073e24f9e 100644
+--- a/src/vs/platform/agentHost/test/node/reducers.test.ts
++++ b/src/vs/platform/agentHost/test/node/reducers.test.ts
+@@ -8,7 +8,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
+ import { sortCustomizationEnablement, withCustomizationEnablement } from '../../common/customizationEnablement.js';
+ import { changesetReducer, chatReducer, sessionReducer } from '../../common/state/protocol/reducers.js';
+ import { ChatInputRequestPurpose, withChatInputRequestPurpose } from '../../common/meta/agentChatInputRequestMeta.js';
+-import { ActionType } from '../../common/state/sessionActions.js';
++import { ActionType, type ChatTruncatedAction, type ChatTurnStartedAction } from '../../common/state/sessionActions.js';
+ import { ChangesetStatus, ChangesetOperationStatus, CustomizationLoadStatus, MessageKind, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, ChatOriginKind, SessionLifecycle, SessionStatus, ToolCallConfirmationReason, ToolCallRiskAssessmentKind, ToolCallRiskAssessmentStatus, ResponsePartKind, ToolCallStatus, TurnState, type AgentCustomization, type ChangesetState, type Customization, type PluginCustomization, type ChatState, type SessionState } from '../../common/state/sessionState.js';
+ import { CustomizationEnablementKind, CustomizationType, McpServerStatus, ToolCallContributorKind, type ToolCallContributor } from '../../common/state/protocol/state.js';
+ 
+@@ -804,3 +804,67 @@ suite('customization enablement', () => {
+ 		]);
+ 	});
+ });
++
++suite('chatReducer replaying client-dispatched actions', () => {
++
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	const turnStarted: ChatTurnStartedAction = {
++		type: ActionType.ChatTurnStarted,
++		turnId: 'turn-1',
++		startedAt: '2025-01-01T00:00:00.000Z',
++		message: { text: 'hello', origin: { kind: MessageKind.User } },
++	};
++
++	function withStreamedMarkdown(state: ChatState, turnId = 'turn-1'): ChatState {
++		state = chatReducer(state, {
++			type: ActionType.ChatResponsePart,
++			turnId,
++			part: { kind: ResponsePartKind.Markdown, id: 'part-1', content: 'Hel' },
++		});
++		return chatReducer(state, { type: ActionType.ChatDelta, turnId, partId: 'part-1', content: 'lo' });
++	}
++
++	test('ChatTurnStarted replayed over the turn it started is a no-op', () => {
++		const started = chatReducer(makeChat(), turnStarted);
++		const streaming = withStreamedMarkdown(started);
++
++		assert.deepStrictEqual({
++			replayedOnStart: chatReducer(started, turnStarted),
++			replayedWhileStreaming: chatReducer(streaming, turnStarted),
++			streamedContent: streaming.activeTurn?.responseParts,
++		}, {
++			replayedOnStart: started,
++			replayedWhileStreaming: streaming,
++			streamedContent: [{ kind: ResponsePartKind.Markdown, id: 'part-1', content: 'Hello' }],
++		});
++	});
++
++	test('ChatTurnStarted for a completed turn is a no-op', () => {
++		const completed = chatReducer(withStreamedMarkdown(chatReducer(makeChat(), turnStarted)), {
++			type: ActionType.ChatTurnComplete,
++			turnId: 'turn-1',
++			duration: 100,
++		});
++
++		assert.strictEqual(chatReducer(completed, turnStarted), completed);
++	});
++
++	test('ChatTruncated is idempotent', () => {
++		let state = makeChat();
++		for (const turnId of ['turn-1', 'turn-2']) {
++			state = chatReducer(state, { ...turnStarted, turnId });
++			state = chatReducer(state, { type: ActionType.ChatTurnComplete, turnId, duration: 100 });
++		}
++		state = withStreamedMarkdown(chatReducer(state, { ...turnStarted, turnId: 'turn-3' }), 'turn-3');
++		const truncations: ChatTruncatedAction[] = [
++			{ type: ActionType.ChatTruncated, turnId: 'turn-1' },
++			{ type: ActionType.ChatTruncated },
++		];
++
++		assert.deepStrictEqual(
++			truncations.map(action => chatReducer(chatReducer(state, action), action)),
++			truncations.map(action => chatReducer(state, action)),
++		);
++	});
++});

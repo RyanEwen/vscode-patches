@@ -1,0 +1,303 @@
+From e8518f19ef343d66540b5e57bdd88e8bfa1a6dc5 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:32:02 -0400
+Subject: [PATCH 1/2] Read project customizations on the host's own filesystem
+
+A window connected to a remote hands the session its working directory in
+the client's namespace, so in a dev container the primary root arrives as
+`vscode-remote://dev-container+<hex>/workspace/repo`. The agent host runs
+inside that container and its file service only answers for `file:`, so
+every project-scope disk scan reads a URI it cannot resolve.
+
+It fails quietly: the scan returns empty rather than erroring, so project
+agents, skills, commands, rules, MCP servers and hooks are all simply
+absent. User-scope ones keep working because `userHome` is already
+host-local, which makes the symptom look like `.claude/commands`
+specifically. Slash commands appear to recover after the first turn, but
+only because the SDK then supplies its own list; the disk scan never
+starts working.
+
+The path is what both namespaces agree on, which materialize already
+relies on by handing the SDK `workingDirectory.fsPath` as its cwd. This
+applies the same reading to the host's own reads, and only to those:
+anything sent back to the client keeps the namespace the client uses.
+
+Scoped to `vscode-remote:`. Stripping the authority off any other scheme
+would name a local file that is not there rather than the resource meant.
+---
+ .../platform/agentHost/common/agentHostUri.ts | 24 ++++++++++++
+ .../node/claude/claudeAgentSession.ts         | 38 +++++++++++++++++--
+ .../agentHostFileSystemProvider.test.ts       | 38 ++++++++++++++++++-
+ 3 files changed, 95 insertions(+), 5 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostUri.ts b/src/vs/platform/agentHost/common/agentHostUri.ts
+index a0343f26f1897..d68170479c556 100644
+--- a/src/vs/platform/agentHost/common/agentHostUri.ts
++++ b/src/vs/platform/agentHost/common/agentHostUri.ts
+@@ -190,6 +190,30 @@ export function createAgentHostResourceUriMapper(connectionAuthority: string): I
+ 	};
+ }
+ 
++/**
++ * Reinterpret a URI as a path on the machine this agent host runs on.
++ *
++ * The host reads and writes its own filesystem through `file:`, but a window
++ * connected to a remote describes that same filesystem in its own namespace,
++ * for example `vscode-remote://dev-container+<hex>/workspace/repo`. Handing
++ * such a URI to the host's file service finds nothing, and does so quietly:
++ * the read returns empty rather than failing.
++ *
++ * The path is the part both namespaces agree on, which is why materialize can
++ * already pass `workingDirectory.fsPath` to the SDK as its cwd.
++ *
++ * A `file:` URI is returned unchanged, so a local window is untouched.
++ */
++export function toHostLocalUri(resource: URI): URI {
++	// Only the remote namespace is rewritten. Any other scheme either is
++	// already host-local or names something this host cannot resolve by path,
++	// and stripping its authority would invent a local file that is not there.
++	if (resource.scheme !== Schemas.vscodeRemote) {
++		return resource;
++	}
++	return URI.file(resource.fsPath);
++}
++
+ /**
+  * Strips the redundant `ws://` scheme from an address. The transport layer
+  * already defaults to `ws://`, so only `wss://` needs to be preserved.
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 87c826ce5c1c2..8246d48cc7e15 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -16,6 +16,7 @@ import { IFileService } from '../../../files/common/files.js';
+ import { IInstantiationService } from '../../../instantiation/common/instantiation.js';
+ import { ILogService } from '../../../log/common/log.js';
+ import { IAgentConfigurationService } from '../agentConfigurationService.js';
++import { toHostLocalUri } from '../../common/agentHostUri.js';
+ import { ISyncedCustomization } from '../../common/agentPluginManager.js';
+ import { ClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { ClaudeRuntimeEffortLevel, toRuntimeEffortLevel, resolveClaudeEffort } from '../../common/claudeModelConfig.js';
+@@ -221,6 +222,35 @@ export class ClaudeAgentSession extends Disposable {
+ 		const primary = this.workingDirectory;
+ 		return primary ? [primary, ...this._desiredAdditionalDirectories] : undefined;
+ 	}
++
++	/**
++	 * The same roots, in the namespace of the machine this host runs on.
++	 *
++	 * A window connected to a remote hands the session its working directory
++	 * in the CLIENT's namespace, so in a dev container the primary root
++	 * arrives as `vscode-remote://dev-container+<hex>/workspace/repo`. The
++	 * host runs inside that container and its file service only answers for
++	 * `file:`, so reading customizations straight off those URIs silently
++	 * finds nothing: every project-scope agent, skill, command, rule, MCP
++	 * server and hook disappears, while user-scope ones keep working because
++	 * `userHome` is already host-local.
++	 *
++	 * The path is what both sides agree on, and materialize already relies on
++	 * that by handing the SDK `workingDirectory.fsPath` as its cwd. This
++	 * applies the same reading to the host's own disk access.
++	 *
++	 * Only for reads the host performs. Anything sent back to the client, or
++	 * compared against client-supplied URIs, must keep the original.
++	 */
++	private get _hostLocalWorkingDirectories(): readonly URI[] | undefined {
++		return this.workingDirectories?.map(toHostLocalUri);
++	}
++
++	/** Host-local {@link workingDirectory}. See {@link _hostLocalWorkingDirectories}. */
++	private get _hostLocalWorkingDirectory(): URI | undefined {
++		const primary = this.workingDirectory;
++		return primary ? toHostLocalUri(primary) : undefined;
++	}
+ 	private readonly _customizationWatcher = this._register(new MutableDisposable<DisposableStore>());
+ 	private _mcpDiscovery: SessionMcpDiscovery | undefined;
+ 	private _mcpLaunchEnablementRevision = 0;
+@@ -1465,10 +1495,10 @@ export class ClaudeAgentSession extends Disposable {
+ 		const { synced } = this.clientCustomizationsDiff.model.state.get();
+ 		const userHome = this._environmentService.userHome;
+ 		const [multiRoot, rules, mcpServers, hooks] = await Promise.all([
+-			discoverClaudeMultiRootCustomizations(this.workingDirectories, userHome, this._fileService, this._logService),
+-			scanClaudeRules(this.workingDirectory, userHome, this._fileService),
+-			scanClaudeMcpServers(this.workingDirectory, userHome, this._fileService),
+-			scanClaudeHooks(this.workingDirectory, userHome, this._fileService),
++			discoverClaudeMultiRootCustomizations(this._hostLocalWorkingDirectories, userHome, this._fileService, this._logService),
++			scanClaudeRules(this._hostLocalWorkingDirectory, userHome, this._fileService),
++			scanClaudeMcpServers(this._hostLocalWorkingDirectory, userHome, this._fileService),
++			scanClaudeHooks(this._hostLocalWorkingDirectory, userHome, this._fileService),
+ 		]);
+ 
+ 		// Post-materialize, the live SDK snapshot filters the disk set down to
+diff --git a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+index a77b525df53be..3bd6c68de05eb 100644
+--- a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+@@ -12,7 +12,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
+ import { FileChangeType, FilePermission, FileSystemProviderErrorCode, FileType, IFileChange, toFileSystemProviderErrorCode } from '../../../files/common/files.js';
+ import { AgentHostFileSystemProvider, agentHostRemotePath, agentHostUri, type IRemoteFilesystemConnection } from '../../common/agentHostFileSystemProvider.js';
+ import { remoteAgentHostSessionTypeId } from '../../common/agentHostSessionType.js';
+-import { AGENT_HOST_LABEL_FORMATTER, AGENT_HOST_SCHEME, agentHostAuthority, createAgentHostResourceUriMapper, fromAgentHostUri, identityAgentHostResourceUriMapper, isAgentHostContentRefUri, toAgentHostContentUri, toAgentHostUri } from '../../common/agentHostUri.js';
++import { AGENT_HOST_LABEL_FORMATTER, AGENT_HOST_SCHEME, agentHostAuthority, createAgentHostResourceUriMapper, fromAgentHostUri, identityAgentHostResourceUriMapper, isAgentHostContentRefUri, toAgentHostContentUri, toAgentHostUri, toHostLocalUri } from '../../common/agentHostUri.js';
+ import { ContentEncoding, ResourceType, type CreateResourceWatchParams, type ResourceCopyParams, type ResourceListResult, type ResourceMkdirParams, type ResourceReadResult, type ResourceRequestParams, type ResourceRequestResult, type ResourceResolveParams, type ResourceResolveResult } from '../../common/state/protocol/commands.js';
+ import { AhpErrorCodes } from '../../common/state/protocol/errors.js';
+ import { ProtocolError } from '../../common/state/sessionProtocol.js';
+@@ -1070,3 +1070,39 @@ suite('AgentHostFileSystemProvider - resolve / mkdir / copy / watch', () => {
+ 		assert.strictEqual(received[0][0].resource.toString(), agentHostUri('never-registered', '/path/late.txt').toString());
+ 	});
+ });
++
++suite('toHostLocalUri', () => {
++
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('a remote window\'s working directory is reinterpreted as a local path', () => {
++		// What a dev-container window hands the session. The host runs inside
++		// that container, so it must read the path on its own filesystem.
++		const fromClient = URI.parse('vscode-remote://dev-container%2Babc/workspace/printstream');
++
++		assert.strictEqual(toHostLocalUri(fromClient).toString(), URI.file('/workspace/printstream').toString());
++	});
++
++	test('a scheme that is not the remote namespace is left alone', () => {
++		// Stripping the authority off one of these would name a local file that
++		// does not exist, rather than the resource it actually refers to.
++		const wrapped = URI.parse('vscode-agent-host://b64-abc/workspace/repo');
++		const untitled = URI.parse('untitled:Untitled-1');
++
++		assert.strictEqual(toHostLocalUri(wrapped), wrapped);
++		assert.strictEqual(toHostLocalUri(untitled), untitled);
++	});
++	test('a local file: URI is returned unchanged', () => {
++		const local = URI.file('/home/me/project');
++
++		assert.strictEqual(toHostLocalUri(local), local, 'a local window must not be rewritten');
++	});
++
++	test('the path survives, which is what both namespaces agree on', () => {
++		// materialize already relies on this by passing `fsPath` to the SDK as cwd.
++		const nested = URI.parse('vscode-remote://dev-container%2Babc/workspace/repo/.claude/commands');
++
++		assert.strictEqual(toHostLocalUri(nested).path, '/workspace/repo/.claude/commands');
++		assert.strictEqual(toHostLocalUri(nested).authority, '', 'the client authority must not leak into a host read');
++	});
++});
+
+From 705a508f040539f39e7f40f6dac8df77c766ac68 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:37:15 -0400
+Subject: [PATCH 2/2] Keep query and fragment, and cut the comments to the repo
+ limits
+
+`URI.file` builds from the path alone, so the conversion silently dropped
+`query` and `fragment`. Working directories carry neither, but the helper
+is exported and general, and `fromAgentHostUri` returns URIs that do carry
+a query, so the loss would have been waiting for the first such caller.
+
+Also trims the comments this change added. The repository allows 1-2 short
+sentences of JSDoc and at most one line inline, and these ran to twelve and
+fourteen lines. The reasoning belongs in the commit and the pull request,
+which is where it now lives.
+---
+ .../platform/agentHost/common/agentHostUri.ts | 20 ++++---------------
+ .../node/claude/claudeAgentSession.ts         | 19 ++----------------
+ .../agentHostFileSystemProvider.test.ts       | 15 ++++++++++----
+ 3 files changed, 17 insertions(+), 37 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostUri.ts b/src/vs/platform/agentHost/common/agentHostUri.ts
+index d68170479c556..eccde34e40157 100644
+--- a/src/vs/platform/agentHost/common/agentHostUri.ts
++++ b/src/vs/platform/agentHost/common/agentHostUri.ts
+@@ -191,27 +191,15 @@ export function createAgentHostResourceUriMapper(connectionAuthority: string): I
+ }
+ 
+ /**
+- * Reinterpret a URI as a path on the machine this agent host runs on.
+- *
+- * The host reads and writes its own filesystem through `file:`, but a window
+- * connected to a remote describes that same filesystem in its own namespace,
+- * for example `vscode-remote://dev-container+<hex>/workspace/repo`. Handing
+- * such a URI to the host's file service finds nothing, and does so quietly:
+- * the read returns empty rather than failing.
+- *
+- * The path is the part both namespaces agree on, which is why materialize can
+- * already pass `workingDirectory.fsPath` to the SDK as its cwd.
+- *
+- * A `file:` URI is returned unchanged, so a local window is untouched.
++ * Reinterpret a remote-namespace URI as a path on the machine this host runs on.
++ * The host reads its own filesystem through `file:`, so a client's
++ * `vscode-remote:` URI resolves to nothing here.
+  */
+ export function toHostLocalUri(resource: URI): URI {
+-	// Only the remote namespace is rewritten. Any other scheme either is
+-	// already host-local or names something this host cannot resolve by path,
+-	// and stripping its authority would invent a local file that is not there.
+ 	if (resource.scheme !== Schemas.vscodeRemote) {
+ 		return resource;
+ 	}
+-	return URI.file(resource.fsPath);
++	return URI.file(resource.fsPath).with({ query: resource.query, fragment: resource.fragment });
+ }
+ 
+ /**
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 8246d48cc7e15..e5cb426462956 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -224,23 +224,8 @@ export class ClaudeAgentSession extends Disposable {
+ 	}
+ 
+ 	/**
+-	 * The same roots, in the namespace of the machine this host runs on.
+-	 *
+-	 * A window connected to a remote hands the session its working directory
+-	 * in the CLIENT's namespace, so in a dev container the primary root
+-	 * arrives as `vscode-remote://dev-container+<hex>/workspace/repo`. The
+-	 * host runs inside that container and its file service only answers for
+-	 * `file:`, so reading customizations straight off those URIs silently
+-	 * finds nothing: every project-scope agent, skill, command, rule, MCP
+-	 * server and hook disappears, while user-scope ones keep working because
+-	 * `userHome` is already host-local.
+-	 *
+-	 * The path is what both sides agree on, and materialize already relies on
+-	 * that by handing the SDK `workingDirectory.fsPath` as its cwd. This
+-	 * applies the same reading to the host's own disk access.
+-	 *
+-	 * Only for reads the host performs. Anything sent back to the client, or
+-	 * compared against client-supplied URIs, must keep the original.
++	 * {@link workingDirectories} in this host's own namespace, for reads the host
++	 * performs itself. Anything sent to the client keeps the unconverted form.
+ 	 */
+ 	private get _hostLocalWorkingDirectories(): readonly URI[] | undefined {
+ 		return this.workingDirectories?.map(toHostLocalUri);
+diff --git a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+index 3bd6c68de05eb..9449842c60041 100644
+--- a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+@@ -1076,16 +1076,23 @@ suite('toHostLocalUri', () => {
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+ 
+ 	test('a remote window\'s working directory is reinterpreted as a local path', () => {
+-		// What a dev-container window hands the session. The host runs inside
+-		// that container, so it must read the path on its own filesystem.
++		// What a dev-container window hands the session.
+ 		const fromClient = URI.parse('vscode-remote://dev-container%2Babc/workspace/printstream');
+ 
+ 		assert.strictEqual(toHostLocalUri(fromClient).toString(), URI.file('/workspace/printstream').toString());
+ 	});
+ 
++	test('query and fragment survive the conversion', () => {
++		const withParts = URI.parse('vscode-remote://dev-container%2Babc/workspace/repo/x.ts?a=1#L4');
++
++		const local = toHostLocalUri(withParts);
++		assert.deepStrictEqual(
++			{ scheme: local.scheme, path: local.path, query: local.query, fragment: local.fragment },
++			{ scheme: 'file', path: '/workspace/repo/x.ts', query: 'a=1', fragment: 'L4' },
++		);
++	});
+ 	test('a scheme that is not the remote namespace is left alone', () => {
+-		// Stripping the authority off one of these would name a local file that
+-		// does not exist, rather than the resource it actually refers to.
++		// Stripping the authority here would name a local file that is not there.
+ 		const wrapped = URI.parse('vscode-agent-host://b64-abc/workspace/repo');
+ 		const untitled = URI.parse('untitled:Untitled-1');
+ 

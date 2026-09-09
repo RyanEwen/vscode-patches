@@ -1,0 +1,480 @@
+From d24f9dc36e5cdf4e55f069d3a554031f0ccc1010 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 02:16:20 -0400
+Subject: [PATCH 1/3] Resolve a slash command whose content cannot be read
+
+A command's `uri` is not always readable. Built-in skills are published as
+discovery-only entries on the `agent-builtin` scheme that carry a name and a
+description and have nothing behind them, and a file-backed command can be
+deleted between discovery and use.
+
+`resolvePromptSlashCommand` parsed that uri unconditionally, so the read
+rejected and the rejection escaped the resolver. Its caller is the input
+decoration update, which feeds `parsedInput`, so a message containing such a
+command could never be sent and nothing was reported to the user.
+
+Parse best-effort and make `parsedPromptFile` optional: the command still
+resolves, only its body is unavailable. `promptFilePickers` already treats a
+failed parse this way. Consumers skip just the part that needs a body.
+---
+ .../chatSessions/chatSessions.contribution.ts |  6 ++--
+ .../contrib/chat/browser/widget/chatWidget.ts | 14 +++++---
+ .../common/customizationHarnessService.ts     | 13 ++++++--
+ .../promptSyntax/service/promptsService.ts    | 12 ++++++-
+ .../service/promptsServiceImpl.ts             |  5 ++-
+ .../service/promptsService.test.ts            | 32 ++++++++++++++++++-
+ 6 files changed, 70 insertions(+), 12 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts b/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts
+index 6766f5e52f628..506f89f666993 100644
+--- a/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts
+@@ -1811,8 +1811,10 @@ async function resolvePromptSlashCommand(prompt: string, sessionResource: URI, c
+ 	if (slashMatch) {
+ 		// need to resolve the slash command to get the prompt file
+ 		const slashCommand = await customizationHarnessService.resolvePromptSlashCommand(slashMatch[1], sessionResource, CancellationToken.None);
+-		if (slashCommand) {
+-			const parseResult = slashCommand.parsedPromptFile;
++		// A discovery-only command (e.g. a built-in skill) resolves but has no
++		// prompt file to contribute, so there is no variable entry to return.
++		const parseResult = slashCommand?.parsedPromptFile;
++		if (parseResult) {
+ 			// add the prompt file to the context
+ 			const refs = parseResult.body?.variableReferences.map(({ name, offset, fullLength }) => ({ name, range: new OffsetRange(offset, offset + fullLength) })) ?? [];
+ 			const toolReferences = toolsService.toToolReferences(refs);
+diff --git a/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts b/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
+index 2cb7d02248a5e..bc5a6483640ab 100644
+--- a/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
++++ b/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
+@@ -2874,11 +2874,15 @@ export class ChatWidget extends Disposable implements IChatWidget {
+ 		if (!slashCommand) {
+ 			return true;
+ 		}
++		// Only a command backed by readable content contributes a prompt file to
++		// the context; a discovery-only one still runs, it just has no body to
++		// attach. Telemetry below is recorded either way.
+ 		const parseResult = slashCommand.parsedPromptFile;
+-		// add the prompt file to the context
+-		const refs = parseResult.body?.variableReferences.map(({ name, offset, fullLength }) => ({ name, range: new OffsetRange(offset, offset + fullLength) })) ?? [];
+-		const toolReferences = this.toolsService.toToolReferences(refs);
+-		requestInput.attachedContext.insertFirst(toPromptFileVariableEntry(parseResult.uri, PromptFileVariableKind.PromptFile, undefined, true, toolReferences));
++		if (parseResult) {
++			const refs = parseResult.body?.variableReferences.map(({ name, offset, fullLength }) => ({ name, range: new OffsetRange(offset, offset + fullLength) })) ?? [];
++			const toolReferences = this.toolsService.toToolReferences(refs);
++			requestInput.attachedContext.insertFirst(toPromptFileVariableEntry(parseResult.uri, PromptFileVariableKind.PromptFile, undefined, true, toolReferences));
++		}
+ 
+ 		const promptRunEvent: ChatPromptRunEvent = {
+ 			storage: slashCommand.storage,
+@@ -2891,7 +2895,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
+ 		}
+ 		this.telemetryService.publicLog2<ChatPromptRunEvent, ChatPromptRunClassification>('chat.promptRun', promptRunEvent);
+ 
+-		if (parseResult.header) {
++		if (parseResult?.header) {
+ 			const applied = await this._applyPromptMetadata(parseResult.header, requestInput);
+ 			if (!applied) {
+ 				return false;
+diff --git a/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts b/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
+index 10b25c470df61..2c0c1204c9ce2 100644
+--- a/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
++++ b/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
+@@ -635,10 +635,19 @@ export class CustomizationHarnessServiceBase implements ICustomizationHarnessSer
+ 		const commands = await this.getSlashCommands(sessionResource, token);
+ 		const command = commands.find(cmd => cmd.name === name);
+ 		if (command) {
+-			const parsedPromptFile = await this.promptsService.parseNew(command.uri, token);
++			// A command's `uri` is not always readable. Built-in skills are
++			// published on the `agent-builtin` scheme as discovery-only entries
++			// that carry a name and description and have no content behind them,
++			// and a file-backed command can be deleted between discovery and use.
++			// Parsing is best-effort so the command still resolves either way:
++			// letting the read reject here rejects the whole resolution, and the
++			// input-decoration path that calls it silently stops accepting the
++			// message, leaving the user unable to send anything containing that
++			// slash command.
++			const parsedPromptFile = await this.promptsService.parseNew(command.uri, token).catch(() => undefined);
+ 			return {
+ 				...command,
+-				userInvocable: parsedPromptFile.header?.userInvocable ?? command.userInvocable,
++				userInvocable: parsedPromptFile?.header?.userInvocable ?? command.userInvocable,
+ 				parsedPromptFile,
+ 			};
+ 		}
+diff --git a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts
+index 164c6b6bfd7a0..95f001a53a5e8 100644
+--- a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts
++++ b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts
+@@ -392,7 +392,17 @@ export interface IChatPromptSlashCommand {
+ }
+ 
+ export interface IResolvedChatPromptSlashCommand extends IChatPromptSlashCommand {
+-	readonly parsedPromptFile: ParsedPromptFile;
++	/**
++	 * The parsed prompt file, when the command is backed by readable content.
++	 *
++	 * Undefined for a command whose {@link IChatPromptSlashCommand.uri} is a
++	 * discovery-only identity rather than a file — built-in skills are published
++	 * on the `agent-builtin` scheme purely to carry a name and description — and
++	 * for a file-backed command that has since been deleted or become
++	 * unreadable. The command still resolves in both cases; only its body is
++	 * unavailable.
++	 */
++	readonly parsedPromptFile?: ParsedPromptFile;
+ }
+ 
+ 
+diff --git a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
+index f0369bb99a44a..bfb19aa22618d 100644
+--- a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
++++ b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
+@@ -652,9 +652,12 @@ export class PromptsService extends Disposable implements IPromptsService {
+ 		const commands = await this.getPromptSlashCommands(token);
+ 		const command = commands.find(cmd => cmd.name === name && matchesSessionType(cmd.sessionTypes, sessionType));
+ 		if (command) {
++			// Best-effort, for the same reason as the harness resolver: a command
++			// can be discovery-only or its file can have gone away, and neither
++			// should make resolving the command itself fail.
+ 			return {
+ 				...command,
+-				parsedPromptFile: await this.parseNew(command.uri, token),
++				parsedPromptFile: await this.parseNew(command.uri, token).catch(() => undefined),
+ 			};
+ 		}
+ 		return undefined;
+diff --git a/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts b/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
+index 7e6964a2f8e0b..f16a70325a79a 100644
+--- a/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
+@@ -43,7 +43,7 @@ import { ComputeAutomaticInstructions, newInstructionsCollectionEvent, newInstru
+ import { PromptsConfig } from '../../../../common/promptSyntax/config/config.js';
+ import { AGENTS_SOURCE_FOLDER, CLAUDE_CONFIG_FOLDER, HOOKS_SOURCE_FOLDER, INSTRUCTION_FILE_EXTENSION, INSTRUCTIONS_DEFAULT_SOURCE_FOLDER, LEGACY_MODE_DEFAULT_SOURCE_FOLDER, PROMPT_DEFAULT_SOURCE_FOLDER, PROMPT_FILE_EXTENSION } from '../../../../common/promptSyntax/config/promptFileLocations.js';
+ import { INSTRUCTIONS_LANGUAGE_ID, PROMPT_LANGUAGE_ID, PromptFileSource, PromptsType, Target } from '../../../../common/promptSyntax/promptTypes.js';
+-import { IAgentDiscoveryResult, IAgentSource, ICustomAgent, IPromptFileContext, IPromptPath, IPromptsService, PromptsStorage } from '../../../../common/promptSyntax/service/promptsService.js';
++import { IAgentDiscoveryResult, IAgentSource, IChatPromptSlashCommand, ICustomAgent, IPromptFileContext, IPromptPath, IPromptsService, PromptsStorage } from '../../../../common/promptSyntax/service/promptsService.js';
+ import { PromptsService } from '../../../../common/promptSyntax/service/promptsServiceImpl.js';
+ import { mockFiles } from '../testUtils/mockFilesystem.js';
+ import { InMemoryStorageService, IStorageService } from '../../../../../../../platform/storage/common/storage.js';
+@@ -3918,6 +3918,36 @@ suite('PromptsService', () => {
+ 		});
+ 	});
+ 
++	suite('resolvePromptSlashCommand - unreadable command content', () => {
++		teardown(() => {
++			sinon.restore();
++		});
++
++		test('resolves a command whose content cannot be read, with no parsed file', async () => {
++			// A built-in skill is published as a discovery-only identity: it
++			// carries a name and description and there is nothing to read behind
++			// its URI. Resolution must still succeed — rejecting here rejects the
++			// whole input-decoration update, and the user can no longer send any
++			// message containing that slash command.
++			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, false);
++
++			const promptUri = URI.parse('file://extensions/my-extension/discovery-only.prompt.md');
++			sinon.stub(service, 'getPromptSlashCommands').resolves([{
++				name: 'discovery-only',
++				uri: promptUri,
++				storage: PromptsStorage.local,
++				type: PromptsType.prompt,
++			} as IChatPromptSlashCommand]);
++			sinon.stub(service, 'parseNew').rejects(new Error('Unable to resolve nonexistent file'));
++
++			const resolved = await service.resolvePromptSlashCommand('discovery-only', undefined, CancellationToken.None);
++
++			assert.ok(resolved, 'the command should still resolve');
++			assert.strictEqual(resolved.name, 'discovery-only');
++			assert.strictEqual(resolved.parsedPromptFile, undefined, 'no prompt file should be reported');
++		});
++	});
++
+ 	suite('getPromptSlashCommands - skills', () => {
+ 		teardown(() => {
+ 			sinon.restore();
+
+From d1035c2cf77bde3116541138800822a7208a9c83 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 09:22:12 -0400
+Subject: [PATCH 2/3] Keep cancellation and real parse failures distinguishable
+
+Review feedback: a blanket catch also swallowed cancellation, and made a
+genuine parse regression look identical to a command that legitimately has
+nothing to read.
+
+Cancellation now propagates from both resolvers, and the prompts service
+traces any other failure with the command name and uri. The harness has no
+logger (its constructor is not DI-decorated), so it only rethrows.
+
+Tests cover both new branches: cancellation rejects, and a parse failure
+still resolves but is traced.
+---
+ .../common/customizationHarnessService.ts     |  9 +++-
+ .../service/promptsServiceImpl.ts             | 17 +++++--
+ .../service/promptsService.test.ts            | 48 ++++++++++++++++++-
+ 3 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts b/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
+index 2c0c1204c9ce2..4b23db47636c1 100644
+--- a/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
++++ b/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
+@@ -16,6 +16,7 @@ import { PromptsType } from './promptSyntax/promptTypes.js';
+ import { AGENT_MD_FILENAME } from './promptSyntax/config/promptFileLocations.js';
+ import { IAgentSource, IChatPromptSlashCommand, ICustomAgent, IPromptsService, IResolvedChatPromptSlashCommand, matchesSessionType, PromptsStorage } from './promptSyntax/service/promptsService.js';
+ import { CancellationToken } from '../../../../base/common/cancellation.js';
++import { isCancellationError } from '../../../../base/common/errors.js';
+ import { SessionType } from './chatSessionsService.js';
+ import { CustomAgent } from './promptSyntax/service/promptsServiceImpl.js';
+ import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
+@@ -644,7 +645,13 @@ export class CustomizationHarnessServiceBase implements ICustomizationHarnessSer
+ 			// input-decoration path that calls it silently stops accepting the
+ 			// message, leaving the user unable to send anything containing that
+ 			// slash command.
+-			const parsedPromptFile = await this.promptsService.parseNew(command.uri, token).catch(() => undefined);
++			// Cancellation is not a content problem, so it still propagates.
++			const parsedPromptFile = await this.promptsService.parseNew(command.uri, token).catch(e => {
++				if (isCancellationError(e)) {
++					throw e;
++				}
++				return undefined;
++			});
+ 			return {
+ 				...command,
+ 				userInvocable: parsedPromptFile?.header?.userInvocable ?? command.userInvocable,
+diff --git a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
+index bfb19aa22618d..49a06f6fca5ce 100644
+--- a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
++++ b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
+@@ -654,11 +654,18 @@ export class PromptsService extends Disposable implements IPromptsService {
+ 		if (command) {
+ 			// Best-effort, for the same reason as the harness resolver: a command
+ 			// can be discovery-only or its file can have gone away, and neither
+-			// should make resolving the command itself fail.
+-			return {
+-				...command,
+-				parsedPromptFile: await this.parseNew(command.uri, token).catch(() => undefined),
+-			};
++			// should make resolving the command itself fail. Cancellation is not a
++			// content problem and still propagates, and any other failure is traced
++			// so a real parse regression stays distinguishable from a command that
++			// legitimately has nothing to read.
++			const parsedPromptFile = await this.parseNew(command.uri, token).catch(e => {
++				if (isCancellationError(e)) {
++					throw e;
++				}
++				this.logger.trace(`[resolvePromptSlashCommand] no readable content for '${command.name}' (${command.uri}): ${e instanceof Error ? e.message : String(e)}`);
++				return undefined;
++			});
++			return { ...command, parsedPromptFile };
+ 		}
+ 		return undefined;
+ 	}
+diff --git a/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts b/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
+index f16a70325a79a..a8a4f0653d0c3 100644
+--- a/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
+@@ -7,7 +7,7 @@ import assert from 'assert';
+ import * as sinon from 'sinon';
+ import { DeferredPromise } from '../../../../../../../base/common/async.js';
+ import { CancellationToken, CancellationTokenSource } from '../../../../../../../base/common/cancellation.js';
+-import { CancellationError } from '../../../../../../../base/common/errors.js';
++import { CancellationError, isCancellationError } from '../../../../../../../base/common/errors.js';
+ import { Emitter, Event } from '../../../../../../../base/common/event.js';
+ import { match } from '../../../../../../../base/common/glob.js';
+ import { ResourceSet } from '../../../../../../../base/common/map.js';
+@@ -3946,6 +3946,52 @@ suite('PromptsService', () => {
+ 			assert.strictEqual(resolved.name, 'discovery-only');
+ 			assert.strictEqual(resolved.parsedPromptFile, undefined, 'no prompt file should be reported');
+ 		});
++
++		test('a parse failure is traced rather than vanishing', async () => {
++			// Swallowing the failure must not make a real parse regression
++			// indistinguishable from a command that has nothing to read.
++			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, false);
++
++			const promptUri = URI.parse('file://extensions/my-extension/broken.prompt.md');
++			const traceSpy = sinon.spy(logService, 'trace');
++			sinon.stub(service, 'getPromptSlashCommands').resolves([{
++				name: 'broken',
++				uri: promptUri,
++				storage: PromptsStorage.local,
++				type: PromptsType.prompt,
++			} as IChatPromptSlashCommand]);
++			sinon.stub(service, 'parseNew').rejects(new Error('kaboom'));
++
++			const resolved = await service.resolvePromptSlashCommand('broken', undefined, CancellationToken.None);
++
++			assert.ok(resolved, 'the command should still resolve');
++			assert.strictEqual(resolved.parsedPromptFile, undefined);
++			assert.ok(
++				traceSpy.getCalls().some(call => String(call.args[0]).includes('broken')),
++				'the failure should be traced with the command name',
++			);
++		});
++
++		test('cancellation still rejects rather than resolving without a prompt file', async () => {
++			// An aborted resolve must not look like a command with no content, or
++			// callers relying on cancellation to short-circuit would carry on.
++			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, false);
++
++			const promptUri = URI.parse('file://extensions/my-extension/cancelled-resolve.prompt.md');
++			sinon.stub(service, 'getPromptSlashCommands').resolves([{
++				name: 'cancelled-resolve',
++				uri: promptUri,
++				storage: PromptsStorage.local,
++				type: PromptsType.prompt,
++			} as IChatPromptSlashCommand]);
++			sinon.stub(service, 'parseNew').rejects(new CancellationError());
++
++			await assert.rejects(
++				() => service.resolvePromptSlashCommand('cancelled-resolve', undefined, CancellationToken.None),
++				(e: unknown) => isCancellationError(e),
++				'cancellation should propagate',
++			);
++		});
+ 	});
+ 
+ 	suite('getPromptSlashCommands - skills', () => {
+
+From 15664b25e1f4b491397be224fc10c9dce865e550 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:53:19 -0400
+Subject: [PATCH 3/3] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ .../chatSessions/chatSessions.contribution.ts        |  3 +--
+ .../contrib/chat/browser/widget/chatWidget.ts        |  4 +---
+ .../chat/common/customizationHarnessService.ts       | 11 +----------
+ .../common/promptSyntax/service/promptsService.ts    |  8 +-------
+ .../promptSyntax/service/promptsServiceImpl.ts       |  7 +------
+ .../promptSyntax/service/promptsService.test.ts      | 12 +++---------
+ 6 files changed, 8 insertions(+), 37 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts b/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts
+index 506f89f666993..ede7b9ad33915 100644
+--- a/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts
+@@ -1811,8 +1811,7 @@ async function resolvePromptSlashCommand(prompt: string, sessionResource: URI, c
+ 	if (slashMatch) {
+ 		// need to resolve the slash command to get the prompt file
+ 		const slashCommand = await customizationHarnessService.resolvePromptSlashCommand(slashMatch[1], sessionResource, CancellationToken.None);
+-		// A discovery-only command (e.g. a built-in skill) resolves but has no
+-		// prompt file to contribute, so there is no variable entry to return.
++		// A discovery-only command resolves but has no prompt file to contribute.
+ 		const parseResult = slashCommand?.parsedPromptFile;
+ 		if (parseResult) {
+ 			// add the prompt file to the context
+diff --git a/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts b/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
+index bc5a6483640ab..b5a7b809fe89f 100644
+--- a/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
++++ b/src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts
+@@ -2874,9 +2874,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
+ 		if (!slashCommand) {
+ 			return true;
+ 		}
+-		// Only a command backed by readable content contributes a prompt file to
+-		// the context; a discovery-only one still runs, it just has no body to
+-		// attach. Telemetry below is recorded either way.
++		// Only a command with readable content contributes a prompt file; telemetry is recorded either way.
+ 		const parseResult = slashCommand.parsedPromptFile;
+ 		if (parseResult) {
+ 			const refs = parseResult.body?.variableReferences.map(({ name, offset, fullLength }) => ({ name, range: new OffsetRange(offset, offset + fullLength) })) ?? [];
+diff --git a/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts b/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
+index 4b23db47636c1..36739e9dd7729 100644
+--- a/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
++++ b/src/vs/workbench/contrib/chat/common/customizationHarnessService.ts
+@@ -636,16 +636,7 @@ export class CustomizationHarnessServiceBase implements ICustomizationHarnessSer
+ 		const commands = await this.getSlashCommands(sessionResource, token);
+ 		const command = commands.find(cmd => cmd.name === name);
+ 		if (command) {
+-			// A command's `uri` is not always readable. Built-in skills are
+-			// published on the `agent-builtin` scheme as discovery-only entries
+-			// that carry a name and description and have no content behind them,
+-			// and a file-backed command can be deleted between discovery and use.
+-			// Parsing is best-effort so the command still resolves either way:
+-			// letting the read reject here rejects the whole resolution, and the
+-			// input-decoration path that calls it silently stops accepting the
+-			// message, leaving the user unable to send anything containing that
+-			// slash command.
+-			// Cancellation is not a content problem, so it still propagates.
++			// Best-effort: a discovery-only command has no content, and rejecting here blocks sending the message.
+ 			const parsedPromptFile = await this.promptsService.parseNew(command.uri, token).catch(e => {
+ 				if (isCancellationError(e)) {
+ 					throw e;
+diff --git a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts
+index 95f001a53a5e8..9c5360a298bce 100644
+--- a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts
++++ b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsService.ts
+@@ -394,13 +394,7 @@ export interface IChatPromptSlashCommand {
+ export interface IResolvedChatPromptSlashCommand extends IChatPromptSlashCommand {
+ 	/**
+ 	 * The parsed prompt file, when the command is backed by readable content.
+-	 *
+-	 * Undefined for a command whose {@link IChatPromptSlashCommand.uri} is a
+-	 * discovery-only identity rather than a file — built-in skills are published
+-	 * on the `agent-builtin` scheme purely to carry a name and description — and
+-	 * for a file-backed command that has since been deleted or become
+-	 * unreadable. The command still resolves in both cases; only its body is
+-	 * unavailable.
++	 * Undefined for a discovery-only command, or one whose file has gone away.
+ 	 */
+ 	readonly parsedPromptFile?: ParsedPromptFile;
+ }
+diff --git a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
+index 49a06f6fca5ce..04d4b2f8f5fec 100644
+--- a/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
++++ b/src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts
+@@ -652,12 +652,7 @@ export class PromptsService extends Disposable implements IPromptsService {
+ 		const commands = await this.getPromptSlashCommands(token);
+ 		const command = commands.find(cmd => cmd.name === name && matchesSessionType(cmd.sessionTypes, sessionType));
+ 		if (command) {
+-			// Best-effort, for the same reason as the harness resolver: a command
+-			// can be discovery-only or its file can have gone away, and neither
+-			// should make resolving the command itself fail. Cancellation is not a
+-			// content problem and still propagates, and any other failure is traced
+-			// so a real parse regression stays distinguishable from a command that
+-			// legitimately has nothing to read.
++			// Best-effort for the same reason as the harness resolver; cancellation still propagates.
+ 			const parsedPromptFile = await this.parseNew(command.uri, token).catch(e => {
+ 				if (isCancellationError(e)) {
+ 					throw e;
+diff --git a/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts b/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
+index a8a4f0653d0c3..1c259ca7a6a92 100644
+--- a/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/promptSyntax/service/promptsService.test.ts
+@@ -3924,11 +3924,7 @@ suite('PromptsService', () => {
+ 		});
+ 
+ 		test('resolves a command whose content cannot be read, with no parsed file', async () => {
+-			// A built-in skill is published as a discovery-only identity: it
+-			// carries a name and description and there is nothing to read behind
+-			// its URI. Resolution must still succeed — rejecting here rejects the
+-			// whole input-decoration update, and the user can no longer send any
+-			// message containing that slash command.
++			// A built-in skill is discovery-only, and rejecting here would block sending the message.
+ 			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, false);
+ 
+ 			const promptUri = URI.parse('file://extensions/my-extension/discovery-only.prompt.md');
+@@ -3948,8 +3944,7 @@ suite('PromptsService', () => {
+ 		});
+ 
+ 		test('a parse failure is traced rather than vanishing', async () => {
+-			// Swallowing the failure must not make a real parse regression
+-			// indistinguishable from a command that has nothing to read.
++			// A real parse regression must stay distinguishable from a command with nothing to read.
+ 			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, false);
+ 
+ 			const promptUri = URI.parse('file://extensions/my-extension/broken.prompt.md');
+@@ -3973,8 +3968,7 @@ suite('PromptsService', () => {
+ 		});
+ 
+ 		test('cancellation still rejects rather than resolving without a prompt file', async () => {
+-			// An aborted resolve must not look like a command with no content, or
+-			// callers relying on cancellation to short-circuit would carry on.
++			// An aborted resolve must not look like a command with no content.
+ 			testConfigService.setUserConfiguration(PromptsConfig.USE_AGENT_SKILLS, false);
+ 
+ 			const promptUri = URI.parse('file://extensions/my-extension/cancelled-resolve.prompt.md');

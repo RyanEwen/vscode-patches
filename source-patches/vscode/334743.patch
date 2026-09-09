@@ -1,0 +1,636 @@
+From 8f3a91b4598d6f8f9e06d6572add12d2493308aa Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Sat, 5 Sep 2026 21:37:26 -0400
+Subject: [PATCH] Keep every pending steering message instead of only the last
+
+`ChatState` models the two pending-message kinds inconsistently:
+`steeringMessage` is a single slot while `queuedMessages` is a list. The
+`chat/pendingMessageSet` reducer reflects that, overwriting any existing
+steering message with no id check, three lines above a queued branch that
+correctly finds by id and appends.
+
+Sending a second steering message therefore evicts the first from state. The
+message itself is not lost, because the agent was already handed it, so it
+still lands in the transcript when the model consumes it. What is lost is its
+pending bubble, which disappears from the sidebar the moment the next steering
+message is sent and reappears later when the turn picks it up. Nothing in the
+UI required this: the pending-request projection already builds a list carrying
+a kind per entry, and it pushed at most one steering entry only because the
+state could hold at most one.
+
+Make `steeringMessages` a list and mirror the queued branch in the three
+reducer sites, the state aggregation, the pending-request reconciliation and
+the projection. The provider hook becomes
+`setPendingMessages(chat, steeringMessages, queuedMessages)`, and Claude,
+Copilot and Codex each loop rather than handling a single optional message.
+---
+ src/vs/platform/agentHost/common/agent.ts     |  2 +-
+ .../state/protocol/channels-chat/reducer.ts   | 22 ++++++--
+ .../state/protocol/channels-chat/state.ts     |  4 +-
+ .../agentHost/common/state/sessionState.ts    |  6 +--
+ .../queueDrain/queueDrainContribution.ts      |  4 +-
+ .../agentHost/node/claude/claudeAgent.ts      |  6 +--
+ .../agentHost/node/codex/codexAgent.ts        | 14 ++---
+ .../agentHost/node/copilot/copilotAgent.ts    |  4 +-
+ .../node/shared/sessionServerTools.ts         |  2 +-
+ .../test/node/agentSideEffects.test.ts        | 39 ++++++++++++--
+ .../test/node/chatContributions.test.ts       |  2 +-
+ .../agentHost/test/node/claudeAgent.test.ts   | 14 ++---
+ .../codexAgentHostLive.integrationTest.ts     |  2 +-
+ .../test/node/e2e/suites/serverToolsSuite.ts  |  4 +-
+ .../platform/agentHost/test/node/mockAgent.ts | 10 ++--
+ .../sessionFeatures.integrationTest.ts        |  2 +-
+ .../test/node/sessionServerTools.test.ts      |  2 +-
+ .../agentHost/agentHostSessionHandler.ts      | 52 +++++++++++--------
+ .../agentHostChatContribution.test.ts         |  4 +-
+ 19 files changed, 125 insertions(+), 70 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agent.ts b/src/vs/platform/agentHost/common/agent.ts
+index 24960067cc5a7..b88294e885a03 100644
+--- a/src/vs/platform/agentHost/common/agent.ts
++++ b/src/vs/platform/agentHost/common/agent.ts
+@@ -1156,7 +1156,7 @@ export interface IAgent {
+ 	materializeChat(chat: URI, context: URI | IAgentChatContext, providerData: string | undefined): Promise<IAgentCreateChatResult | void>;
+ 
+ 	/** Optional steering hook for providers that can accept messages during an active turn. */
+-	setPendingMessages?(chat: URI, steeringMessage: PendingMessage | undefined, queuedMessages: readonly PendingMessage[]): void;
++	setPendingMessages?(chat: URI, steeringMessages: readonly PendingMessage[], queuedMessages: readonly PendingMessage[]): void;
+ 
+ 	/** Optional history mutation for providers with a native truncation operation. */
+ 	truncateChat?(chat: URI, turnId: string | undefined, context?: URI | IAgentChatContext): Promise<void>;
+diff --git a/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts b/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts
+index 5cf707cfc1f3c..93392f15d696f 100644
+--- a/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts
++++ b/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts
+@@ -355,8 +355,9 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+ 
+ 			// If this turn was auto-started from a pending message, remove it
+ 			if (action.queuedMessageId) {
+-				if (next.steeringMessage?.id === action.queuedMessageId) {
+-					next = { ...next, steeringMessage: undefined };
++				if (next.steeringMessages) {
++					const filtered = next.steeringMessages.filter(m => m.id !== action.queuedMessageId);
++					next = { ...next, steeringMessages: filtered.length > 0 ? filtered : undefined };
+ 				}
+ 				if (next.queuedMessages) {
+ 					const filtered = next.queuedMessages.filter(m => m.id !== action.queuedMessageId);
+@@ -840,7 +841,14 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+ 		case ActionType.ChatPendingMessageSet: {
+ 			const entry: PendingMessage = { id: action.id, message: action.message };
+ 			if (action.kind === PendingMessageKind.Steering) {
+-				return { ...state, steeringMessage: entry };
++				const existing = state.steeringMessages ?? [];
++				const idx = existing.findIndex(m => m.id === action.id);
++				if (idx >= 0) {
++					const updated = [...existing];
++					updated[idx] = entry;
++					return { ...state, steeringMessages: updated };
++				}
++				return { ...state, steeringMessages: [...existing, entry] };
+ 			}
+ 			const existing = state.queuedMessages ?? [];
+ 			const idx = existing.findIndex(m => m.id === action.id);
+@@ -854,10 +862,14 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+ 
+ 		case ActionType.ChatPendingMessageRemoved: {
+ 			if (action.kind === PendingMessageKind.Steering) {
+-				if (!state.steeringMessage || state.steeringMessage.id !== action.id) {
++				const existing = state.steeringMessages;
++				if (!existing) {
+ 					return state;
+ 				}
+-				return { ...state, steeringMessage: undefined };
++				const filtered = existing.filter(m => m.id !== action.id);
++				return filtered.length === existing.length
++					? state
++					: { ...state, steeringMessages: filtered.length > 0 ? filtered : undefined };
+ 			}
+ 			const existing = state.queuedMessages;
+ 			if (!existing) {
+diff --git a/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts b/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts
+index dbae61c6f3899..2dee5f73c5991 100644
+--- a/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts
++++ b/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts
+@@ -78,8 +78,8 @@ export interface ChatState {
+ 	turnsNextCursor?: string;
+ 	/** Currently in-progress turn */
+ 	activeTurn?: ActiveTurn;
+-	/** Message to inject into the current turn at a convenient point */
+-	steeringMessage?: PendingMessage;
++	/** Messages to inject into the current turn at a convenient point, in send order */
++	steeringMessages?: PendingMessage[];
+ 	/** Messages to send automatically as new turns after the current turn finishes */
+ 	queuedMessages?: PendingMessage[];
+ 	/**
+diff --git a/src/vs/platform/agentHost/common/state/sessionState.ts b/src/vs/platform/agentHost/common/state/sessionState.ts
+index a9c78879815c2..036b45dd9d058 100644
+--- a/src/vs/platform/agentHost/common/state/sessionState.ts
++++ b/src/vs/platform/agentHost/common/state/sessionState.ts
+@@ -1320,8 +1320,8 @@ export interface ISessionWithDefaultChat extends SessionState {
+ 	turns: Turn[];
+ 	/** Currently in-progress turn of this chat. */
+ 	activeTurn?: ActiveTurn;
+-	/** Steering message pending on this chat. */
+-	steeringMessage?: PendingMessage;
++	/** Steering messages pending on this chat. */
++	steeringMessages?: PendingMessage[];
+ 	/** Queued messages pending on this chat. */
+ 	queuedMessages?: PendingMessage[];
+ 	/** Draft input of this chat. */
+@@ -1342,7 +1342,7 @@ export function mergeSessionWithDefaultChat(session: SessionState, chat: ChatSta
+ 		workingDirectories: chat?.workingDirectories ?? session.workingDirectories,
+ 		turns: chat?.turns ?? [],
+ 		activeTurn: chat?.activeTurn,
+-		steeringMessage: chat?.steeringMessage,
++		steeringMessages: chat?.steeringMessages,
+ 		queuedMessages: chat?.queuedMessages,
+ 		draft: chat?.draft,
+ 	};
+diff --git a/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts b/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts
+index 769cc4bec90ee..b600459d7cd45 100644
+--- a/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts
++++ b/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts
+@@ -86,7 +86,7 @@ export class QueueDrainContribution extends Disposable implements IAgentHostChat
+ 			return;
+ 		}
+ 		const session = parseRequiredSessionUriFromChatUri(channel);
+-		this._providerService.getProviderForSession(session)?.setPendingMessages?.(URI.parse(channel), state.steeringMessage, []);
++		this._providerService.getProviderForSession(session)?.setPendingMessages?.(URI.parse(channel), state.steeringMessages ?? [], []);
+ 		this._tryConsumeNextQueuedMessage(channel);
+ 	}
+ 
+@@ -98,7 +98,7 @@ export class QueueDrainContribution extends Disposable implements IAgentHostChat
+ 			return;
+ 		}
+ 		const state = this._stateManager.getSessionState(channel);
+-		if (!state?.queuedMessages?.length || state.steeringMessage) {
++		if (!state?.queuedMessages?.length || state.steeringMessages?.length) {
+ 			return;
+ 		}
+ 		const latestTurn = state.turns.at(-1);
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index f1949bd1b03b0..2169dda2f2fbf 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -2381,7 +2381,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		sess.abort();
+ 	}
+ 
+-	setPendingMessages(chat: URI, steeringMessage: PendingMessage | undefined, _queuedMessages: readonly PendingMessage[]): void {
++	setPendingMessages(chat: URI, steeringMessages: readonly PendingMessage[], _queuedMessages: readonly PendingMessage[]): void {
+ 		// Queued messages are intentionally a no-op. CONTEXT.md M10 +
+ 		// AgentSideEffects confirm queued messages are consumed server-side;
+ 		// the agent boundary always receives an empty queue.
+@@ -2389,12 +2389,12 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		// Control-plane operations carry no host context, and need none: the
+ 		// exact chat backing is the only state they touch.
+ 		const target = this._findChatByUri(chat);
+-		this._logService.info(`[Claude] setPendingMessages for ${chat.toString()}: steering=${steeringMessage?.id ?? 'none'} queued=${_queuedMessages.length}`);
++		this._logService.info(`[Claude] setPendingMessages for ${chat.toString()}: steering=${steeringMessages.length} queued=${_queuedMessages.length}`);
+ 		if (!target) {
+ 			this._logService.warn(`[Claude] setPendingMessages: target not found for ${chat.toString()}`);
+ 			return;
+ 		}
+-		if (steeringMessage) {
++		for (const steeringMessage of steeringMessages) {
+ 			target.injectSteering(steeringMessage);
+ 		}
+ 	}
+diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+index a8e35fab4dde2..72e874ac2b39d 100644
+--- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
++++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+@@ -5726,13 +5726,15 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		}
+ 	}
+ 
+-	setPendingMessages(chat: URI, steeringMessage: PendingMessage | undefined, _queuedMessages: readonly PendingMessage[]): void {
+-		// Queued messages are consumed server-side (AgentSideEffects drives a
+-		// fresh turn per `idle`); only the single steering message reaches the
+-		// agent for mid-turn injection.
+-		if (!steeringMessage) {
+-			return;
++	setPendingMessages(chat: URI, steeringMessages: readonly PendingMessage[], _queuedMessages: readonly PendingMessage[]): void {
++		// Queued messages are consumed server-side; only steering reaches the agent.
++		for (const steeringMessage of steeringMessages) {
++			this._sendSteering(chat, steeringMessage);
+ 		}
++	}
++
++	/** Injects one steering message into the chat's active codex turn. */
++	private _sendSteering(chat: URI, steeringMessage: PendingMessage): void {
+ 		// Steering is always addressed by a concrete chat channel URI, which
+ 		// resolves through the binding recorded when that chat was provisioned
+ 		// or restored — never through URI shape.
+diff --git a/src/vs/platform/agentHost/node/copilot/copilotAgent.ts b/src/vs/platform/agentHost/node/copilot/copilotAgent.ts
+index 0f8144b6b3bf5..e7d8d3f59c3bf 100644
+--- a/src/vs/platform/agentHost/node/copilot/copilotAgent.ts
++++ b/src/vs/platform/agentHost/node/copilot/copilotAgent.ts
+@@ -4276,7 +4276,7 @@ export class CopilotAgent extends Disposable implements IAgent {
+ 		};
+ 	}
+ 
+-	setPendingMessages(chat: URI, steeringMessage: PendingMessage | undefined, _queuedMessages: readonly PendingMessage[]): void {
++	setPendingMessages(chat: URI, steeringMessages: readonly PendingMessage[], _queuedMessages: readonly PendingMessage[]): void {
+ 		const backing = this._chatBackings.get(chat.toString());
+ 		const target = backing ? this._findSessionBySdkId(backing.sdkSessionId) : undefined;
+ 		if (!target) {
+@@ -4285,7 +4285,7 @@ export class CopilotAgent extends Disposable implements IAgent {
+ 		}
+ 
+ 		// Steering: send with mode 'immediate' so the SDK injects it mid-turn
+-		if (steeringMessage) {
++		for (const steeringMessage of steeringMessages) {
+ 			target.sendSteering(steeringMessage);
+ 		}
+ 
+diff --git a/src/vs/platform/agentHost/node/shared/sessionServerTools.ts b/src/vs/platform/agentHost/node/shared/sessionServerTools.ts
+index dad63d53cdf6d..8a641b0f1dc14 100644
+--- a/src/vs/platform/agentHost/node/shared/sessionServerTools.ts
++++ b/src/vs/platform/agentHost/node/shared/sessionServerTools.ts
+@@ -1135,7 +1135,7 @@ export async function applySendMessageTool(accessor: ISessionServerToolAccessor,
+ 		...(sourceTurnId !== undefined ? { sourceTurnId } : {}),
+ 	} : undefined;
+ 	const targetState = stateManager?.getChatState(chat.toString());
+-	if (stateManager && (targetState?.activeTurn || targetState?.steeringMessage || targetState?.queuedMessages?.length)) {
++	if (stateManager && (targetState?.activeTurn || targetState?.steeringMessages?.length || targetState?.queuedMessages?.length)) {
+ 		const queuedMessage: Message = {
+ 			text: message,
+ 			origin: { kind: MessageKind.Agent },
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index c63233f6b41e1..2ce7b04907110 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -3447,12 +3447,43 @@ suite('AgentSideEffects', () => {
+ 			sideEffects.handleAction(defaultChatUri, action);
+ 
+ 			assert.strictEqual(agent.setPendingMessagesCalls.length, 1);
+-			assert.deepStrictEqual(agent.setPendingMessagesCalls[0].steeringMessage, { id: 'steer-1', message: { text: 'focus on tests', origin: { kind: MessageKind.User } } });
++			assert.deepStrictEqual(agent.setPendingMessagesCalls[0].steeringMessages, [{ id: 'steer-1', message: { text: 'focus on tests', origin: { kind: MessageKind.User } } }]);
+ 			assert.deepStrictEqual(agent.setPendingMessagesCalls[0].queuedMessages, []);
+ 			// Steering is always addressed by a concrete chat channel URI.
+ 			assert.strictEqual(agent.setPendingMessagesCalls[0].chat.toString(), defaultChatUri);
+ 		});
+ 
++		test('keeps an earlier steering message when a second one is sent', () => {
++			setupSession();
++
++			const first = {
++				type: ActionType.ChatPendingMessageSet as const,
++				kind: PendingMessageKind.Steering,
++				id: 'steer-1',
++				message: { text: 'focus on tests', origin: { kind: MessageKind.User } },
++			};
++			const second = {
++				type: ActionType.ChatPendingMessageSet as const,
++				kind: PendingMessageKind.Steering,
++				id: 'steer-2',
++				message: { text: 'and check the docs', origin: { kind: MessageKind.User } },
++			};
++			[first, second].forEach((action, i) => {
++				stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: i + 1 });
++				sideEffects.handleAction(defaultChatUri, action);
++			});
++
++			// The second used to overwrite the first, hiding its bubble until consumed.
++			assert.deepStrictEqual(
++				stateManager.getChatState(defaultChatUri)?.steeringMessages?.map(m => m.id),
++				['steer-1', 'steer-2'],
++			);
++			assert.deepStrictEqual(
++				agent.setPendingMessagesCalls.at(-1)?.steeringMessages.map(m => m.id),
++				['steer-1', 'steer-2'],
++			);
++		});
++
+ 		test('syncs a peer chat steering message addressed by the peer chat URI', () => {
+ 			setupSession();
+ 			const peerChatUri = URI.parse(buildChatUri(sessionUri.toString(), 'peer-steer'));
+@@ -3470,7 +3501,7 @@ suite('AgentSideEffects', () => {
+ 			assert.strictEqual(agent.setPendingMessagesCalls.length, 1);
+ 			assert.deepStrictEqual({
+ 				chat: agent.setPendingMessagesCalls[0].chat.toString(),
+-				steeringId: agent.setPendingMessagesCalls[0].steeringMessage?.id,
++				steeringId: agent.setPendingMessagesCalls[0].steeringMessages[0]?.id,
+ 			}, {
+ 				chat: peerChatUri.toString(),
+ 				steeringId: 'steer-peer',
+@@ -3491,7 +3522,7 @@ suite('AgentSideEffects', () => {
+ 
+ 			// Queued messages are not forwarded to the agent; the server controls consumption
+ 			assert.strictEqual(agent.setPendingMessagesCalls.length, 1);
+-			assert.strictEqual(agent.setPendingMessagesCalls[0].steeringMessage, undefined);
++			assert.deepStrictEqual(agent.setPendingMessagesCalls[0].steeringMessages, []);
+ 			assert.deepStrictEqual(agent.setPendingMessagesCalls[0].queuedMessages, []);
+ 
+ 			// Session was idle, so the queued message is consumed immediately
+@@ -3957,7 +3988,7 @@ suite('AgentSideEffects', () => {
+ 
+ 			// Steering message should be removed from state
+ 			const state = stateManager.getSessionState(sessionUri.toString());
+-			assert.strictEqual(state?.steeringMessage, undefined);
++			assert.strictEqual(state?.steeringMessages, undefined);
+ 		});
+ 	});
+ 
+diff --git a/src/vs/platform/agentHost/test/node/chatContributions.test.ts b/src/vs/platform/agentHost/test/node/chatContributions.test.ts
+index 71ae61375b300..ca58b02a29e97 100644
+--- a/src/vs/platform/agentHost/test/node/chatContributions.test.ts
++++ b/src/vs/platform/agentHost/test/node/chatContributions.test.ts
+@@ -895,7 +895,7 @@ function createQueueDrainContributions(disposables: ReturnType<typeof ensureNoDi
+ 	const mockAgent = new MockAgent();
+ 	let agent: MockAgent | undefined = mockAgent;
+ 	const pendingMessages: (PendingMessage | undefined)[] = [];
+-	mockAgent.setPendingMessages = (_chat, steeringMessage) => pendingMessages.push(steeringMessage);
++	mockAgent.setPendingMessages = (_chat, steeringMessages) => pendingMessages.push(steeringMessages[0]);
+ 	services.set(IAgentHostProviderService, createTestAgentHostProviderService(() => agent));
+ 	services.set(IAgentHostLocalTurns, new AgentHostLocalTurns(sessionDataService, logService));
+ 	const instantiationService = disposables.add(new InstantiationService(services, /*strict*/ true));
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index fde567e90763e..ad4da0df7276b 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7953,7 +7953,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
+ 		await tick();
+ 
+-		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-1', message: { text: 'switch topic', origin: { kind: MessageKind.User } } }, []);
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), [{ id: 'pending-1', message: { text: 'switch topic', origin: { kind: MessageKind.User } } }], []);
+ 		await tick();
+ 		await tick();
+ 
+@@ -7973,7 +7973,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 	test('setPendingMessages with empty steering and non-empty queued is a no-op', async () => {
+ 		const { ctx, sessionUri, query, advance } = await materialize();
+ 		const before = query.drainedPrompts.length;
+-		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), undefined, [{ id: 'q1', message: { text: 'queued', origin: { kind: MessageKind.User } } }]);
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), [], [{ id: 'q1', message: { text: 'queued', origin: { kind: MessageKind.User } } }]);
+ 		await tick();
+ 		assert.strictEqual(query.drainedPrompts.length, before);
+ 		advance.complete();
+@@ -7989,7 +7989,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
+ 		await tick();
+ 
+-		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-9', message: { text: 'steer', origin: { kind: MessageKind.User } } }, []);
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), [{ id: 'pending-9', message: { text: 'steer', origin: { kind: MessageKind.User } } }], []);
+ 		// Microtask cycles let the FakeQuery's background drain pull the
+ 		// steering entry off `_toYield`; that drain is when our session
+ 		// fires `steering_consumed` (SDK ack semantics — mirrors Copilot's
+@@ -8157,7 +8157,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
+ 
+ 		// Inject steering and capture its uuid via the iterable's drain.
+-		ctx.agent.setPendingMessages!(defaultChatUri(created.session), { id: 'pending-steer', message: { text: 'moo', origin: { kind: MessageKind.User } } }, []);
++		ctx.agent.setPendingMessages!(defaultChatUri(created.session), [{ id: 'pending-steer', message: { text: 'moo', origin: { kind: MessageKind.User } } }], []);
+ 		await tick();
+ 		await tick();
+ 		const query = ctx.sdk.warmQueries[0].produced!;
+@@ -8222,7 +8222,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 
+ 		// Inject steering so the queue holds [original, steering] when
+ 		// result#1 lands.
+-		ctx.agent.setPendingMessages!(defaultChatUri(created.session), { id: 'pending-c1', message: { text: 'steer', origin: { kind: MessageKind.User } } }, []);
++		ctx.agent.setPendingMessages!(defaultChatUri(created.session), [{ id: 'pending-c1', message: { text: 'steer', origin: { kind: MessageKind.User } } }], []);
+ 		await tick();
+ 		await tick();
+ 
+@@ -10337,12 +10337,12 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 
+ 		// Known materialized additional chat: resolved via the `chat` arg, no warning.
+ 		logService.warns.length = 0;
+-		agent.setPendingMessages!(chatUri, { id: 'p1', message: { text: 'steer', origin: { kind: MessageKind.User } } }, []);
++		agent.setPendingMessages!(chatUri, [{ id: 'p1', message: { text: 'steer', origin: { kind: MessageKind.User } } }], []);
+ 		const warnAfterKnown = logService.warns.filter(w => w.includes('setPendingMessages'));
+ 
+ 		// Unknown additional chat URI: not found, warns.
+ 		const unknownChat = URI.parse(buildChatUri(created.session.toString(), 'chat-missing'));
+-		agent.setPendingMessages!(unknownChat, undefined, []);
++		agent.setPendingMessages!(unknownChat, [], []);
+ 		const warnAfterUnknown = logService.warns.filter(w => w.includes('setPendingMessages'));
+ 
+ 		assert.deepStrictEqual({ knownWarns: warnAfterKnown.length, unknownWarns: warnAfterUnknown.length }, { knownWarns: 0, unknownWarns: 1 });
+diff --git a/src/vs/platform/agentHost/test/node/e2e/providers/codexAgentHostLive.integrationTest.ts b/src/vs/platform/agentHost/test/node/e2e/providers/codexAgentHostLive.integrationTest.ts
+index 88543e565f2d5..ebd70ab3cbac6 100644
+--- a/src/vs/platform/agentHost/test/node/e2e/providers/codexAgentHostLive.integrationTest.ts
++++ b/src/vs/platform/agentHost/test/node/e2e/providers/codexAgentHostLive.integrationTest.ts
+@@ -193,7 +193,7 @@ const REAL_CODEX_ENABLED = process.env['AGENT_HOST_REAL_CODEX'] === '1';
+ 
+ 		// Regardless of path, the steering bubble must not be stuck in state.
+ 		const snapshot = await chatState(chat);
+-		assert.strictEqual(snapshot.steeringMessage, undefined);
++		assert.strictEqual(snapshot.steeringMessages, undefined);
+ 	});
+ 
+ 	test('client tool is registered and invoked end-to-end', async function () {
+diff --git a/src/vs/platform/agentHost/test/node/e2e/suites/serverToolsSuite.ts b/src/vs/platform/agentHost/test/node/e2e/suites/serverToolsSuite.ts
+index 9fd2eaaf647d1..f0f9e980d97d6 100644
+--- a/src/vs/platform/agentHost/test/node/e2e/suites/serverToolsSuite.ts
++++ b/src/vs/platform/agentHost/test/node/e2e/suites/serverToolsSuite.ts
+@@ -1089,12 +1089,12 @@ export function defineServerToolsTests(context: IAgentHostE2ETestContext): void
+ 			messages: state.turns.map(turn => turn.message.text),
+ 			activeTurn: state.activeTurn,
+ 			queuedMessages: state.queuedMessages,
+-			steeringMessage: state.steeringMessage,
++			steeringMessages: state.steeringMessages,
+ 		}, {
+ 			messages: [`Call send_message exactly once with session "${session.sessionUri}" and message "loop", then reply exactly "refused".`],
+ 			activeTurn: undefined,
+ 			queuedMessages: undefined,
+-			steeringMessage: undefined,
++			steeringMessages: undefined,
+ 		});
+ 	}, supportsSelfSendRejection);
+ 
+diff --git a/src/vs/platform/agentHost/test/node/mockAgent.ts b/src/vs/platform/agentHost/test/node/mockAgent.ts
+index fe321991e33c8..1518a16d158cc 100644
+--- a/src/vs/platform/agentHost/test/node/mockAgent.ts
++++ b/src/vs/platform/agentHost/test/node/mockAgent.ts
+@@ -78,7 +78,7 @@ export class MockAgent implements IAgent {
+ 
+ 
+ 	readonly sendMessageCalls: IMockSendMessageCall[] = [];
+-	readonly setPendingMessagesCalls: { chat: URI; steeringMessage: PendingMessage | undefined; queuedMessages: readonly PendingMessage[] }[] = [];
++	readonly setPendingMessagesCalls: { chat: URI; steeringMessages: readonly PendingMessage[]; queuedMessages: readonly PendingMessage[] }[] = [];
+ 	readonly disposeSessionCalls: URI[] = [];
+ 	readonly releaseSessionCalls: URI[] = [];
+ 	readonly abortSessionCalls: URI[] = [];
+@@ -250,8 +250,8 @@ export class MockAgent implements IAgent {
+ 		}
+ 	}
+ 
+-	setPendingMessages(chat: URI, steeringMessage: PendingMessage | undefined, queuedMessages: readonly PendingMessage[]): void {
+-		this.setPendingMessagesCalls.push({ chat, steeringMessage, queuedMessages });
++	setPendingMessages(chat: URI, steeringMessages: readonly PendingMessage[], queuedMessages: readonly PendingMessage[]): void {
++		this.setPendingMessagesCalls.push({ chat, steeringMessages, queuedMessages });
+ 	}
+ 
+ 	async getSessionMessages(session: URI): Promise<readonly Turn[]> {
+@@ -1012,9 +1012,9 @@ export class ScriptedMockAgent implements IAgent {
+ 		}
+ 	}
+ 
+-	setPendingMessages(chat: URI, steeringMessage: PendingMessage | undefined, _queuedMessages: readonly PendingMessage[]): void {
++	setPendingMessages(chat: URI, steeringMessages: readonly PendingMessage[], _queuedMessages: readonly PendingMessage[]): void {
+ 		// When steering is set, consume it on the next tick
+-		if (steeringMessage) {
++		for (const steeringMessage of steeringMessages) {
+ 			timeout(20).then(() => {
+ 				this._onDidChatProgress.fire({ kind: 'steering_consumed', chat: isAhpChatChannel(chat.toString()) ? chat : URI.parse(buildDefaultChatUri(chat)), id: steeringMessage.id });
+ 			});
+diff --git a/src/vs/platform/agentHost/test/node/protocol/sessionFeatures.integrationTest.ts b/src/vs/platform/agentHost/test/node/protocol/sessionFeatures.integrationTest.ts
+index 6effc6997a044..c32505e44d953 100644
+--- a/src/vs/platform/agentHost/test/node/protocol/sessionFeatures.integrationTest.ts
++++ b/src/vs/platform/agentHost/test/node/protocol/sessionFeatures.integrationTest.ts
+@@ -342,7 +342,7 @@ suite('Protocol WebSocket — Session Features', function () {
+ 
+ 		// Steering should be cleared from state
+ 		const state = await fetchSessionWithChat(client, sessionUri);
+-		assert.ok(!state.steeringMessage, 'steering message should be cleared after consumption');
++		assert.ok(!state.steeringMessages?.length, 'steering message should be cleared after consumption');
+ 	});
+ 
+ 	// ---- Truncation -----------------------------------------------------------
+diff --git a/src/vs/platform/agentHost/test/node/sessionServerTools.test.ts b/src/vs/platform/agentHost/test/node/sessionServerTools.test.ts
+index 327df814b4126..4f62b42b80d89 100644
+--- a/src/vs/platform/agentHost/test/node/sessionServerTools.test.ts
++++ b/src/vs/platform/agentHost/test/node/sessionServerTools.test.ts
+@@ -1683,7 +1683,7 @@ suite('SessionServerTools', () => {
+ 			results: [queuedResult, steeringResult],
+ 			queuedMessages: stateManager.getChatState(queuedChat)?.queuedMessages?.map(message => message.message.text),
+ 			steeringQueuedMessages: stateManager.getChatState(steeringChat)?.queuedMessages?.map(message => message.message.text),
+-			steeringMessage: stateManager.getChatState(steeringChat)?.steeringMessage?.message.text,
++			steeringMessage: stateManager.getChatState(steeringChat)?.steeringMessages?.[0]?.message.text,
+ 			prompts,
+ 		}, {
+ 			results: [
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 9e0dab7f65044..0855dd2b90c86 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -2072,12 +2072,12 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		const chatURI = this._getChatURI(sessionResource);
+ 		const pending = chatModel.getPendingRequests();
+ 		const protocolState = this._getSessionState(session, chatURI);
+-		const prevSteering = protocolState?.steeringMessage;
++		const prevSteering = protocolState?.steeringMessages ?? [];
+ 		const prevQueued = protocolState?.queuedMessages ?? [];
+ 
+ 		// Compute current state from chat model
+ 		interface IPendingSnapshot { id: string; message: Message }
+-		let currentSteering: IPendingSnapshot | undefined;
++		const currentSteering: IPendingSnapshot[] = [];
+ 		const currentQueued: IPendingSnapshot[] = [];
+ 		for (const p of pending) {
+ 			const variables = p.request.variableData?.variables ?? [];
+@@ -2085,28 +2085,36 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 			const attachments = messageAttachments.length > 0 ? messageAttachments : undefined;
+ 			const snapshot: IPendingSnapshot = { id: p.request.id, message: userOriginMessage(p.request.message.text, attachments) };
+ 			if (p.kind === ChatRequestQueueKind.Steering) {
+-				currentSteering = snapshot;
++				currentSteering.push(snapshot);
+ 			} else {
+ 				currentQueued.push(snapshot);
+ 			}
+ 		}
+ 
+-		// --- Steering ---
+-		if (currentSteering) {
+-			if (currentSteering.id !== prevSteering?.id || !equals(currentSteering.message, prevSteering.message)) {
++		// --- Steering: removals ---
++		const currentSteeringIds = new Set(currentSteering.map(s => s.id));
++		for (const prev of prevSteering) {
++			if (!currentSteeringIds.has(prev.id)) {
++				this._dispatchAction(backendSession, {
++					type: ActionType.ChatPendingMessageRemoved,
++					kind: PendingMessageKind.Steering,
++					id: prev.id,
++				}, chatURI);
++			}
++		}
++
++		// --- Steering: additions ---
++		const prevSteeringById = new Map(prevSteering.map(s => [s.id, s]));
++		for (const s of currentSteering) {
++			const prev = prevSteeringById.get(s.id);
++			if (!prev || !equals(s.message, prev.message)) {
+ 				this._dispatchAction(backendSession, {
+ 					type: ActionType.ChatPendingMessageSet,
+ 					kind: PendingMessageKind.Steering,
+-					id: currentSteering.id,
+-					message: currentSteering.message,
++					id: s.id,
++					message: s.message,
+ 				}, chatURI);
+ 			}
+-		} else if (prevSteering) {
+-			this._dispatchAction(backendSession, {
+-				type: ActionType.ChatPendingMessageRemoved,
+-				kind: PendingMessageKind.Steering,
+-				id: prevSteering.id,
+-			}, chatURI);
+ 		}
+ 
+ 		// --- Queued: removals ---
+@@ -2176,8 +2184,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		});
+ 
+ 		const remote: IRemotePendingRequest[] = [];
+-		if (state.steeringMessage) {
+-			remote.push(toRemote(state.steeringMessage, ChatRequestQueueKind.Steering));
++		for (const steering of state.steeringMessages ?? []) {
++			remote.push(toRemote(steering, ChatRequestQueueKind.Steering));
+ 		}
+ 		for (const queued of state.queuedMessages ?? []) {
+ 			remote.push(toRemote(queued, ChatRequestQueueKind.Queued));
+@@ -2345,7 +2353,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		const currentState = this._getSessionState(sessionStr, chatURI);
+ 		let lastSeenTurnId: string | undefined = currentState?.activeTurn?.id;
+ 		let previousQueuedIds: Set<string> | undefined;
+-		let previousSteeringId: string | undefined = currentState?.steeringMessage?.id;
++		let previousSteeringIds = new Set((currentState?.steeringMessages ?? []).map(m => m.id));
+ 		let previousTitle: string | undefined = currentState ? getChatTitle(currentState, chatURI) : undefined;
+ 		let previousTurnIds = new Set(currentState?.turns.map(turn => turn.id) ?? []);
+ 
+@@ -2368,13 +2376,15 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 
+ 			// Track queued message IDs so we can detect which one was consumed
+ 			const currentQueuedIds = new Set((e.state.queuedMessages ?? []).map(m => m.id));
+-			const currentSteeringId = e.state.steeringMessage?.id;
++			const currentSteeringIds = new Set((e.state.steeringMessages ?? []).map(m => m.id));
+ 
+ 			// Detect steering message removal or replacement regardless of turn changes
+-			if (previousSteeringId && previousSteeringId !== currentSteeringId) {
+-				this._chatService.removePendingRequest(sessionResource, previousSteeringId);
++			for (const prevId of previousSteeringIds) {
++				if (!currentSteeringIds.has(prevId)) {
++					this._chatService.removePendingRequest(sessionResource, prevId);
++				}
+ 			}
+-			previousSteeringId = currentSteeringId;
++			previousSteeringIds = currentSteeringIds;
+ 
+ 			const currentTitle = getChatTitle(e.state, chatURI);
+ 			if (currentTitle && currentTitle !== previousTitle) {
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+index ba552893d7236..e708153ab1e34 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+@@ -151,7 +151,7 @@ function normalizeTestAction(action: SessionAction | ChatAction | TerminalAction
+  * these on the session for convenience; the mock connection splits them onto
+  * the default-chat subscription when serving {@link StateComponents.Chat}.
+  */
+-type SeededSessionState = SessionState & Partial<Pick<ISessionWithDefaultChat, 'turns' | 'activeTurn' | 'steeringMessage' | 'queuedMessages' | 'draft'>>;
++type SeededSessionState = SessionState & Partial<Pick<ISessionWithDefaultChat, 'turns' | 'activeTurn' | 'steeringMessages' | 'queuedMessages' | 'draft'>>;
+ 
+ class MockAgentHostService extends mock<IAgentHostService>() {
+ 	declare readonly _serviceBrand: undefined;
+@@ -559,7 +559,7 @@ class MockAgentHostService extends mock<IAgentHostService>() {
+ 			interactivity: this._chatInteractivities.get(chatUriStr),
+ 			turns: seeded?.turns ?? [],
+ 			activeTurn: seeded?.activeTurn,
+-			steeringMessage: seeded?.steeringMessage,
++			steeringMessages: seeded?.steeringMessages,
+ 			queuedMessages: seeded?.queuedMessages,
+ 			draft: seeded?.draft,
+ 		};

@@ -1,0 +1,149 @@
+From bb6a2fc5b494ab3ba9a30f8f3e25c783d2b68e2d Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Sun, 6 Sep 2026 12:20:43 -0400
+Subject: [PATCH] Seed new chat-input sessions from the remembered
+ session-config picks
+
+The Agents window and the chat input seed a new session's config from two
+different places. The Agents window replays the user's last picks from profile
+storage; the chat input reads only `chat.defaultConfiguration`, which covers the
+`autoApprove` and `mode` axes and nothing else.
+
+Any other property therefore falls back to its schema default in the chat input
+however many times the user changes it. Claude's `permissionMode` is the visible
+case: the Approvals chip reads that property, `chat.defaultConfiguration` does
+not write it, so every new chat starts on Default while the Agents window keeps
+whatever was last chosen.
+
+Move the storage key and the remembered-key predicate into
+`sessionConfigKeys.ts` so both surfaces share one definition rather than a copy,
+and seed the chat input's initial config from the same store. Isolation is
+spread last so it stays host-owned, and the existing `chat.defaultConfiguration`
+handling is left in place, so the two axes it already governs keep their current
+precedence in this path.
+---
+ .../platform/agentHost/common/sessionConfigKeys.ts | 13 +++++++++++++
+ .../browser/baseAgentHostSessionsProvider.ts       | 14 ++++----------
+ .../agentHostUntitledProvisionalSessionService.ts  | 14 ++++++++++++--
+ 3 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/sessionConfigKeys.ts b/src/vs/platform/agentHost/common/sessionConfigKeys.ts
+index 55d4f98656a99..e654b36e8c73a 100644
+--- a/src/vs/platform/agentHost/common/sessionConfigKeys.ts
++++ b/src/vs/platform/agentHost/common/sessionConfigKeys.ts
+@@ -70,3 +70,16 @@ export function omitTransientSessionConfigValues<T>(values: Record<string, T>):
+ 	delete result[SessionConfigKey.ShellInitScripts];
+ 	return result;
+ }
++
++/**
++ * Profile-scoped store of the user's last session-config picks. Shared so the Agents
++ * window and the chat input seed new sessions from the same choices.
++ */
++export const REMEMBERED_SESSION_CONFIG_STORAGE_KEY = 'sessions.agentHost.sessionConfigPicker.selectedValues';
++
++const UNSAFE_SESSION_CONFIG_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
++
++/** Whether a session-config property may be carried from one session to the next. */
++export function isRememberedSessionConfigKey(property: string): boolean {
++	return property !== SessionConfigKey.Branch && !UNSAFE_SESSION_CONFIG_KEYS.has(property);
++}
+diff --git a/src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts b/src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts
+index 1944b6b622f50..8422d34a3f2bb 100644
+--- a/src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts
++++ b/src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts
+@@ -29,7 +29,7 @@ import { buildAnnotationsUri } from '../../../../../platform/agentHost/common/an
+ import { ChangesetKind } from '../../../../../platform/agentHost/common/changesetUri.js';
+ import { parseGitHubIssueUrl } from '../../../../../platform/agentHost/common/githubIssueReferences.js';
+ import { getEffectiveAgents } from '../../../../../platform/agentHost/common/customAgents.js';
+-import { KNOWN_MODE_VALUES, SessionConfigKey } from '../../../../../platform/agentHost/common/sessionConfigKeys.js';
++import { isRememberedSessionConfigKey, KNOWN_MODE_VALUES, REMEMBERED_SESSION_CONFIG_STORAGE_KEY, SessionConfigKey } from '../../../../../platform/agentHost/common/sessionConfigKeys.js';
+ import { migrateLegacyAutopilotConfig } from '../../../../../platform/agentHost/common/agentHostSchema.js';
+ import { readAgentDevContainerWorktreeMetadata, withAgentDevContainerWorktreeMetadata, type IAgentDevContainerWorktreeMetadata } from '../../../../../platform/agentHost/common/meta/agentDevContainerWorktreeMeta.js';
+ import type { IAgentSubscription } from '../../../../../platform/agentHost/common/state/agentSubscription.js';
+@@ -70,8 +70,6 @@ import { mapProtocolStatus } from './agentHostDiffs.js';
+ import { createActiveSessionSubscriptionObs, createChangesets, IAgentHostChangeset, selectMostRecentChatUri } from './agentHostSessionChangesets.js';
+ import { createSessionOutputObs, ISessionOutputObs } from './agentHostSessionFiles.js';
+ 
+-const STORAGE_KEY_REMEMBERED_SESSION_CONFIG_VALUES = 'sessions.agentHost.sessionConfigPicker.selectedValues';
+-const UNSAFE_SESSION_CONFIG_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+ const SESSION_CHANGE_NOTIFICATION_DEBOUNCE_MS = 50;
+ 
+ function mergeSessionChangeEvents(events: readonly ISessionChangeEvent[]): ISessionChangeEvent {
+@@ -284,10 +282,6 @@ function deserializeStatus(raw: ISerializedSessionMetadata): ProtocolSessionStat
+ 	return status;
+ }
+ 
+-function isRememberedSessionConfigKey(property: string): boolean {
+-	return property !== SessionConfigKey.Branch && !UNSAFE_SESSION_CONFIG_KEYS.has(property);
+-}
+-
+ function normalizeAutoApproveValue(value: unknown, policyRestricted: boolean): ChatPermissionLevel | undefined {
+ 	// `KNOWN_AUTO_APPROVE_VALUES` is intentionally tolerant of legacy values
+ 	// that are not real `ChatPermissionLevel`s. Validate against the enum here
+@@ -3775,7 +3769,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
+ 		// Seed session config values from the last user picks, migrating any
+ 		// legacy `autoApprove='autopilot'` remembered value into the new
+ 		// `mode='autopilot'` shape before the per-axis precedence below runs.
+-		const rememberedValues = this._storageService.getObject<Record<string, unknown>>(STORAGE_KEY_REMEMBERED_SESSION_CONFIG_VALUES, StorageScope.PROFILE, {});
++		const rememberedValues = this._storageService.getObject<Record<string, unknown>>(REMEMBERED_SESSION_CONFIG_STORAGE_KEY, StorageScope.PROFILE, {});
+ 		for (const [property, value] of Object.entries(rememberedValues)) {
+ 			if (typeof value === 'string' && isRememberedSessionConfigKey(property)) {
+ 				config[property] = value;
+@@ -3867,7 +3861,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
+ 
+ 		// Remember portable config picks across sessions.
+ 		if (typeof normalizedValue === 'string' && isRememberedSessionConfigKey(property)) {
+-			const rememberedValues = this._storageService.getObject<Record<string, unknown>>(STORAGE_KEY_REMEMBERED_SESSION_CONFIG_VALUES, StorageScope.PROFILE, {});
++			const rememberedValues = this._storageService.getObject<Record<string, unknown>>(REMEMBERED_SESSION_CONFIG_STORAGE_KEY, StorageScope.PROFILE, {});
+ 			const nextRememberedValues = Object.create(null) as Record<string, string>;
+ 			for (const [key, rememberedValue] of Object.entries(rememberedValues)) {
+ 				if (typeof rememberedValue === 'string' && isRememberedSessionConfigKey(key)) {
+@@ -3875,7 +3869,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
+ 				}
+ 			}
+ 			nextRememberedValues[property] = normalizedValue;
+-			this._storageService.store(STORAGE_KEY_REMEMBERED_SESSION_CONFIG_VALUES, JSON.stringify(nextRememberedValues), StorageScope.PROFILE, StorageTarget.MACHINE);
++			this._storageService.store(REMEMBERED_SESSION_CONFIG_STORAGE_KEY, JSON.stringify(nextRememberedValues), StorageScope.PROFILE, StorageTarget.MACHINE);
+ 		}
+ 
+ 		// Mark resolution before firing so the first picker render is already inert.
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts
+index 9c7716bf8828f..99a21ec674b2b 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts
+@@ -58,7 +58,8 @@ import { isEqual } from '../../../../../../base/common/resources.js';
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { generateUuid } from '../../../../../../base/common/uuid.js';
+ import { IAgentHostService } from '../../../../../../platform/agentHost/common/agentService.js';
+-import { KNOWN_MODE_VALUES, SessionConfigKey } from '../../../../../../platform/agentHost/common/sessionConfigKeys.js';
++import { isRememberedSessionConfigKey, KNOWN_MODE_VALUES, REMEMBERED_SESSION_CONFIG_STORAGE_KEY, SessionConfigKey } from '../../../../../../platform/agentHost/common/sessionConfigKeys.js';
++import { IStorageService, StorageScope } from '../../../../../../platform/storage/common/storage.js';
+ import { migrateLegacyAutopilotConfig } from '../../../../../../platform/agentHost/common/agentHostSchema.js';
+ import { ActionType } from '../../../../../../platform/agentHost/common/state/protocol/actions.js';
+ import type { ResolveSessionConfigResult } from '../../../../../../platform/agentHost/common/state/protocol/commands.js';
+@@ -291,6 +292,7 @@ export class AgentHostUntitledProvisionalSessionService extends Disposable imple
+ 		@IAgentHostImportConversationStore private readonly _importConversationStore: IAgentHostImportConversationStore,
+ 		@IAgentHostActiveClientService private readonly _activeClientService: IAgentHostActiveClientService,
+ 		@IUriIdentityService private readonly _uriIdentityService: IUriIdentityService,
++		@IStorageService private readonly _storageService: IStorageService,
+ 	) {
+ 		super();
+ 
+@@ -1062,7 +1064,15 @@ export class AgentHostUntitledProvisionalSessionService extends Disposable imple
+ 		if (this._environmentService.isSessionsWindow) {
+ 			return undefined;
+ 		}
+-		const config: Record<string, unknown> = { [SessionConfigKey.Isolation]: 'folder' };
++		// Seed from the picks the Agents window remembers, so a chip set there is not reset here.
++		const remembered: Record<string, unknown> = Object.create(null);
++		const rememberedValues = this._storageService.getObject<Record<string, unknown>>(REMEMBERED_SESSION_CONFIG_STORAGE_KEY, StorageScope.PROFILE, {});
++		for (const [property, value] of Object.entries(rememberedValues)) {
++			if (typeof value === 'string' && isRememberedSessionConfigKey(property)) {
++				remembered[property] = value;
++			}
++		}
++		const config: Record<string, unknown> = { ...remembered, [SessionConfigKey.Isolation]: 'folder' };
+ 
+ 		const configuredDefaults = this._configurationService.getValue<IChatDefaultConfiguration>(ChatConfiguration.DefaultConfiguration);
+ 		const policyValue = this._configurationService.inspect<boolean>(ChatConfiguration.GlobalAutoApprove).policyValue;

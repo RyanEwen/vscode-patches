@@ -1,0 +1,71 @@
+From b71a273f5d8cdd67e3b3b920dcd974321194782a Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 10:54:51 -0400
+Subject: [PATCH] chat: settle deferreds of pending requests dropped by remote
+ sync
+
+syncPendingRequestsFromRemote captured the model's live pending-request
+array as "existing", then called replacePendingRequests, which clears and
+refills that same array in place. The loop that follows, meant to reject
+the deferred of every request the remote no longer lists, therefore
+iterated the reconciled set instead and never settled anything. A queued
+or steering request that the agent host consumed or dropped left its
+sendRequest promise pending on the client forever.
+
+Snapshot the pending requests before replacing them, matching how
+migrateRequests and the other callers copy the array.
+---
+ .../common/chatService/chatServiceImpl.ts     |  2 +-
+ .../common/chatService/chatService.test.ts    | 26 +++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts b/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
+index 472c940369ab9..cc7fb22cc713d 100644
+--- a/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
++++ b/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
+@@ -2360,7 +2360,7 @@ export class ChatService extends Disposable implements IChatService {
+ 			return;
+ 		}
+ 
+-		const existing = model.getPendingRequests();
++		const existing = [...model.getPendingRequests()];
+ 		const existingById = new Map(existing.map(request => [request.request.id, request]));
+ 		const reconciled: IChatPendingRequest[] = requests.map(remote => {
+ 			const variableData = remote.variableData ?? { variables: [] };
+diff --git a/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts b/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts
+index c8e26005442d9..3fe67cdcb44cc 100644
+--- a/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts
+@@ -1409,6 +1409,32 @@ suite('ChatService', () => {
+ 		]]);
+ 	});
+ 
++	test('syncPendingRequestsFromRemote settles the deferred of a request the remote dropped', async () => {
++		const testService = createChatService();
++		const modelRef = testDisposables.add(startSessionModel(testService));
++		const model = modelRef.object;
++
++		const kept = await testService.sendRequest(model.sessionResource, 'kept message', { queue: ChatRequestQueueKind.Queued, pauseQueue: true });
++		const dropped = await testService.sendRequest(model.sessionResource, 'dropped message', { queue: ChatRequestQueueKind.Queued, pauseQueue: true });
++		assert.ok(ChatSendResult.isQueued(kept));
++		assert.ok(ChatSendResult.isQueued(dropped));
++		const keptId = model.getPendingRequests()[0].request.id;
++
++		const settled: [string, ChatSendResult][] = [];
++		void kept.deferred.then(result => settled.push(['kept', result]));
++		void dropped.deferred.then(result => settled.push(['dropped', result]));
++
++		testService.syncPendingRequestsFromRemote(model.sessionResource, [
++			{ id: keptId, kind: ChatRequestQueueKind.Queued, message: 'kept message' },
++		]);
++		await timeout(0);
++
++		assert.deepStrictEqual({ settled, pending: model.getPendingRequests().map(p => p.request.id) }, {
++			settled: [['dropped', { kind: 'rejected', reason: 'Request was removed from queue' }]],
++			pending: [keptId],
++		});
++	});
++
+ 	test('sendPendingRequestImmediately cancels current and sends the queued message on local sessions', async () => {
+ 		const firstStarted = new DeferredPromise<void>();
+ 		const secondInvoked = new DeferredPromise<void>();

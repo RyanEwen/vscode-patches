@@ -1,0 +1,1197 @@
+From c435218d96835b16a2e16df0617485a5fd0058b6 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 23:36:28 -0400
+Subject: [PATCH 1/6] Agent host: surface a Claude steering message as its own
+ turn
+
+Steering a Claude session left the message with no representation. The
+pending bubble was removed as soon as the queue handed the message to the
+SDK, and because the response folded into the running turn, nothing took
+its place: the model visibly changed course with no record of why.
+
+Hold the message until the SDK preempts the running turn for it. The
+result the SDK emits for the aborted generation completes the turn the
+steer interrupted and starts one whose message is the steer, with
+queuedMessageId clearing the pending bubble in the same action. The queue
+is retargeted so later events and the final completion land in the new
+turn. A steer that never runs still clears via steering_consumed.
+
+This is what #318456 did for Copilot, and it matches what M10 already
+specified: the ack belongs at model visibility, not queue acceptance.
+
+CONTEXT.md described an SDKUserMessage echo on the event stream as the
+visibility signal. The SDK sends no such echo, verified by logging every
+user message a live steered turn produced: all were tool_result messages
+and the steer appeared only in the on-disk transcript. The intermediate
+result is used instead, and the document is corrected.
+---
+ .../platform/agentHost/node/claude/CONTEXT.md |  92 +++++++++------
+ .../node/claude/claudeAgentSession.ts         |   2 +-
+ .../node/claude/claudePromptQueue.ts          |  26 +++--
+ .../node/claude/claudeSdkPipeline.ts          | 105 ++++++++++++++----
+ .../agentHost/test/node/claudeAgent.test.ts   |  95 ++++++++++------
+ .../test/node/claudePromptQueue.test.ts       |  40 ++++---
+ 6 files changed, 242 insertions(+), 118 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/CONTEXT.md b/src/vs/platform/agentHost/node/claude/CONTEXT.md
+index 7d51615231bb9..999775401ed20 100644
+--- a/src/vs/platform/agentHost/node/claude/CONTEXT.md
++++ b/src/vs/platform/agentHost/node/claude/CONTEXT.md
+@@ -1420,7 +1420,7 @@ sees the deltas it can act on.
+ | IAgent surface | SDK primitive(s) | What it does |
+ |---|---|---|
+ | `setPendingMessages?(chat, steeringMessage, queuedMessages)` (optional) | Yield an `SDKUserMessage` with `priority: 'now'` into the prompt iterable that was passed to `query()` ([sdk.d.ts:3067-3086](../../../../../../extensions/copilot/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts#L3067-L3086)) | Notifies the agent that the chat's pending-message state changed. The agent reacts by yielding the steering content as an `SDKUserMessage` whose `priority` is `'now'`, which the SDK treats as "preempt the current turn and run me first." |
+-| (outbound signal) `AgentSignal { kind: 'steering_consumed', session, id }` | n/a (host-emitted on SDK ack) | Agent fires this signal when the SDK confirms the steering message was delivered to the model. Host then dispatches `SessionPendingMessageRemoved` so the client clears the pending pill. |
++| (outbound signal) `AgentSignal { kind: 'steering_consumed', session, id }` | n/a (host-emitted) | Fallback for a steering message the SDK accepted but never echoed (abort, dispose). Host dispatches `SessionPendingMessageRemoved` so the client clears the pending pill. On the normal path the echo promotes the message to its own turn and `ChatTurnStarted.queuedMessageId` clears the pill instead. |
+ 
+ ##### Pending-message taxonomy (locked at the protocol layer)
+ 
+@@ -1553,13 +1553,14 @@ operating without the distinction the protocol exposes.
+ The signal `IAgentSteeringConsumedSignal { kind: 'steering_consumed', session, id }`
+ ([agentService.ts:359-362](../../common/agentService.ts#L359-L362))
+ is **not** emitted when the iterable's `yield` resolves — yielding
+-only means the SDK accepted the message into its command queue.
+-The agent emits the signal when the SDK actually surfaces the
+-message to the model (the next `SDKUserMessage` echo on the event
+-stream after the SDK's `'now'`-watcher has aborted the previous
+-turn and dequeued this message). This matches the client's
+-expectation: the pending-message pill should clear when the model
+-has *seen* the steering, not when the queue accepted it.
++only means the SDK accepted the message into its command queue. It
++is the fallback for a steer that never reaches the model: on the
++normal path the pill clears when the steering turn starts, which
++happens on the intermediate `result` the SDK emits for the turn the
++steer aborted. (An earlier revision of this document described an
++`SDKUserMessage` echo on the event stream; the SDK sends no such
++echo.) Either way the pill clears when the model has *seen* the
++steering, not when the queue accepted it.
+ 
+ The host's reaction to the signal is to dispatch
+ `SessionPendingMessageRemoved { kind: PendingMessageKind.Steering, id }`
+@@ -1569,24 +1570,40 @@ This is the second of the three steering touchpoints on the host:
+ 
+ 1. Client writes `SessionPendingMessageSet { kind: Steering, ... }`.
+ 2. Host forwards the new state to `IAgent.setPendingMessages`.
+-3. Agent emits `steering_consumed` after SDK ack.
+-4. Host dispatches `SessionPendingMessageRemoved { kind: Steering, id }`.
++3. On the SDK echo the agent promotes the steer to its own turn, and
++   `ChatTurnStarted.queuedMessageId` clears the pending message.
++4. Without an echo (abort, dispose) the agent emits `steering_consumed`
++   and the host dispatches `SessionPendingMessageRemoved { kind: Steering, id }`.
+ 
+ ##### Steering vs `sendMessage` boundary
+ 
+-A steering message is **not** a turn boundary. It does not get a
+-`Turn.id`, does not appear as a separate user `Turn` in
+-`getSessionMessages`, and does not emit a `SessionTurnStart`. From
+-the protocol Turn perspective it is invisible — its content shows
+-up as part of the *next* assistant message in the current turn,
+-because the model received it mid-generation and folded it into
+-the response. The agent's transcript reconstruction
+-(`getSessionMessages`, M7) collapses the SDK's intermediate
+-`SDKUserMessage` for steering into the in-progress Turn rather
+-than starting a new one. This is an asymmetry vs `sendMessage`
+-that consumers must understand: a UI showing "turns" should not
+-expect each pending-message-set + steering-consumed pair to add a
+-row.
++A steering message **becomes** a turn boundary, but later than
++`sendMessage` does. Queueing it does not start a turn: the SDK owns
++the message from that moment, while the chat keeps showing the
++pending bubble. `priority: 'now'` makes the SDK abort the current
++generation and emit a `result` for it, and that intermediate `result`
++is the trigger: the pipeline completes the turn the steer interrupted
++and starts one whose `Turn.message` is the steering content, with
++`queuedMessageId` set so the reducer clears the pending bubble in the
++same action. Everything the SDK produces from then on, including the
++final turn completion, belongs to the new turn.
++
++The intermediate `result` is used rather than the queue handoff
++because it is the point at which the message has demonstrably reached
++the model. A steer that never reaches it (abort, dispose, or a turn
++that ends without one) is cleared with `steering_consumed` instead, so
++no pending bubble is left behind.
++
++Note that the SDK does **not** echo a steering `SDKUserMessage` back on
++the event stream. Verified against `@anthropic-ai/claude-agent-sdk` by
++logging every `user` message a live steered turn produced: all of them
++were `tool_result` messages, and the steer appeared only in the
++on-disk transcript. An echo-driven trigger therefore never fires.
++
++This matches the Copilot agent host, which promotes steering the same
++way (`_beginSteeringTurn`). Before that change both harnesses folded
++steering into the running turn, which left the message with no
++representation anywhere once its pending bubble was removed.
+ 
+ #### Truncation: `truncateSession`
+ 
+@@ -1672,10 +1689,10 @@ me first" — via different transports:
+ - **Steering preserves the in-flight Turn at the protocol level
+   even though the SDK preempts internally.** On the Claude SDK,
+   `priority: 'now'` causes the SDK to abort the current
+-  generation and run the steering message next. The protocol Turn
+-  reconstruction (M7) folds the resulting messages back into the
+-  same Turn so consumers see steering as "additional context for
+-  the current generation," not a new turn. Provider implementations
++  generation and run the steering message next. The `result` for that
++  aborted generation ends the interrupted Turn and opens the steering
++  Turn, so consumers see the steer as its own row rather than as
++  silent context for the previous one. Provider implementations
+   must yield via `priority: 'now'` (or the SDK's equivalent
+   preempt hint), **not** via `Query.interrupt()` followed by a new
+   send — that path produces explicit Turn boundaries.
+@@ -1683,15 +1700,18 @@ me first" — via different transports:
+   agent treating non-empty `queuedMessages` is implementing
+   behavior the host explicitly excludes from this surface; the
+   parameter exists only as a future-proofing slot.
+-- **Steering doesn't create a new `Turn.id`.** A steering message
+-  is folded into the current Turn's user-side history at
+-  reconstruction time. UIs that key off Turn boundaries will not
+-  see steering as a separate row.
+-- **`steering_consumed` waits for model visibility, not queue
+-  acceptance.** The signal must fire after the SDK has actually
+-  surfaced the message to the model, not when the agent's `yield`
+-  resolves. Premature signals would clear the pill before the
+-  user's intent has reached the model.
++- **Steering creates a new `Turn.id`, on preemption rather than on
++  send.** Queueing the message starts nothing; the `result` for the
++  aborted generation completes the interrupted Turn and starts the
++  steering Turn, whose id is the steer's pending-message id. UIs that
++  key off Turn boundaries see the steer as its own row.
++- **The pending pill clears at model visibility, not queue
++  acceptance.** On the normal path the SDK echo promotes the steer to
++  its own turn and `ChatTurnStarted.queuedMessageId` clears the pill.
++  `steering_consumed` is the cleanup fallback for a steer that is never
++  echoed (abort, dispose, or a turn that ends without it), so the pill
++  does not outlive the message. Clearing on `yield` would hide the
++  message while the model is still acting on it.
+ - **`truncateSession?` being undefined is a valid protocol
+   state.** Clients must check for the optional-ness and degrade
+   gracefully (e.g., offer fork instead). Agents must not throw
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index ea0c9ec0389da..4612cb8614b9f 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -1046,7 +1046,7 @@ export class ClaudeAgentSession extends Disposable {
+ 			// boundary is the convention for both code paths.
+ 			uuid: steeringMessage.id as `${string}-${string}-${string}-${string}-${string}`,
+ 		};
+-		pipeline.injectSteering(sdkMessage, steeringMessage.id);
++		pipeline.injectSteering(sdkMessage, steeringMessage);
+ 	}
+ 
+ 	/** Live permission-mode change. Forwards to the pipeline; the pipeline remembers it for re-application after a rebind. */
+diff --git a/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts b/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts
+index f0463060a4038..7e515fc8ea862 100644
+--- a/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts
++++ b/src/vs/platform/agentHost/node/claude/claudePromptQueue.ts
+@@ -22,8 +22,10 @@ import { ILogService } from '../../../log/common/log.js';
+ export interface IPendingSdkMessage {
+ 	readonly sdkMessage: SDKUserMessage;
+ 	readonly sdkUuid: string;
+-	readonly turnId: string;
+-	readonly stopWatch: StopWatch;
++	/** Protocol turn these events belong to; reassigned by {@link ClaudePromptQueue.retargetTurn}. */
++	turnId: string;
++	/** Times the protocol turn; replaced along with {@link turnId}. */
++	stopWatch: StopWatch;
+ 	readonly deferred: DeferredPromise<void>;
+ 	readonly steeringPendingId?: string;
+ }
+@@ -70,9 +72,6 @@ export class ClaudePromptQueue extends Disposable {
+ 						const entry = this._toYield.shift()!;
+ 						this._yielded.push(entry);
+ 						this._logService.info(`[Claude:${this._sessionId}] queue yielded sdkUuid=${entry.sdkUuid} turnId=${entry.turnId}${entry.steeringPendingId ? ` steeringPendingId=${entry.steeringPendingId}` : ''}`);
+-						if (entry.steeringPendingId) {
+-							this._onSteeringYielded(entry.steeringPendingId);
+-						}
+ 						return { done: false, value: entry.sdkMessage };
+ 					}
+ 					await this._pendingPromptDeferred.p;
+@@ -85,7 +84,6 @@ export class ClaudePromptQueue extends Disposable {
+ 	constructor(
+ 		private readonly _sessionId: string,
+ 		private readonly _getAbortSignal: () => AbortSignal,
+-		private readonly _onSteeringYielded: (pendingId: string) => void,
+ 		@ILogService private readonly _logService: ILogService,
+ 	) {
+ 		super();
+@@ -106,10 +104,8 @@ export class ClaudePromptQueue extends Disposable {
+ 	}
+ 
+ 	/**
+-	 * Most-recent in-flight or queued entry, used by steering to inherit
+-	 * its parent's `turnId`. Prefers the in-flight head over the latest
+-	 * queued entry (matches CONTEXT.md M10: steering folds into the
+-	 * in-progress protocol Turn).
++	 * Most-recent in-flight or queued entry, whose `turnId` a steer inherits
++	 * until it preempts that turn and is promoted to its own.
+ 	 */
+ 	peekParent(): IPendingSdkMessage | undefined {
+ 		return this._yielded[0] ?? this._toYield[this._toYield.length - 1];
+@@ -142,6 +138,16 @@ export class ClaudePromptQueue extends Disposable {
+ 		return completed;
+ 	}
+ 
++	/** Moves every entry to a new protocol turn, so later events and the final completion follow a promoted steer. */
++	retargetTurn(turnId: string, stopWatch: StopWatch): void {
++		for (const list of [this._toYield, this._yielded, this._popped]) {
++			for (const entry of list) {
++				entry.turnId = turnId;
++				entry.stopWatch = stopWatch;
++			}
++		}
++	}
++
+ 	/** Reject every pending deferred with `err` and clear all lists. */
+ 	failAll(err: Error): void {
+ 		const rejectAll = (list: IPendingSdkMessage[]) => {
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 6ed4794e0362f..9b75da4ca437e 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -15,6 +15,7 @@ import { ClaudeRuntimeEffortLevel } from '../../common/claudeModelConfig.js';
+ import { AgentSignal } from '../../common/agent.js';
+ import { ISessionDatabase } from '../../common/sessionDataService.js';
+ import { ActionType } from '../../common/state/sessionActions.js';
++import { PendingMessage } from '../../common/state/protocol/state.js';
+ import { DeferredPromise } from '../../../../base/common/async.js';
+ import { ClaudePromptQueue, IPendingSdkMessage } from './claudePromptQueue.js';
+ import { ClaudeSdkMessageRouter } from './claudeSdkMessageRouter.js';
+@@ -237,8 +238,10 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	 *   • `ChatTurnComplete` action, fired when the LAST entry in the
+ 	 *     queue drains via `result` (intermediate results during steering
+ 	 *     preempt do NOT fire — CONTEXT.md M10).
+-	 *   • `steering_consumed` signal, fired the moment the iterable yields
+-	 *     a steering entry to the SDK.
++	 *   • `ChatTurnStarted`/`ChatTurnComplete` pair, fired when a steering
++	 *     message preempts a turn and is promoted to its own.
++	 *   • `steering_consumed` signal, fired for a steering message the SDK
++	 *     accepted but never ran (abort or dispose).
+ 	 */
+ 	readonly onDidProduceSignal: Event<AgentSignal> = this._onDidProduceSignal.event;
+ 
+@@ -264,11 +267,6 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			ClaudePromptQueue,
+ 			sessionId,
+ 			() => this._abortController.signal,
+-			(pendingId: string) => this._onDidProduceSignal.fire({
+-				kind: 'steering_consumed',
+-				chat: this.chatChannelUri,
+-				id: pendingId,
+-			}),
+ 		));
+ 		this._router = this._register(instantiationService.createInstance(
+ 			ClaudeSdkMessageRouter, chatChannelUri, resource, dbRef, subagents, clientToolOwner,
+@@ -276,6 +274,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._register(this._router.onDidProduceSignal(s => this._onDidProduceSignal.fire(s)));
+ 		// Dispose chain → abort → SDK cleanup. Reads the *current*
+ 		// `_abortController` so a swap aborts the live subprocess.
++		this._register(toDisposable(() => this._drainPendingSteeringFlips()));
+ 		this._register(toDisposable(() => this._abortController.abort()));
+ 		this._register(toDisposable(() => {
+ 			void Promise.resolve(this._warm[Symbol.asyncDispose]()).catch((err: unknown) =>
+@@ -446,18 +445,80 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		return this._queue.push(entry);
+ 	}
+ 
++	/** Steering messages the SDK has accepted but not yet run, keyed by pending-message id. */
++	private readonly _pendingSteeringFlips = new Map<string, PendingMessage>();
++
+ 	/**
+-	 * Push a `priority: 'now'` steering message into the iterable. The
+-	 * caller pre-builds the {@link SDKUserMessage} (the pipeline is SDK
+-	 * messaging-shaped, not protocol-shaped). `pendingMessageId` is the
+-	 * protocol `PendingMessage.id` that {@link onSteeringConsumed} will
+-	 * carry when the SDK accepts the message.
+-	 *
+-	 * No-op if the pipeline is aborted or no in-flight / queued request
+-	 * exists to inherit a `turnId` from (CONTEXT.md M10: steering folds
+-	 * into the in-progress protocol Turn).
++	 * Promotes a steer to its own turn, completing the one it interrupted.
++	 * Mirrors the Copilot agent host so both harnesses surface steering the same way.
++	 */
++	private _beginSteeringTurn(steering: PendingMessage, interrupted: IPendingSdkMessage): void {
++		// Complete before starting: the still-pending steer is what stops the host draining a queued message in between.
++		this._onDidProduceSignal.fire({
++			kind: 'action',
++			resource: this.chatChannelUri,
++			action: {
++				type: ActionType.ChatTurnComplete,
++				turnId: interrupted.turnId,
++				duration: Math.max(0, interrupted.stopWatch.elapsed()),
++			},
++		});
++		const turnId = steering.id;
++		this._onDidProduceSignal.fire({
++			kind: 'action',
++			resource: this.chatChannelUri,
++			action: {
++				type: ActionType.ChatTurnStarted,
++				turnId,
++				startedAt: new Date().toISOString(),
++				message: steering.message,
++				queuedMessageId: steering.id,
++			},
++		});
++		this._queue.retargetTurn(turnId, StopWatch.create(false));
++		this._logService.info(`[Claude:${this.sessionId}] steering promoted to turn ${turnId} (pendingId=${steering.id})`);
++	}
++
++	/**
++	 * Promotes the steer the SDK is about to run, if the entry it just finished was
++	 * preempted by one. The SDK does not echo steering, so this result is the
++	 * earliest point at which the message is known to have reached the model.
++	 */
++	private _promoteSteeringAtHead(completed: IPendingSdkMessage): void {
++		const pendingId = this._queue.peekParent()?.steeringPendingId;
++		const steering = pendingId ? this._pendingSteeringFlips.get(pendingId) : undefined;
++		if (!steering) {
++			return;
++		}
++		this._pendingSteeringFlips.delete(steering.id);
++		this._beginSteeringTurn(steering, completed);
++	}
++
++	/** Clears steers the SDK accepted but never ran, so no pending bubble is left behind. */
++	private _drainPendingSteeringFlips(): void {
++		if (this._pendingSteeringFlips.size === 0) {
++			return;
++		}
++		const ids = [...this._pendingSteeringFlips.keys()];
++		this._pendingSteeringFlips.clear();
++		for (const id of ids) {
++			this._onDidProduceSignal.fire({ kind: 'steering_consumed', chat: this.chatChannelUri, id });
++		}
++	}
++
++	/** Fails every queued entry and clears the steering messages that went with them. */
++	private _failQueue(error: Error): void {
++		this._queue.failAll(error);
++		this._drainPendingSteeringFlips();
++	}
++
++	/**
++	 * Pushes a `priority: 'now'` steering message into the iterable, then holds it
++	 * until the SDK preempts the running turn for it. No-op if the pipeline is
++	 * aborted or nothing is in flight to steer.
+ 	 */
+-	injectSteering(prompt: SDKUserMessage, pendingMessageId: string): void {
++	injectSteering(prompt: SDKUserMessage, steeringMessage: PendingMessage): void {
++		const pendingMessageId = steeringMessage.id;
+ 		if (this._abortController.signal.aborted) {
+ 			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (controller aborted) id=${pendingMessageId}`);
+ 			return;
+@@ -480,6 +541,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			deferred: new DeferredPromise<void>(),
+ 			steeringPendingId: pendingMessageId,
+ 		}).catch(() => { /* expected on abort/crash */ });
++		this._pendingSteeringFlips.set(pendingMessageId, steeringMessage);
+ 		this._logService.info(`[Claude:${this.sessionId}] injectSteering: enqueued id=${pendingMessageId} sdkUuid=${sdkUuid}`);
+ 	}
+ 
+@@ -499,7 +561,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			return;
+ 		}
+ 		this._abortController.abort();
+-		this._queue.failAll(new CancellationError());
++		this._failQueue(new CancellationError());
+ 		// Mark unhealthy but keep the `_query` handle: the next `send` rebinds,
+ 		// and `shutdownAndWait` still needs it to await the subprocess exit.
+ 		this._needsRebind = true;
+@@ -619,7 +681,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind-aborted: warm dispose failed: ${err}`));
+ 			void Promise.resolve(oldWarm[Symbol.asyncDispose]()).catch((err: unknown) =>
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] previous WarmQuery dispose failed during aborted rebind: ${err}`));
+-			this._queue.failAll(new CancellationError());
++			this._failQueue(new CancellationError());
+ 			this._needsRebind = true;
+ 			throw new CancellationError();
+ 		}
+@@ -690,6 +752,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 					// Intermediate result (still pending entries from a
+ 					// steering preempt) does NOT fire ChatTurnComplete.
+ 					if (completed && this._queue.isEmpty) {
++						this._drainPendingSteeringFlips();
+ 						this._onDidProduceSignal.fire({
+ 							kind: 'action',
+ 							resource: this.chatChannelUri,
+@@ -699,6 +762,8 @@ export class ClaudeSdkPipeline extends Disposable {
+ 								duration: Math.max(0, completed.stopWatch.elapsed()),
+ 							},
+ 						});
++					} else if (completed) {
++						this._promoteSteeringAtHead(completed);
+ 					}
+ 				}
+ 			}
+@@ -722,7 +787,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			// not clobber the fresh one. Mark unhealthy (keep the handle for
+ 			// teardown); the next `send` rebinds.
+ 			if (this._query === query) {
+-				this._queue.failAll(fatal);
++				this._failQueue(fatal);
+ 				this._needsRebind = true;
+ 			}
+ 			if (!isCancellationError(fatal)) {
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index ad2394f87ae05..2f13ed95cb540 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7435,8 +7435,8 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		advance.complete();
+ 	});
+ 
+-	test('steering_consumed fires when the iterable hands the steering message to the SDK', async () => {
+-		const { ctx, sessionUri, advance } = await materialize();
++	test('the result that ends the preempted turn promotes the steering message to its own turn', async () => {
++		const { ctx, sessionUri, query, advance } = await materialize();
+ 		const sid = AgentSession.id(sessionUri);
+ 
+ 		const signals: AgentSignal[] = [];
+@@ -7444,28 +7444,58 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 
+ 		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
+ 		await tick();
+-
+-		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-9', message: { text: 'steer', origin: { kind: MessageKind.User } } }, []);
+-		// Microtask cycles let the FakeQuery's background drain pull the
+-		// steering entry off `_toYield`; that drain is when our session
+-		// fires `steering_consumed` (SDK ack semantics — mirrors Copilot's
+-		// `sendSteering` firing right after `send({mode:'immediate'})`).
+-		// Firing later (on the steering's result) would let the user
+-		// reorder/delete the still-pending entry; the SDK has no hook for
+-		// that, so we ack as soon as the SDK takes ownership.
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-9', message: { text: 'switch topic', origin: { kind: MessageKind.User } } }, []);
+ 		await tick();
+ 		await tick();
+ 
+-		const consumed = signals.find(s => s.kind === 'steering_consumed');
+-		assert.ok(consumed, `expected steering_consumed after iterable yield, got kinds: ${signals.map(s => s.kind).join(', ')}`);
+-		assert.deepStrictEqual({ kind: consumed.kind, id: (consumed as { id: string }).id }, { kind: 'steering_consumed', id: 'pending-9' });
+-
+-		// Cleanup so longSend resolves.
+-		ctx.sdk.nextQueryMessages.push(makeResultSuccess(sid));
++		const steered = query.drainedPrompts.find(p => p.priority === 'now')!;
++		assert.strictEqual(steered.uuid, 'pending-9', 'the steer is sent under its pending-message id');
++		// result#1 ends the preempted turn, result#2 ends the steering turn.
++		ctx.sdk.nextQueryMessages.push(makeResultSuccess(sid), makeResultSuccess(sid));
+ 		advance.complete();
+ 		await longSend;
++
++		const turnActions = signals
++			.filter(s => s.kind === 'action')
++			.map(s => (s as { action: { type: string; turnId: string; message?: { text: string }; queuedMessageId?: string } }).action)
++			.filter(a => a.type === ActionType.ChatTurnComplete || a.type === ActionType.ChatTurnStarted);
++		const started = turnActions.find(a => a.type === ActionType.ChatTurnStarted);
++		assert.deepStrictEqual({
++			preemptedTurnCompleted: turnActions.some(a => a.type === ActionType.ChatTurnComplete && a.turnId === 'turn-2'),
++			startedMessage: started?.message?.text,
++			clearsPendingBubble: started?.queuedMessageId,
++			startedTurnId: started?.turnId,
++			finalCompleteTargetsSteeringTurn: turnActions.at(-1)?.type === ActionType.ChatTurnComplete && turnActions.at(-1)?.turnId === started?.turnId,
++		}, {
++			preemptedTurnCompleted: true,
++			startedMessage: 'switch topic',
++			clearsPendingBubble: 'pending-9',
++			startedTurnId: 'pending-9',
++			finalCompleteTargetsSteeringTurn: true,
++		});
+ 	});
+ 
++	test('a steering message the SDK never runs still clears its pending bubble', async () => {
++		const { ctx, sessionUri, advance } = await materialize();
++
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
++
++		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
++		await tick();
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-10', message: { text: 'never echoed', origin: { kind: MessageKind.User } } }, []);
++		await tick();
++		await tick();
++
++		await ctx.agent.chats.abort(defaultChatUri(sessionUri));
++		advance.complete();
++		await longSend.catch(() => { /* cancelled */ });
++
++		assert.deepStrictEqual(
++			signals.filter(s => s.kind === 'steering_consumed').map(s => (s as { id: string }).id),
++			['pending-10'],
++		);
++	});
+ 
+ 	test('abortSession on a materialized session cancels the in-flight turn and leaves the session reusable', async () => {
+ 		const ctx = createTestContext(disposables);
+@@ -7581,14 +7611,12 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		}, { models: ['claude-sonnet-4-6'], efforts: ['high'] });
+ 	});
+ 
+-	test('intermediate result during steering does NOT complete the in-flight sendMessage or fire ChatTurnComplete', async () => {
++	test('intermediate result during steering closes the preempted turn and opens the steering turn', async () => {
+ 		// CONTEXT.md M10: when the SDK preempts via `'now'`-priority, it
+ 		// emits one `result` message per turn it ran (the aborted
+-		// original + the steering reply). Protocol-wise this is ONE Turn,
+-		// so the agent must suppress the intermediate result: do not
+-		// settle the original sendMessage's deferred, do not fire
+-		// ChatTurnComplete. The FINAL result (when no steering is
+-		// outstanding) closes the protocol Turn.
++		// original + the steering reply). The intermediate result ends the
++		// turn the steer interrupted and starts the steering turn, without
++		// settling the original sendMessage's deferred.
+ 		const ctx = createTestContext(disposables);
+ 		await ctx.agent.authenticate('https://api.github.com', 'tok');
+ 		await tick();
+@@ -7632,18 +7660,19 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		advance.complete();
+ 		await inFlight;
+ 
+-		// Exactly one ChatTurnComplete fires (the final result), and
+-		// steering_consumed fires for the echo.
+-		const turnCompletes = signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatTurnComplete);
+-		const consumed = signals.filter(s => s.kind === 'steering_consumed');
++		const turnActions = signals
++			.filter(s => s.kind === 'action')
++			.map(s => (s as { action: { type: string; turnId: string; queuedMessageId?: string } }).action)
++			.filter(a => a.type === ActionType.ChatTurnComplete || a.type === ActionType.ChatTurnStarted);
+ 		assert.deepStrictEqual({
+-			turnCompleteCount: turnCompletes.length,
+-			steeringConsumedCount: consumed.length,
+-			steeringConsumedId: consumed[0] && (consumed[0] as { id: string }).id,
++			sequence: turnActions.map(a => `${a.type === ActionType.ChatTurnStarted ? 'started' : 'complete'}:${a.turnId}`),
++			// The pending bubble clears with the steering turn, so no fallback signal fires.
++			steeringConsumedCount: signals.filter(s => s.kind === 'steering_consumed').length,
++			clearsPendingBubble: turnActions.find(a => a.type === ActionType.ChatTurnStarted)?.queuedMessageId,
+ 		}, {
+-			turnCompleteCount: 1,
+-			steeringConsumedCount: 1,
+-			steeringConsumedId: 'pending-steer',
++			sequence: ['complete:turn-1', 'started:pending-steer', 'complete:pending-steer'],
++			steeringConsumedCount: 0,
++			clearsPendingBubble: 'pending-steer',
+ 		});
+ 	});
+ 
+diff --git a/src/vs/platform/agentHost/test/node/claudePromptQueue.test.ts b/src/vs/platform/agentHost/test/node/claudePromptQueue.test.ts
+index 2b6c9db01ae99..b60db0dfad5c8 100644
+--- a/src/vs/platform/agentHost/test/node/claudePromptQueue.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudePromptQueue.test.ts
+@@ -18,21 +18,18 @@ import { ClaudePromptQueue, IPendingSdkMessage } from '../../node/claude/claudeP
+ interface IQueueHarness {
+ 	readonly queue: ClaudePromptQueue;
+ 	readonly controller: AbortController;
+-	readonly steeringYielded: string[];
+ }
+ 
+ function createQueue(disposables: Pick<DisposableStore, 'add'>): IQueueHarness {
+ 	const controller = new AbortController();
+-	const steeringYielded: string[] = [];
+ 	const services = new ServiceCollection([ILogService, new NullLogService()]);
+ 	const instantiationService = disposables.add(new InstantiationService(services));
+ 	const queue = disposables.add(instantiationService.createInstance(
+ 		ClaudePromptQueue,
+ 		'sess-1',
+ 		() => controller.signal,
+-		(id: string) => steeringYielded.push(id),
+ 	));
+-	return { queue, controller, steeringYielded };
++	return { queue, controller };
+ }
+ 
+ function makeEntry(id: string, opts?: { steeringPendingId?: string; turnId?: string }): IPendingSdkMessage {
+@@ -176,22 +173,29 @@ suite('ClaudePromptQueue', () => {
+ 		assert.strictEqual(queue.peekParent(), undefined);
+ 	});
+ 
+-	test('steering callback fires when an entry with steeringPendingId is YIELDED, not when it is pushed', async () => {
+-		const { queue, steeringYielded } = createQueue(disposables);
++	test('retargetTurn moves queued, in-flight and popped entries to the steering turn', async () => {
++		const { queue } = createQueue(disposables);
+ 		const iter = queue.iterable[Symbol.asyncIterator]();
+-		const e = makeEntry('s1', { steeringPendingId: 'pending-42' });
+-		void queue.push(e);
+-		assert.deepStrictEqual(steeringYielded, [], 'no fire on push');
++		const popped = makeEntry('a');
++		const inFlight = makeEntry('b', { steeringPendingId: 'pending-42' });
++		const queued = makeEntry('c');
++		void queue.push(popped);
++		void queue.push(inFlight);
++		void queue.push(queued);
+ 		await drainOne(iter);
+-		assert.deepStrictEqual(steeringYielded, ['pending-42'], 'fires on yield');
+-	});
+-
+-	test('non-steering entries do not fire the steering callback', async () => {
+-		const { queue, steeringYielded } = createQueue(disposables);
+-		const iter = queue.iterable[Symbol.asyncIterator]();
+-		void queue.push(makeEntry('plain'));
+ 		await drainOne(iter);
+-		assert.deepStrictEqual(steeringYielded, []);
++		// Leaves `popped` held (the queue is not empty), `inFlight` yielded, `queued` waiting.
++		queue.settleHead();
++		const stopWatch = StopWatch.create(false);
++		queue.retargetTurn('turn-steer', stopWatch);
++		assert.deepStrictEqual(
++			[popped, inFlight, queued].map(e => ({ uuid: e.sdkUuid, turnId: e.turnId, stopWatch: e.stopWatch })),
++			[
++				{ uuid: 'a', turnId: 'turn-steer', stopWatch },
++				{ uuid: 'b', turnId: 'turn-steer', stopWatch },
++				{ uuid: 'c', turnId: 'turn-steer', stopWatch },
++			],
++		);
+ 	});
+ 
+ 	test('settleHead on an empty yielded list returns undefined and is a no-op', () => {
+@@ -206,7 +210,7 @@ suite('ClaudePromptQueue', () => {
+ 		const services = new ServiceCollection([ILogService, new NullLogService()]);
+ 		const inst = disposables.add(new InstantiationService(services));
+ 		const q = disposables.add(inst.createInstance(
+-			ClaudePromptQueue, 'sess-reset', () => liveController.signal, () => { /* no steering */ },
++			ClaudePromptQueue, 'sess-reset', () => liveController.signal,
+ 		));
+ 
+ 		// Park next() on the original deferred.
+
+From 58c5dafd8f490d8610cae8d2a3c40e0059dd6a3c Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 02:27:14 -0400
+Subject: [PATCH 2/6] Update the abort call for the two-argument signature on
+ main
+
+---
+ src/vs/platform/agentHost/test/node/claudeAgent.test.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index b0591e93834e8..febca16f09e57 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7622,7 +7622,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		await tick();
+ 		await tick();
+ 
+-		await ctx.agent.chats.abort(defaultChatUri(sessionUri));
++		await ctx.agent.chats.abort(defaultChatUri(sessionUri), chatContext(defaultChatUri(sessionUri)));
+ 		advance.complete();
+ 		await longSend.catch(() => { /* cancelled */ });
+ 
+
+From 77530e2bee8cf2aed27a0d5c7454adc21cb8d78b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 00:28:50 -0400
+Subject: [PATCH 3/6] Do not render an interrupted turn as failed
+
+Interrupting a turn makes the SDK emit a result of subtype
+error_during_execution carrying an internal diagnostic rather than a real
+failure, and mapResult turns any such result into a ChatError. Promoting the
+steer gives that turn its own bubble, so every steered message rendered an
+error above the steer's answer.
+
+The pipeline is the only place that can tell an interruption from a failure,
+so the suppression is scoped to the condition the promotion itself uses, and
+traces what it drops. An execution error outside a pending steer is untouched.
+---
+ .../node/claude/claudeSdkPipeline.ts          | 36 ++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 3fbe6567c827f..7d40b22afd663 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -272,7 +272,12 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._router = this._register(instantiationService.createInstance(
+ 			ClaudeSdkMessageRouter, chatChannelUri, resource, dbRef, subagents, clientToolOwner,
+ 		));
+-		this._register(this._router.onDidProduceSignal(s => this._onDidProduceSignal.fire(s)));
++		this._register(this._router.onDidProduceSignal(s => {
++			if (this._isSteeringPreemptDiagnostic(s)) {
++				return;
++			}
++			this._onDidProduceSignal.fire(s);
++		}));
+ 		// Dispose chain → abort → SDK cleanup. Reads the *current*
+ 		// `_abortController` so a swap aborts the live subprocess.
+ 		this._register(toDisposable(() => this._drainPendingSteeringFlips()));
+@@ -481,6 +486,35 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._logService.info(`[Claude:${this.sessionId}] steering promoted to turn ${turnId} (pendingId=${steering.id})`);
+ 	}
+ 
++	/**
++	 * Whether this signal is the SDK reporting the turn a steer interrupted.
++	 *
++	 * Interrupting a turn produces a `result` of subtype `error_during_execution`
++	 * carrying an internal diagnostic rather than a real failure, and the mapper
++	 * turns any such result into a `ChatError`. Left alone that renders the
++	 * preempted turn as failed, which is wrong and newly visible here: promoting
++	 * the steer gives that turn its own bubble to fail in.
++	 *
++	 * Scoped to the moment a promotion is pending, using the same condition
++	 * {@link _promoteSteeringAtHead} promotes on, so an execution error outside a
++	 * steer still surfaces. One that happens to coincide with a pending steer is
++	 * traced rather than dropped silently.
++	 */
++	private _isSteeringPreemptDiagnostic(signal: AgentSignal): boolean {
++		if (signal.kind !== 'action' || signal.action.type !== ActionType.ChatError) {
++			return false;
++		}
++		if (signal.action.error?.errorType !== 'error_during_execution') {
++			return false;
++		}
++		const pendingId = this._queue.peekParent()?.steeringPendingId;
++		if (!pendingId || !this._pendingSteeringFlips.has(pendingId)) {
++			return false;
++		}
++		this._logService.trace(`[Claude:${this.sessionId}] suppressing interrupted-turn diagnostic for the steer at ${pendingId}: ${signal.action.error?.message ?? ''}`);
++		return true;
++	}
++
+ 	/**
+ 	 * Promotes the steer the SDK is about to run, if the entry it just finished was
+ 	 * preempted by one. The SDK does not echo steering, so this result is the
+
+From d0a066f345dc20b90570f5d3383f07f467d9912b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 10:58:26 -0400
+Subject: [PATCH 4/6] Do not treat the SDK's interrupt diagnostic as an
+ execution error
+
+Interrupting a turn makes the SDK emit a result of subtype
+`error_during_execution`, and the mapper turns any such result into a
+ChatError. Steering interrupts on every steer, so with the preempted turn
+promoted to its own bubble, every steered message rendered an error above
+its own correct answer.
+
+The SDK always makes an internal diagnostic the first entry of `errors`
+and appends the real errors, if any, after it. On its own it is not a
+failure: an interrupted turn carries nothing else. Filtering it out where
+the error text is extracted leaves a genuine error intact (minus a prefix
+that was never meant for users) and leaves an interrupted turn with no
+error text, so no ChatError is built for it. `ChatTurnComplete` comes from
+the pipeline, not from here, so the turn still completes normally.
+
+This replaces the earlier attempt in the pipeline's signal fan-out, which
+keyed on whether a steer was pending. That check raced: the promotion
+clears the pending flip at the same result seam the signal flows through,
+so it silently never fired.
+---
+ .../node/claude/claudeMapSessionEvents.ts     | 17 ++++++++-
+ .../node/claude/claudeSdkPipeline.ts          | 36 +------------------
+ .../test/node/claudeMapSessionEvents.test.ts  | 35 ++++++++++++++++++
+ 3 files changed, 52 insertions(+), 36 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts b/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
+index e2a2ef30cc0e7..fbbb7cbfc0e23 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
+@@ -513,6 +513,12 @@ function mapResult(
+ 	return signals;
+ }
+ 
++/**
++ * Prefix of the internal diagnostic the SDK prepends to a result's `errors`,
++ * e.g. `[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null`.
++ */
++const INTERRUPT_DIAGNOSTIC_PREFIX = '[ede_diagnostic]';
++
+ /**
+  * Extracts the error text from an SDK result message for the error subtypes
+  * the proxy can relay. Mirrors the Copilot Chat extension's
+@@ -523,7 +529,16 @@ function getResultErrorText(message: Extract<SDKMessage, { type: 'result' }>): s
+ 		return message.is_error ? message.result : undefined;
+ 	}
+ 	if (message.subtype === 'error_during_execution') {
+-		return message.errors?.join('\n');
++		// The SDK always makes an internal diagnostic the FIRST entry of
++		// `errors` and appends the real errors, if any, after it. On its own it
++		// is not a failure: interrupting a turn produces an
++		// `error_during_execution` result whose `errors` holds nothing else, and
++		// steering interrupts on every steer. Dropping the diagnostic leaves a
++		// genuine error intact (minus a prefix that was never meant for users)
++		// and leaves an interrupted turn with no error text, so no ChatError is
++		// emitted and the turn does not render as failed.
++		const errors = message.errors?.filter(error => !error.startsWith(INTERRUPT_DIAGNOSTIC_PREFIX));
++		return errors?.length ? errors.join('\n') : undefined;
+ 	}
+ 	return undefined;
+ }
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 7d40b22afd663..3fbe6567c827f 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -272,12 +272,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._router = this._register(instantiationService.createInstance(
+ 			ClaudeSdkMessageRouter, chatChannelUri, resource, dbRef, subagents, clientToolOwner,
+ 		));
+-		this._register(this._router.onDidProduceSignal(s => {
+-			if (this._isSteeringPreemptDiagnostic(s)) {
+-				return;
+-			}
+-			this._onDidProduceSignal.fire(s);
+-		}));
++		this._register(this._router.onDidProduceSignal(s => this._onDidProduceSignal.fire(s)));
+ 		// Dispose chain → abort → SDK cleanup. Reads the *current*
+ 		// `_abortController` so a swap aborts the live subprocess.
+ 		this._register(toDisposable(() => this._drainPendingSteeringFlips()));
+@@ -486,35 +481,6 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._logService.info(`[Claude:${this.sessionId}] steering promoted to turn ${turnId} (pendingId=${steering.id})`);
+ 	}
+ 
+-	/**
+-	 * Whether this signal is the SDK reporting the turn a steer interrupted.
+-	 *
+-	 * Interrupting a turn produces a `result` of subtype `error_during_execution`
+-	 * carrying an internal diagnostic rather than a real failure, and the mapper
+-	 * turns any such result into a `ChatError`. Left alone that renders the
+-	 * preempted turn as failed, which is wrong and newly visible here: promoting
+-	 * the steer gives that turn its own bubble to fail in.
+-	 *
+-	 * Scoped to the moment a promotion is pending, using the same condition
+-	 * {@link _promoteSteeringAtHead} promotes on, so an execution error outside a
+-	 * steer still surfaces. One that happens to coincide with a pending steer is
+-	 * traced rather than dropped silently.
+-	 */
+-	private _isSteeringPreemptDiagnostic(signal: AgentSignal): boolean {
+-		if (signal.kind !== 'action' || signal.action.type !== ActionType.ChatError) {
+-			return false;
+-		}
+-		if (signal.action.error?.errorType !== 'error_during_execution') {
+-			return false;
+-		}
+-		const pendingId = this._queue.peekParent()?.steeringPendingId;
+-		if (!pendingId || !this._pendingSteeringFlips.has(pendingId)) {
+-			return false;
+-		}
+-		this._logService.trace(`[Claude:${this.sessionId}] suppressing interrupted-turn diagnostic for the steer at ${pendingId}: ${signal.action.error?.message ?? ''}`);
+-		return true;
+-	}
+-
+ 	/**
+ 	 * Promotes the steer the SDK is about to run, if the entry it just finished was
+ 	 * preempted by one. The SDK does not echo steering, so this result is the
+diff --git a/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts b/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts
+index 229557d89e19a..39138e8e51856 100644
+--- a/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts
+@@ -114,6 +114,41 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
+ 		assert.ok(!error.message.includes(PROXY_ERROR_PREFIX), 'proxy marker should be stripped from the human-readable message');
+ 	});
+ 
++	test('an interrupted turn emits no ChatError (its errors hold only the SDK diagnostic)', () => {
++		const signals = mapSDKMessageToAgentSignals(
++			makeResultError(SESSION_ID, ['[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null']),
++			SESSION,
++			TURN_ID,
++			new ClaudeMapperState(),
++			new NullLogService(),
++			r(),
++			undefined,
++			123,
++		);
++
++		assert.strictEqual(signals.find(s => s.kind === 'action' && s.action.type === ActionType.ChatError), undefined);
++	});
++
++	test('a real execution error still emits a ChatError when the SDK diagnostic precedes it', () => {
++		const signals = mapSDKMessageToAgentSignals(
++			makeResultError(SESSION_ID, [
++				'[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null',
++				'CAPI request failed: 500 Internal Server Error',
++			]),
++			SESSION,
++			TURN_ID,
++			new ClaudeMapperState(),
++			new NullLogService(),
++			r(),
++			undefined,
++			123,
++		);
++
++		const errorSignal = signals.find(s => s.kind === 'action' && s.action.type === ActionType.ChatError);
++		assert.ok(errorSignal && errorSignal.kind === 'action' && errorSignal.action.type === ActionType.ChatError);
++		assert.strictEqual(errorSignal.action.error.message, 'CAPI request failed: 500 Internal Server Error');
++	});
++
+ 	test('successful result is_error with a proxy marker emits a ChatError carrying _meta', () => {
+ 		const marker = encodeForwardedChatError({ fetchError: { type: 'quotaExceeded', capiError: { code: 'quota_exceeded' } } });
+ 		const result = makeResultSuccess(SESSION_ID);
+
+From ce6562fd9ed7c22bd9a72f5f06427f92c3381343 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:57:29 -0400
+Subject: [PATCH 5/6] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ .../agentHost/node/claude/claudeMapSessionEvents.ts      | 9 +--------
+ src/vs/platform/agentHost/test/node/claudeAgent.test.ts  | 6 +-----
+ 2 files changed, 2 insertions(+), 13 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts b/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
+index fbbb7cbfc0e23..d4db64e5ec64f 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
+@@ -529,14 +529,7 @@ function getResultErrorText(message: Extract<SDKMessage, { type: 'result' }>): s
+ 		return message.is_error ? message.result : undefined;
+ 	}
+ 	if (message.subtype === 'error_during_execution') {
+-		// The SDK always makes an internal diagnostic the FIRST entry of
+-		// `errors` and appends the real errors, if any, after it. On its own it
+-		// is not a failure: interrupting a turn produces an
+-		// `error_during_execution` result whose `errors` holds nothing else, and
+-		// steering interrupts on every steer. Dropping the diagnostic leaves a
+-		// genuine error intact (minus a prefix that was never meant for users)
+-		// and leaves an interrupted turn with no error text, so no ChatError is
+-		// emitted and the turn does not render as failed.
++		// The SDK prepends a diagnostic to `errors`; on its own it is not a failure.
+ 		const errors = message.errors?.filter(error => !error.startsWith(INTERRUPT_DIAGNOSTIC_PREFIX));
+ 		return errors?.length ? errors.join('\n') : undefined;
+ 	}
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index febca16f09e57..dacd8e9dbe1da 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7747,11 +7747,7 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 	});
+ 
+ 	test('intermediate result during steering closes the preempted turn and opens the steering turn', async () => {
+-		// CONTEXT.md M10: when the SDK preempts via `'now'`-priority, it
+-		// emits one `result` message per turn it ran (the aborted
+-		// original + the steering reply). The intermediate result ends the
+-		// turn the steer interrupted and starts the steering turn, without
+-		// settling the original sendMessage's deferred.
++		// The intermediate result ends the interrupted turn without settling its deferred.
+ 		const ctx = createTestContext(disposables);
+ 		await ctx.agent.authenticate('https://api.github.com', 'tok');
+ 		await tick();
+
+From b77eb1cae09a4a26292c1664865122270788116f Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 10:08:53 -0400
+Subject: [PATCH 6/6] Mint the promoted steering turn, and end it when the
+ pipeline aborts
+
+Two corrections to the promotion path.
+
+The promoted turn reused the steering `PendingMessage.id` as its `Turn.id`.
+That made one string a pending-message id, an SDK uuid and a protocol turn id
+at once. `ChatTurnStarted.queuedMessageId` already carries the link the client
+needs to clear the pending bubble, so the turn id can be minted fresh, which is
+what the Codex and Copilot paths already do.
+
+The promoted turn also outlived an abort. The client never dispatched this turn
+id, so nothing on its side closes it, and the pipeline did not close it either:
+the chat was left showing a turn that would run forever. Track the promoted
+turn and cancel it when the pipeline aborts or is disposed, clearing it when it
+completes normally.
+
+Also corrects three statements in CONTEXT.md that described promotion as
+happening on an SDK echo of the steering message. The SDK sends no such echo,
+as the same document notes a few lines further down, and the code promotes on
+the intermediate result that ends the preempted turn.
+---
+ .../platform/agentHost/node/claude/CONTEXT.md | 11 +++---
+ .../node/claude/claudeSdkPipeline.ts          | 38 ++++++++++++++++++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 38 ++++++++++++++++++-
+ 3 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/CONTEXT.md b/src/vs/platform/agentHost/node/claude/CONTEXT.md
+index 999775401ed20..766740116903f 100644
+--- a/src/vs/platform/agentHost/node/claude/CONTEXT.md
++++ b/src/vs/platform/agentHost/node/claude/CONTEXT.md
+@@ -1420,7 +1420,7 @@ sees the deltas it can act on.
+ | IAgent surface | SDK primitive(s) | What it does |
+ |---|---|---|
+ | `setPendingMessages?(chat, steeringMessage, queuedMessages)` (optional) | Yield an `SDKUserMessage` with `priority: 'now'` into the prompt iterable that was passed to `query()` ([sdk.d.ts:3067-3086](../../../../../../extensions/copilot/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts#L3067-L3086)) | Notifies the agent that the chat's pending-message state changed. The agent reacts by yielding the steering content as an `SDKUserMessage` whose `priority` is `'now'`, which the SDK treats as "preempt the current turn and run me first." |
+-| (outbound signal) `AgentSignal { kind: 'steering_consumed', session, id }` | n/a (host-emitted) | Fallback for a steering message the SDK accepted but never echoed (abort, dispose). Host dispatches `SessionPendingMessageRemoved` so the client clears the pending pill. On the normal path the echo promotes the message to its own turn and `ChatTurnStarted.queuedMessageId` clears the pill instead. |
++| (outbound signal) `AgentSignal { kind: 'steering_consumed', session, id }` | n/a (host-emitted) | Fallback for a steering message the SDK accepted but never ran (abort, dispose). Host dispatches `SessionPendingMessageRemoved` so the client clears the pending pill. On the normal path the intermediate `result` that ends the preempted turn promotes the message to its own turn, and `ChatTurnStarted.queuedMessageId` clears the pill instead. |
+ 
+ ##### Pending-message taxonomy (locked at the protocol layer)
+ 
+@@ -1570,9 +1570,10 @@ This is the second of the three steering touchpoints on the host:
+ 
+ 1. Client writes `SessionPendingMessageSet { kind: Steering, ... }`.
+ 2. Host forwards the new state to `IAgent.setPendingMessages`.
+-3. On the SDK echo the agent promotes the steer to its own turn, and
++3. On the intermediate `result` that ends the preempted turn, the agent
++   promotes the steer to its own turn, and
+    `ChatTurnStarted.queuedMessageId` clears the pending message.
+-4. Without an echo (abort, dispose) the agent emits `steering_consumed`
++4. If that never arrives (abort, dispose) the agent emits `steering_consumed`
+    and the host dispatches `SessionPendingMessageRemoved { kind: Steering, id }`.
+ 
+ ##### Steering vs `sendMessage` boundary
+@@ -1673,7 +1674,7 @@ otherwise compose with fork at the UI layer.
+ | `truncateSession` | Implemented; serializes through `_sessionSequencer`; protocol→SDK eventId translation | Not implemented (deliberate; SDK has no in-place truncate) |
+ | `setPendingMessages` (steering) | Implemented; injects via Copilot SDK's `send({ mode: 'immediate' })` | Implemented (planned Phase 9); yields `SDKUserMessage` with `priority: 'now'` into the existing prompt iterable |
+ | `setPendingMessages` (queued) | n/a — server consumes server-side | n/a — server consumes server-side |
+-| `IAgentSteeringConsumedSignal` | Emitted on SDK ack | Emitted when the SDK echoes the `'now'`-priority message on the event stream after preempting the in-flight turn |
++| `IAgentSteeringConsumedSignal` | Emitted on SDK ack | Cleanup only: emitted for a steer the SDK accepted but never ran. The normal path promotes the steer to its own turn on the intermediate `result`, which clears the pill via `queuedMessageId` |
+ 
+ The two SDKs land on the **same conceptual primitive** — a
+ per-message hint that means "preempt the current turn and serve
+@@ -1706,7 +1707,7 @@ me first" — via different transports:
+   steering Turn, whose id is the steer's pending-message id. UIs that
+   key off Turn boundaries see the steer as its own row.
+ - **The pending pill clears at model visibility, not queue
+-  acceptance.** On the normal path the SDK echo promotes the steer to
++  acceptance.** On the normal path the intermediate `result` promotes the steer to
+   its own turn and `ChatTurnStarted.queuedMessageId` clears the pill.
+   `steering_consumed` is the cleanup fallback for a steer that is never
+   echoed (abort, dispose, or a turn that ends without it), so the pill
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 3fbe6567c827f..57e8f28a4d41c 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -9,6 +9,7 @@ import { Emitter, Event } from '../../../../base/common/event.js';
+ import { Disposable, IReference, toDisposable } from '../../../../base/common/lifecycle.js';
+ import { StopWatch } from '../../../../base/common/stopwatch.js';
+ import { URI } from '../../../../base/common/uri.js';
++import { generateUuid } from '../../../../base/common/uuid.js';
+ import { IInstantiationService } from '../../../instantiation/common/instantiation.js';
+ import { ILogService } from '../../../log/common/log.js';
+ import { ClaudeRuntimeEffortLevel } from '../../common/claudeModelConfig.js';
+@@ -275,6 +276,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._register(this._router.onDidProduceSignal(s => this._onDidProduceSignal.fire(s)));
+ 		// Dispose chain → abort → SDK cleanup. Reads the *current*
+ 		// `_abortController` so a swap aborts the live subprocess.
++		this._register(toDisposable(() => this._cancelPromotedTurn()));
+ 		this._register(toDisposable(() => this._drainPendingSteeringFlips()));
+ 		this._register(toDisposable(() => this._abortController.abort()));
+ 		this._register(toDisposable(() => {
+@@ -450,6 +452,15 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	/** Steering messages the SDK has accepted but not yet run, keyed by pending-message id. */
+ 	private readonly _pendingSteeringFlips = new Map<string, PendingMessage>();
+ 
++	/**
++	 * The promoted steering turn, while one is open.
++	 *
++	 * The client never dispatched this turn, so its own cancel path does not
++	 * target it. Without this the turn survives an abort and the chat shows it
++	 * running forever.
++	 */
++	private _promotedTurnId: string | undefined;
++
+ 	/**
+ 	 * Promotes a steer to its own turn, completing the one it interrupted.
+ 	 * Mirrors the Copilot agent host so both harnesses surface steering the same way.
+@@ -465,7 +476,8 @@ export class ClaudeSdkPipeline extends Disposable {
+ 				duration: Math.max(0, interrupted.stopWatch.elapsed()),
+ 			},
+ 		});
+-		const turnId = steering.id;
++		// Fresh id: `queuedMessageId` already links the steer to its pending message.
++		const turnId = generateUuid();
+ 		this._onDidProduceSignal.fire({
+ 			kind: 'action',
+ 			resource: this.chatChannelUri,
+@@ -477,6 +489,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 				queuedMessageId: steering.id,
+ 			},
+ 		});
++		this._promotedTurnId = turnId;
+ 		this._queue.retargetTurn(turnId, StopWatch.create(false));
+ 		this._logService.info(`[Claude:${this.sessionId}] steering promoted to turn ${turnId} (pendingId=${steering.id})`);
+ 	}
+@@ -496,6 +509,25 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		this._beginSteeringTurn(steering, completed);
+ 	}
+ 
++	/**
++	 * Ends a promoted steering turn that will never finish.
++	 *
++	 * Only the host can: the client did not mint this turn id, so nothing on
++	 * its side will close it.
++	 */
++	private _cancelPromotedTurn(): void {
++		const turnId = this._promotedTurnId;
++		if (turnId === undefined) {
++			return;
++		}
++		this._promotedTurnId = undefined;
++		this._onDidProduceSignal.fire({
++			kind: 'action',
++			resource: this.chatChannelUri,
++			action: { type: ActionType.ChatTurnCancelled, turnId, duration: 0 },
++		});
++	}
++
+ 	/** Clears steers the SDK accepted but never ran, so no pending bubble is left behind. */
+ 	private _drainPendingSteeringFlips(): void {
+ 		if (this._pendingSteeringFlips.size === 0) {
+@@ -511,6 +543,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	/** Fails every queued entry and clears the steering messages that went with them. */
+ 	private _failQueue(error: Error): void {
+ 		this._queue.failAll(error);
++		this._cancelPromotedTurn();
+ 		this._drainPendingSteeringFlips();
+ 	}
+ 
+@@ -768,6 +801,9 @@ export class ClaudeSdkPipeline extends Disposable {
+ 								duration: Math.max(0, completed.stopWatch.elapsed()),
+ 							},
+ 						});
++						if (this._promotedTurnId === completed.turnId) {
++							this._promotedTurnId = undefined;
++						}
+ 					} else if (completed) {
+ 						this._promoteSteeringAtHead(completed);
+ 					}
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index dacd8e9dbe1da..94abfad9755a7 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7599,17 +7599,51 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 			preemptedTurnCompleted: turnActions.some(a => a.type === ActionType.ChatTurnComplete && a.turnId === 'turn-2'),
+ 			startedMessage: started?.message?.text,
+ 			clearsPendingBubble: started?.queuedMessageId,
+-			startedTurnId: started?.turnId,
++			startedTurnIdIsFresh: Boolean(started?.turnId) && started?.turnId !== 'pending-9',
+ 			finalCompleteTargetsSteeringTurn: turnActions.at(-1)?.type === ActionType.ChatTurnComplete && turnActions.at(-1)?.turnId === started?.turnId,
+ 		}, {
+ 			preemptedTurnCompleted: true,
+ 			startedMessage: 'switch topic',
+ 			clearsPendingBubble: 'pending-9',
+-			startedTurnId: 'pending-9',
++			startedTurnIdIsFresh: true,
+ 			finalCompleteTargetsSteeringTurn: true,
+ 		});
+ 	});
+ 
++	test('aborting after a steer was promoted cancels the promoted turn', async () => {
++		const { ctx, sessionUri, query, advance } = await materialize();
++		const sid = AgentSession.id(sessionUri);
++
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
++
++		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
++		await tick();
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-11', message: { text: 'switch topic', origin: { kind: MessageKind.User } } }, []);
++		await tick();
++		await tick();
++		assert.ok(query.drainedPrompts.some(p => p.priority === 'now'), 'the steer reached the SDK');
++
++		// One result ends the preempted turn, promoting the steer; the abort abandons it.
++		ctx.sdk.nextQueryMessages.push(makeResultSuccess(sid));
++		await tick();
++		await ctx.agent.chats.abort(defaultChatUri(sessionUri), chatContext(defaultChatUri(sessionUri)));
++		advance.complete();
++		await longSend.catch(() => { /* cancelled */ });
++
++		const actions = signals
++			.filter(s => s.kind === 'action')
++			.map(s => (s as { action: { type: string; turnId: string } }).action);
++		const promoted = actions.find(a => a.type === ActionType.ChatTurnStarted && a.turnId !== 'turn-2');
++
++		// The client never dispatched this turn id, so only the host can close it.
++		assert.ok(promoted, 'the steer was promoted to its own turn');
++		assert.ok(
++			actions.some(a => a.type === ActionType.ChatTurnCancelled && a.turnId === promoted.turnId),
++			'the promoted turn is cancelled when the pipeline aborts',
++		);
++	});
++
+ 	test('a steering message the SDK never runs still clears its pending bubble', async () => {
+ 		const { ctx, sessionUri, advance } = await materialize();
+ 

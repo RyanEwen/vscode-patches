@@ -1,0 +1,73 @@
+From 0bd0bfbd9a83fbca86ec667383df997282b4cbaf Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 3 Sep 2026 12:38:43 -0400
+Subject: [PATCH] Report a browser tool failure with an empty message as a
+ failure
+
+`errorResult('')` left `toolResultError` falsy, so `toolResultToProtocol`
+serialized the call as `success: true` while the completed row still read
+"Browser action failed". Both `new Error()` and `throw ''` reach it as an
+empty string, from `playwrightInvoke` and two other call sites.
+
+Fall back to the failure label for the error and the content part, as the
+conversion above already does for `result.error`.
+
+Also corrects the comment on `failedMessage`. These tools do not all declare
+only an `invocationMessage`; the screenshot tool prepares a past-tense one,
+and that prepared label is what survives when a result carries no
+`toolResultMessage`.
+---
+ .../electron-browser/tools/browserToolHelpers.ts     | 12 +++++-------
+ .../tools/browserToolHelpers.test.ts                 |  8 ++++++++
+ 2 files changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+index c8ebc636de1e9..b75785b204bdd 100644
+--- a/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
++++ b/src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts
+@@ -176,11 +176,8 @@ export async function playwrightInvoke<TArgs extends unknown[], TReturn>(
+ /**
+  * Past-tense label for a browser tool call that failed.
+  *
+- * These tools declare only an `invocationMessage`, so on completion the
+- * present-tense label is reused verbatim and a failed call reads as a
+- * successful one ("Capturing browser screenshot"). Naming the failure keeps
+- * the completed state honest, as the agent host already does for client tool
+- * calls and the codex mapper does for its own results.
++ * Without one, a completed call keeps whatever label the tool prepared, so a
++ * failure reads as a success.
+  */
+ const failedMessage = localize('browser.actionFailed', "Browser action failed");
+ 
+@@ -217,9 +214,10 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult,
+ }
+ 
+ export function errorResult(message: string): IToolResult {
++	const error = message || failedMessage;
+ 	return {
+-		content: [{ kind: 'text', value: message }],
+-		toolResultError: message,
++		content: [{ kind: 'text', value: error }],
++		toolResultError: error,
+ 		toolResultMessage: failedMessage,
+ 	};
+ }
+diff --git a/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts b/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts
+index 8247335699752..eaf6a2b83bdb4 100644
+--- a/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts
++++ b/src/vs/workbench/contrib/browserView/test/electron-browser/tools/browserToolHelpers.test.ts
+@@ -44,6 +44,14 @@ suite('browserToolHelpers', () => {
+ 		assert.ok(result.toolResultMessage);
+ 	});
+ 
++	test('errorResult with an empty message still reports a failure', () => {
++		// `throw ''` and `new Error()` both reach here as an empty string.
++		const result = errorResult('');
++
++		assert.ok(result.toolResultError, 'an empty error message is still a failure');
++		assert.ok(result.content.some(part => part.kind === 'text' && part.value), 'the model needs a non-empty reason');
++	});
++
+ 	test('browser context explains active network filtering', () => {
+ 		const editorService = upcastPartial<IEditorService>({
+ 			activeEditor: undefined,

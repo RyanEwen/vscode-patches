@@ -1,0 +1,248 @@
+From 4fffd39ddbedad53d77bf0c38d935131d0ce23fd Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 28 Aug 2026 11:23:34 -0400
+Subject: [PATCH] Resolve agent host file paths against the window's remote
+
+---
+ .../platform/agentHost/common/agentHostUri.ts | 45 ++++++++++++++---
+ .../agentHostFileSystemProvider.test.ts       | 50 ++++++++++++++++++-
+ .../browser/localAgentHostSessionsProvider.ts |  8 +--
+ .../agentHost/agentHostChatContribution.ts    |  8 +--
+ 4 files changed, 96 insertions(+), 15 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostUri.ts b/src/vs/platform/agentHost/common/agentHostUri.ts
+index a0343f26f1897..bf13a8a30421e 100644
+--- a/src/vs/platform/agentHost/common/agentHostUri.ts
++++ b/src/vs/platform/agentHost/common/agentHostUri.ts
+@@ -72,13 +72,16 @@ interface IAgentHostUriMeta {
+ }
+ 
+ /**
+- * Wraps a remote URI into a {@link AGENT_HOST_SCHEME} URI that can be
+- * resolved through the agent host filesystem provider.
++ * Maps a URI on the agent host into one the client can resolve. A remote
++ * window's `file:` URIs rebase onto {@link Schemas.vscodeRemote}; everything
++ * else wraps into a {@link AGENT_HOST_SCHEME} URI resolved through the agent
++ * host filesystem provider.
+  *
+  * @param originalUri The URI on the remote (e.g. `file:///path` or
+  *   `agenthost-content:///sessionId/...`)
+- * @param connectionAuthority The sanitized connection identifier used as
+- *   the URI authority (from {@link agentHostAuthority}).
++ * @param connectionAuthority The connection identifier used as the URI
++ *   authority, from {@link agentHostAuthority} for a remote agent host or
++ *   {@link inWindowAgentHostAuthority} for the in-process one.
+  */
+ export function toAgentHostUri(originalUri: URI, connectionAuthority: string): URI {
+ 	return wrapAgentHostUri(originalUri, connectionAuthority, false);
+@@ -106,8 +109,15 @@ export function toAgentHostContentUri(originalUri: URI, connectionAuthority: str
+ export type AgentHostUriMapper = (uri: URI, options?: { readonly contentRef?: boolean }) => URI;
+ 
+ function wrapAgentHostUri(originalUri: URI, connectionAuthority: string, contentRef: boolean): URI {
+-	if (connectionAuthority === 'local' && originalUri.scheme === Schemas.file) {
+-		return originalUri;
++	if (originalUri.scheme === Schemas.file) {
++		if (connectionAuthority === LOCAL_AGENT_HOST_AUTHORITY) {
++			return originalUri;
++		}
++		// A remote window already reaches these files over its own connection.
++		const windowRemote = windowRemoteAuthorityOf(connectionAuthority);
++		if (windowRemote) {
++			return originalUri.with({ scheme: Schemas.vscodeRemote, authority: windowRemote });
++		}
+ 	}
+ 
+ 	const meta: IAgentHostUriMeta = {
+@@ -227,11 +237,30 @@ export function agentHostAuthority(address: string): string {
+ }
+ 
+ /**
+- * Authority of the in-process agent host. It always runs on the same
+- * machine — and therefore the same operating system — as the client.
++ * Authority of the in-process agent host of a local window, where it shares
++ * the client's filesystem and operating system.
+  */
+ export const LOCAL_AGENT_HOST_AUTHORITY = 'local';
+ 
++/**
++ * Authority of the in-process agent host of a window whose remote authority is
++ * `remoteAuthority`. The authority names whose filesystem the host's paths are
++ * on, which for a remote window is the remote machine rather than the client.
++ */
++export function inWindowAgentHostAuthority(remoteAuthority: string | undefined): string {
++	// Lowercased so the key survives URI serialization.
++	return remoteAuthority ? `${LOCAL_AGENT_HOST_AUTHORITY}+${remoteAuthority.toLowerCase()}` : LOCAL_AGENT_HOST_AUTHORITY;
++}
++
++/**
++ * The window remote authority encoded by {@link inWindowAgentHostAuthority},
++ * or `undefined` for any other connection.
++ */
++export function windowRemoteAuthorityOf(connectionAuthority: string): string | undefined {
++	const prefix = `${LOCAL_AGENT_HOST_AUTHORITY}+`;
++	return connectionAuthority.startsWith(prefix) ? connectionAuthority.slice(prefix.length) : undefined;
++}
++
+ /**
+  * Fallback label formatter for {@link AGENT_HOST_SCHEME} URIs of hosts
+  * whose operating system is unknown. The URI path is already the original
+diff --git a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+index a77b525df53be..68332bf474966 100644
+--- a/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts
+@@ -7,12 +7,13 @@ import assert from 'assert';
+ import { timeout } from '../../../../base/common/async.js';
+ import { VSBuffer } from '../../../../base/common/buffer.js';
+ import { Emitter, Event } from '../../../../base/common/event.js';
++import { Schemas } from '../../../../base/common/network.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+ import { FileChangeType, FilePermission, FileSystemProviderErrorCode, FileType, IFileChange, toFileSystemProviderErrorCode } from '../../../files/common/files.js';
+ import { AgentHostFileSystemProvider, agentHostRemotePath, agentHostUri, type IRemoteFilesystemConnection } from '../../common/agentHostFileSystemProvider.js';
+ import { remoteAgentHostSessionTypeId } from '../../common/agentHostSessionType.js';
+-import { AGENT_HOST_LABEL_FORMATTER, AGENT_HOST_SCHEME, agentHostAuthority, createAgentHostResourceUriMapper, fromAgentHostUri, identityAgentHostResourceUriMapper, isAgentHostContentRefUri, toAgentHostContentUri, toAgentHostUri } from '../../common/agentHostUri.js';
++import { AGENT_HOST_LABEL_FORMATTER, AGENT_HOST_SCHEME, agentHostAuthority, createAgentHostResourceUriMapper, fromAgentHostUri, identityAgentHostResourceUriMapper, isAgentHostContentRefUri, toAgentHostContentUri, toAgentHostUri, inWindowAgentHostAuthority, LOCAL_AGENT_HOST_AUTHORITY, windowRemoteAuthorityOf } from '../../common/agentHostUri.js';
+ import { ContentEncoding, ResourceType, type CreateResourceWatchParams, type ResourceCopyParams, type ResourceListResult, type ResourceMkdirParams, type ResourceReadResult, type ResourceRequestParams, type ResourceRequestResult, type ResourceResolveParams, type ResourceResolveResult } from '../../common/state/protocol/commands.js';
+ import { AhpErrorCodes } from '../../common/state/protocol/errors.js';
+ import { ProtocolError } from '../../common/state/sessionProtocol.js';
+@@ -214,6 +215,53 @@ suite('toAgentHostUri / fromAgentHostUri', () => {
+ 		});
+ 	});
+ 
++	test('a local window uses the local authority, so its paths pass through', () => {
++		const authority = inWindowAgentHostAuthority(undefined);
++		const original = URI.file('/workspace/test.ts');
++		assert.strictEqual(authority, LOCAL_AGENT_HOST_AUTHORITY);
++		assert.strictEqual(toAgentHostUri(original, authority).toString(), original.toString());
++	});
++
++	test('a remote window rebases host paths onto its own remote connection', () => {
++		const authority = inWindowAgentHostAuthority('dev-container+7b22686f7374');
++		const rebased = toAgentHostUri(URI.file('/workspace/test.ts'), authority);
++
++		assert.deepStrictEqual({
++			scheme: rebased.scheme,
++			authority: rebased.authority,
++			path: rebased.path,
++		}, {
++			scheme: Schemas.vscodeRemote,
++			authority: 'dev-container+7b22686f7374',
++			path: '/workspace/test.ts',
++		});
++	});
++
++	test('a remote window still wraps host URIs that are not files', () => {
++		const authority = inWindowAgentHostAuthority('dev-container+7b22686f7374');
++		const original = URI.from({ scheme: 'agenthost-content', authority: 'session1', path: '/snap/before' });
++		const wrapped = toAgentHostUri(original, authority);
++
++		assert.strictEqual(wrapped.scheme, AGENT_HOST_SCHEME);
++		assert.strictEqual(fromAgentHostUri(wrapped).toString(), original.toString());
++	});
++
++	test('a mixed case window authority survives a URI round trip', () => {
++		const authority = inWindowAgentHostAuthority('ssh-remote+MyHost');
++		const wrapped = toAgentHostUri(URI.from({ scheme: 'agenthost-content', path: '/snap/before' }), authority);
++		const reparsed = URI.parse(wrapped.toString());
++
++		// URI serialization lowercases the authority, and the filesystem provider
++		// looks its connections up by exact match.
++		assert.strictEqual(reparsed.authority, authority);
++		assert.strictEqual(windowRemoteAuthorityOf(reparsed.authority), 'ssh-remote+myhost');
++	});
++
++	test('a remote agent host is unaffected by the local encoding', () => {
++		assert.strictEqual(windowRemoteAuthorityOf('my-server'), undefined);
++		assert.strictEqual(toAgentHostUri(URI.file('/w/a.ts'), 'my-server').scheme, AGENT_HOST_SCHEME);
++	});
++
+ 	test('agentHostUri for root path produces valid encoded URI', () => {
+ 		const authority = agentHostAuthority('localhost:8089');
+ 		const uri = agentHostUri(authority, '/');
+diff --git a/src/vs/sessions/contrib/providers/agentHost/browser/localAgentHostSessionsProvider.ts b/src/vs/sessions/contrib/providers/agentHost/browser/localAgentHostSessionsProvider.ts
+index bfaa520cf7bee..d57d6e19833bc 100644
+--- a/src/vs/sessions/contrib/providers/agentHost/browser/localAgentHostSessionsProvider.ts
++++ b/src/vs/sessions/contrib/providers/agentHost/browser/localAgentHostSessionsProvider.ts
+@@ -16,7 +16,7 @@ import { basename, dirname, isEqualOrParent, relativePath } from '../../../../..
+ import { ThemeIcon } from '../../../../../base/common/themables.js';
+ import { URI } from '../../../../../base/common/uri.js';
+ import { localize } from '../../../../../nls.js';
+-import { type AgentHostUriMapper, LOCAL_AGENT_HOST_AUTHORITY, toAgentHostContentUri, toAgentHostUri } from '../../../../../platform/agentHost/common/agentHostUri.js';
++import { type AgentHostUriMapper, inWindowAgentHostAuthority, toAgentHostContentUri, toAgentHostUri } from '../../../../../platform/agentHost/common/agentHostUri.js';
+ import { type IAgentSessionMetadata } from '../../../../../platform/agentHost/common/agent.js';
+ import { affectsAgentHostProviderPreference, IAgentConnection, IAgentHostService, shouldSurfaceLocalAgentHostProvider } from '../../../../../platform/agentHost/common/agentService.js';
+ import type { AgentCustomization, ISessionGitState } from '../../../../../platform/agentHost/common/state/sessionState.js';
+@@ -115,6 +115,7 @@ export class LocalAgentHostSessionsProvider extends BaseAgentHostSessionsProvide
+ 
+ 	/** `true` when running in the dedicated Agents window vs. a regular editor window. */
+ 	private readonly _isSessionsWindow: boolean;
++	private readonly _connectionAuthority: string;
+ 	private _automationSessionResources = new ResourceSet();
+ 	private readonly _devContainerAvailableDrafts = new Set<string>();
+ 	private readonly _devContainerDrafts = new Set<string>();
+@@ -184,6 +185,7 @@ export class LocalAgentHostSessionsProvider extends BaseAgentHostSessionsProvide
+ 		this.automations = automations;
+ 
+ 		this._isSessionsWindow = environmentService.isSessionsWindow;
++		this._connectionAuthority = inWindowAgentHostAuthority(environmentService.remoteAuthority);
+ 
+ 		this.label = localize('localAgentHostLabel', "Local Agent Host");
+ 
+@@ -483,8 +485,8 @@ export class LocalAgentHostSessionsProvider extends BaseAgentHostSessionsProvide
+ 
+ 	protected override _diffUriMapper(): AgentHostUriMapper {
+ 		return (uri, options) => options?.contentRef
+-			? toAgentHostContentUri(uri, LOCAL_AGENT_HOST_AUTHORITY)
+-			: toAgentHostUri(uri, LOCAL_AGENT_HOST_AUTHORITY);
++			? toAgentHostContentUri(uri, this._connectionAuthority)
++			: toAgentHostUri(uri, this._connectionAuthority);
+ 	}
+ 
+ 	// -- Workspaces ----------------------------------------------------------
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts
+index aa033e9625b11..4ad6d08ceed3e 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostChatContribution.ts
+@@ -13,7 +13,7 @@ import { ThemeIcon } from '../../../../../../base/common/themables.js';
+ import { localize } from '../../../../../../nls.js';
+ import { affectsAgentHostProviderPreference, IAgentHostService, protectedResourcesRequireGitHubCopilotSignIn, shouldSurfaceLocalAgentHostProvider, type AgentProvider } from '../../../../../../platform/agentHost/common/agentService.js';
+ import { IAgentHostEnablementService } from '../../../../../../platform/agentHost/common/agentHostEnablementService.js';
+-import { LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost/common/agentHostUri.js';
++import { inWindowAgentHostAuthority } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+ import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
+ import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
+ import { type AgentInfo, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+@@ -122,6 +122,7 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
+ 
+ 	private readonly _isSessionsWindow: boolean;
+ 	private readonly _enableSmokeTestDriver: boolean;
++	private readonly _connectionAuthority: string;
+ 	private _initialized = false;
+ 	private readonly _enablementStore = this._register(new MutableDisposable<DisposableStore>());
+ 	private _authenticationGeneration = 0;
+@@ -147,6 +148,7 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
+ 		super();
+ 		this._isSessionsWindow = environmentService.isSessionsWindow;
+ 		this._enableSmokeTestDriver = !!environmentService.enableSmokeTestDriver;
++		this._connectionAuthority = inWindowAgentHostAuthority(environmentService.remoteAuthority);
+ 
+ 		this._register(autorun(reader => {
+ 			const enabled = this._agentHostEnablementService.enabled.read(reader);
+@@ -176,7 +178,7 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
+ 		}
+ 		this._initialized = true;
+ 		this._promptCacheNotification = this._register(this._instantiationService.createInstance(AgentHostPromptCacheNotification));
+-		this._register(this._agentHostFileSystemService.registerAuthority(LOCAL_AGENT_HOST_AUTHORITY, this._agentHostService));
++		this._register(this._agentHostFileSystemService.registerAuthority(this._connectionAuthority, this._agentHostService));
+ 
+ 		// React to root state changes (agent discovery / removal)
+ 		this._register(this._agentHostService.rootState.onDidChange(rootState => {
+@@ -340,7 +342,7 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
+ 			fullName: agent.displayName,
+ 			description: agent.description,
+ 			connection: this._agentHostService,
+-			connectionAuthority: LOCAL_AGENT_HOST_AUTHORITY,
++			connectionAuthority: this._connectionAuthority,
+ 			onSessionMaterialized: resource => this._chatSessionsService.notifySessionMaterialized?.(resource),
+ 			resolveAuthentication: (resources) => this._resolveAuthenticationInteractively(resources),
+ 			promptCacheNotification: this._promptCacheNotification,

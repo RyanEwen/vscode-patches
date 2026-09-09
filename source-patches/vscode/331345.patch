@@ -1,0 +1,542 @@
+From efc734ecb69faaabda50ff721d0dcc0494d8e255 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 17:30:16 -0400
+Subject: [PATCH 1/4] Count the session's changes, not the branch's divergence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The session-list chip was computed from the branch changeset in two places.
+A branch measures itself against its upstream, so it includes commits made
+before the session existed and by other people; a session that never ran a
+turn still got a count.
+
+Ownership moves to the session changeset on the write path, and the read
+path's branch-derived fallback — which also persisted what it derived,
+making the wrong number durable — is removed. With no session-scoped
+evidence the chip is absent, and the next completed turn writes the real one.
+
+Fixing either half alone is inert: the write path persists the branch number
+and the read path then serves it faithfully from the stored summary.
+
+Session diffs come from checkpoints, so a session without them now shows no
+chip rather than a wrong one.
+---
+ .../node/agentHostChangesetService.ts         | 118 +++++-------------
+ .../node/agentHostChangesetService.test.ts    |  39 ++++--
+ 2 files changed, 65 insertions(+), 92 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/agentHostChangesetService.ts b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+index a2ee98b7b65d2..15c0f34411afe 100644
+--- a/src/vs/platform/agentHost/node/agentHostChangesetService.ts
++++ b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+@@ -105,43 +105,6 @@ function summariseDiffs(diffs: readonly ISessionFileDiff[] | undefined): Changes
+ 	return { additions, deletions, files: diffs.length };
+ }
+ 
+-/**
+- * Derives the `summary.changes` aggregate for an unopened session from
+- * the ready live {@link ChangesetState} of the catalogue entry whose
+- * `changeKind === 'session'` — typically because a previous
+- * `restoreStaticChangeset` warmed the cache before the session itself
+- * was attached.
+- *
+- * Returns `undefined` when no live session-wide state is ready, so
+- * `listSessions` leaves the `changes` field unset for sessions without
+- * usable counts — preserving the long-standing contract that unopened
+- * sessions without live or persisted data advertise no aggregate.
+- *
+- * Only the `changeKind: 'session'` entry feeds the summary; other kinds
+- * (`'uncommitted'`, `'turn'`, `'compare-turns'`) describe slices, not
+- * the session-level footprint. The static catalogue itself (built by
+- * {@link buildDefaultChangesetCatalog}) is independent of counts and
+- * is seeded once at session creation.
+- */
+-function computeChangesSummaryFromLiveState(
+-	session: ChangesetState | undefined,
+-): ChangesSummary | undefined {
+-	const sessionDiffs = session?.status === ChangesetStatus.Ready ? session.files.map(f => f.edit) : undefined;
+-	return summariseDiffs(sessionDiffs);
+-}
+-
+-/**
+- * Derives the `summary.changes` aggregate for an unopened session from
+- * parsed persisted diffs for the `changeKind: 'session'` catalogue
+- * entry. Returns `undefined` when the session-wide blob is absent so
+- * malformed metadata leaves `summary.changes` unset.
+- */
+-function computeChangesSummaryFromPersistedDiffs(
+-	sessionDiffs: readonly ISessionFileDiff[] | undefined,
+-): ChangesSummary | undefined {
+-	return summariseDiffs(sessionDiffs);
+-}
+-
+ /**
+  * Parses a JSON-serialised {@link ISessionFileDiff}[] blob from session
+  * metadata. Returns `undefined` for missing or malformed input, logging a
+@@ -322,36 +285,17 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 			}
+ 		}
+ 
+-		// Read live state for an unopened session: synthesise the aggregate
+-		// from the live `changeKind: 'branch'` changeset state. Counts stay
+-		// in lockstep with the actual changeset state for the session-list chip.
+-		const liveSession = this._stateManager.getChangesetState(buildBranchChangesetUri(sessionUri));
+-		const liveChanges = computeChangesSummaryFromLiveState(liveSession);
+-		if (liveChanges) {
+-			// Migrate the changes summary to the new storage mechanism.
+-			this.persistChangesSummary(sessionUri, liveChanges);
+-			return liveChanges;
+-		}
+-
+-		// No live source — try persisted blobs (if the caller batched them).
+-		const branchRaw = metadata[META_CHANGESET_BRANCH];
+-		const legacyRaw = metadata[META_LEGACY_DIFFS];
+-		if (branchRaw === undefined && legacyRaw === undefined) {
+-			return undefined;
+-		}
+-		const restored = this.parsePersistedStaticChangesets(sessionUri, { branchRaw, legacyRaw });
+-
+-		// `listSessions` must not seed full changeset state for every row; it
+-		// only parses persisted blobs enough to render the chip aggregate.
+-		// Once the session is opened via `restoreSession`, the live overlay in
+-		// `AgentService.listSessions` replaces this parse-only aggregate.
+-		const persistedChanges = computeChangesSummaryFromPersistedDiffs(restored.branch);
+-		if (persistedChanges) {
+-			// Migrate the changes summary to the new storage mechanism.
+-			this.persistChangesSummary(sessionUri, persistedChanges);
+-			return persistedChanges;
+-		}
+-
++		// Nothing session-scoped is available. The `changeKind: 'branch'`
++		// changeset is not a substitute: it measures the branch against its
++		// upstream, which includes every commit made before the session existed
++		// and by anyone else. Deriving the chip from it labels that divergence
++		// as the session's own work — a session that has never run a turn, and
++		// owns no file edits at all, still gets a count — and persisting it
++		// makes the wrong number durable.
++		//
++		// A row with no chip is the honest rendering of "no session-scoped
++		// evidence yet". The next completed turn writes `META_CHANGES_SUMMARY`
++		// and the chip appears with the session's real counts.
+ 		return undefined;
+ 	}
+ 
+@@ -1317,30 +1261,34 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 				// during the rollout window.
+ 				this._persistSessionFlag(session, META_LEGACY_DIFFS, JSON.stringify(diffs));
+ 
+-				// Own the `summary.changes` aggregate by session shape:
+-				//
+-				// - SINGLE-folder: derive it from the primary branch `diffs`,
+-				//   exactly as before — that branch changeset IS the whole
+-				//   session footprint. The session-list chip and the
+-				//   inactive-session aggregate (`computeListEntryChanges`) read the
+-				//   branch changeset, as does the active session view, so sourcing
+-				//   the persisted summary from the same place keeps the count stable
+-				//   across the active <-> inactive transition.
+-				// - MULTI-folder: the primary-only `diffs` under-count the session,
+-				//   so do NOT write the summary here. Recompute the ALL-FOLDER
+-				//   aggregate independently from every repository's branch diff so a
+-				//   subsequent branch recompute keeps the all-folder count instead of
+-				//   clobbering it back to the primary folder's. The branch CHANGESET
+-				//   state is still published from the primary `diffs` above (data
+-				//   unchanged); only the summary ownership moves.
++				// MULTI-folder: the primary-only `diffs` under-count the session,
++				// so recompute the ALL-FOLDER aggregate independently from every
++				// repository so a subsequent branch recompute keeps the all-folder
++				// count instead of clobbering it back to the primary folder's. The
++				// branch CHANGESET state is still published from the primary
++				// `diffs` above (data unchanged); only the summary ownership moves.
+ 				const workingDirectories = this._configurationService.getEffectiveWorkingDirectories(session);
+ 				if (isMultiRootSession(workingDirectories)) {
+ 					// Reuse the primary branch `diffs` just computed above so the
+ 					// summary doesn't re-diff the primary repo (perf: one fewer git
+ 					// diff per branch recompute).
+ 					await this._updateMultiFolderChangesSummary(session, ref.object, workingDirectories!, diffs);
+-				} else {
+-					const changesSummary = summariseDiffs(diffs) ?? { additions: 0, deletions: 0, files: 0 };
++				}
++			}
++
++			// SINGLE-folder: the chip counts the session's own work, so it comes
++			// from the session changeset. The branch changeset answers a
++			// different question — how far the branch has diverged from its
++			// upstream — which includes commits made before the session existed
++			// and by other people; sourcing the chip from it labels all of that
++			// as this session's changes.
++			if (kind === ChangesetKind.Session) {
++				const workingDirectories = this._configurationService.getEffectiveWorkingDirectories(session);
++				// `summariseDiffs` separates "computed, and empty" (a zero chip,
++				// which is a real answer) from "could not compute" (`undefined`),
++				// which must leave the chip unset rather than claim zero.
++				const changesSummary = summariseDiffs(diffs);
++				if (!isMultiRootSession(workingDirectories) && changesSummary) {
+ 					this.persistChangesSummary(session, changesSummary);
+ 					this._stateManager.setSessionSummaryChanges(session, changesSummary);
+ 				}
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+index 5cf5dd3f399f9..8a4d3c588a925 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+@@ -1943,6 +1943,25 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 			assert.deepStrictEqual(JSON.parse((await db.getMetadata(META_CHANGES_SUMMARY))!), { additions: 8, deletions: 3, files: 2 }, 'persisted all-folder summary is not clobbered');
+ 		});
+ 
++		test('a session with no summary of its own advertises no chip, rather than the branch divergence', async () => {
++			const git = createNoopGitService();
++			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
++			// The branch is far from its upstream — commits made before this
++			// session existed, and by other people. None of it is this session's.
++			git.computeSessionFileDiffs = async () => [gitDiff('/repoA/history.ts', 16070, 634)];
++			const db = new TestSessionDatabase();
++			const { svc, stateManager } = build({ workingDirectories: ['file:///repoA'], git, checkpoint: NULL_CHECKPOINT_SERVICE, db });
++
++			svc.refreshBranchChangeset(sessionStr);
++			await waitForCount(() => stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status === ChangesetStatus.Ready ? 1 : 0, 1);
++			stateManager.removeSession(sessionStr);
++
++			const overlay = svc.computeListEntryChanges(sessionStr, {});
++
++			assert.strictEqual(overlay, undefined, 'no session-scoped evidence must render no chip');
++			assert.strictEqual(await db.getMetadata(META_CHANGES_SUMMARY), undefined, 'the branch divergence must not be persisted as the session summary');
++		});
++
+ 		test('multi-folder branch changeset DATA stays primary-only (AC-8 data fence)', async () => {
+ 			const git = createNoopGitService();
+ 			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
+@@ -1965,22 +1984,28 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 			assert.deepStrictEqual(branch?.files.map(f => f.id), [URI.file('/repoA/a.ts').toString()], 'branch changeset data stays primary-only in a multi-root session');
+ 		});
+ 
+-		test('single-folder summary stays branch-derived (characterization: byte-for-byte unchanged)', async () => {
++		test('a branch refresh no longer writes the chip from the branch divergence', async () => {
+ 			const git = createNoopGitService();
+ 			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
+-			git.computeSessionFileDiffs = async () => [gitDiff('/wd/only.ts', 4, 2)];
++			// The branch has diverged far from its upstream — commits made before
++			// this session existed, and by other people. None of it is the
++			// session's own work, so none of it belongs in the session's chip.
++			git.computeSessionFileDiffs = async () => [gitDiff('/wd/history.ts', 16070, 634)];
+ 			const db = new TestSessionDatabase();
+ 			const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git, checkpoint: NULL_CHECKPOINT_SERVICE, db });
+ 
+ 			svc.refreshBranchChangeset(sessionStr);
+-			const changes = await waitForSummaryChanges(stateManager);
++			await waitForCount(() => stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status === ChangesetStatus.Ready ? 1 : 0, 1);
+ 
+-			// The single primary branch diff IS the whole session footprint, exactly as today.
+-			assert.deepStrictEqual(changes, { additions: 4, deletions: 2, files: 1 });
++			// The branch changeset itself is still published — only its ownership
++			// of the chip is withdrawn.
+ 			assert.deepStrictEqual(
+-				JSON.parse((await db.getMetadata(META_CHANGES_SUMMARY))!),
+-				{ additions: 4, deletions: 2, files: 1 },
++				stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.files.map(f => f.id),
++				[URI.file('/wd/history.ts').toString()],
++				'branch changeset data is unaffected',
+ 			);
++			assert.strictEqual(stateManager.getSessionSummary(sessionStr)?.changes, undefined, 'a branch refresh must not write the chip');
++			assert.strictEqual(await db.getMetadata(META_CHANGES_SUMMARY), undefined, 'the branch divergence must not be persisted as the chip');
+ 		});
+ 
+ 		test('a repository whose branch diff throws is skipped and logged, without failing the aggregate', async () => {
+
+From 642ba9828f14f541fe312b0fc3548245cd2543e8 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 19:53:56 -0400
+Subject: [PATCH 2/4] Assert the state the test waited for
+
+Review feedback: waitForCount returns on timeout, so a wait that never
+succeeded would surface later as a less actionable failure.
+---
+ .../agentHost/test/node/agentHostChangesetService.test.ts  | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+index 8a4d3c588a925..b89320f895884 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+@@ -1996,6 +1996,13 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 
+ 			svc.refreshBranchChangeset(sessionStr);
+ 			await waitForCount(() => stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status === ChangesetStatus.Ready ? 1 : 0, 1);
++			// `waitForCount` gives up silently, so assert what it was waiting for
++			// rather than letting a timeout surface as a confusing later failure.
++			assert.strictEqual(
++				stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status,
++				ChangesetStatus.Ready,
++				'branch changeset did not become ready',
++			);
+ 
+ 			// The branch changeset itself is still published — only its ownership
+ 			// of the chip is withdrawn.
+
+From bad496d34f054d43c4d02613e11b691d90f4f023 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 13:22:41 -0400
+Subject: [PATCH 3/4] Keep branch divergence out of the legacy session key, and
+ fix the build
+
+Review raised that this change stops the chip being derived from branch
+divergence, yet the branch refresh still mirrors its diffs into the legacy
+`'diffs'` key. That key is documented as the session-wide list and, more to
+the point, `parsePersistedStaticChangesets` parses it as the SESSION
+changeset and seeds it into session state. So branch-vs-upstream diffs
+written there came back on restore as the session's own work: the same
+mislabelling this PR removes from the chip, arriving by a different route.
+
+The mirror now happens on the session path, where the payload matches what
+the key means and what reads it. Its comment already claimed to write "the
+session-changeset payload"; it was simply on the wrong branch of the
+conditional.
+
+Also drops the `ChangesetState` type import, which this PR left unused when
+it deleted `computeChangesSummaryFromLiveState`. It failed `noUnusedLocals`,
+so the branch did not compile.
+---
+ .../node/agentHostChangesetService.ts         | 16 +++++----
+ .../node/agentHostChangesetService.test.ts    | 36 ++++++++++++++++++-
+ 2 files changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/agentHostChangesetService.ts b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+index 15c0f34411afe..914d1c6090efe 100644
+--- a/src/vs/platform/agentHost/node/agentHostChangesetService.ts
++++ b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+@@ -21,7 +21,7 @@ import {
+ } from '../common/changesetUri.js';
+ import { IDiffComputeService } from '../common/diffComputeService.js';
+ import { ISessionDatabase, ISessionDataService } from '../common/sessionDataService.js';
+-import type { ChangesetState, ChangesSummary } from '../common/state/protocol/state.js';
++import type { ChangesSummary } from '../common/state/protocol/state.js';
+ import { ActionType } from '../common/state/sessionActions.js';
+ import {
+ 	ChangesetStatus,
+@@ -1256,11 +1256,6 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 			this._persistSessionFlag(session, persistKeyFor(kind), JSON.stringify(diffs));
+ 
+ 			if (kind === ChangesetKind.Branch) {
+-				// Migration: also overwrite the legacy `'diffs'` key with the
+-				// session-changeset payload so older readers stay correct
+-				// during the rollout window.
+-				this._persistSessionFlag(session, META_LEGACY_DIFFS, JSON.stringify(diffs));
+-
+ 				// MULTI-folder: the primary-only `diffs` under-count the session,
+ 				// so recompute the ALL-FOLDER aggregate independently from every
+ 				// repository so a subsequent branch recompute keeps the all-folder
+@@ -1283,6 +1278,15 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 			// and by other people; sourcing the chip from it labels all of that
+ 			// as this session's changes.
+ 			if (kind === ChangesetKind.Session) {
++				// Migration: mirror the session payload into the legacy `'diffs'`
++				// key so older readers stay correct during the rollout window.
++				// It belongs here and not on the branch path:
++				// `parsePersistedStaticChangesets` reads this key as the SESSION
++				// changeset and seeds it into session state, so branch diffs written
++				// here come back on restore as the session's own work, which is the
++				// very mislabelling this change removes from the chip.
++				this._persistSessionFlag(session, META_LEGACY_DIFFS, JSON.stringify(diffs));
++
+ 				const workingDirectories = this._configurationService.getEffectiveWorkingDirectories(session);
+ 				// `summariseDiffs` separates "computed, and empty" (a zero chip,
+ 				// which is a real answer) from "could not compute" (`undefined`),
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+index b89320f895884..8857df8cefabd 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+@@ -19,7 +19,7 @@ import { ActionEnvelope, ActionType } from '../../common/state/sessionActions.js
+ import { ChangesetStatus, FileEditKind, MessageKind, SessionStatus, withSessionGitState, type Changeset, type ISessionFileDiff } from '../../common/state/sessionState.js';
+ import { AgentHostChangesetService } from '../../node/agentHostChangesetService.js';
+ import { NullAgentHostWorktreeIsolation } from '../../node/shared/worktreeIsolation.js';
+-import { META_CHANGES_SUMMARY } from '../../common/agentHostChangesetService.js';
++import { META_CHANGES_SUMMARY, META_CHANGESET_BRANCH, META_LEGACY_DIFFS } from '../../common/agentHostChangesetService.js';
+ import type { ChangesSummary } from '../../common/state/protocol/state.js';
+ import { IAgentHostChangesetSubscriptionService } from '../../common/agentHostChangesetSubscriptionService.js';
+ import { IAgentHostChangesetOperationService } from '../../common/agentHostChangesetOperationService.js';
+@@ -2015,6 +2015,40 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 			assert.strictEqual(await db.getMetadata(META_CHANGES_SUMMARY), undefined, 'the branch divergence must not be persisted as the chip');
+ 		});
+ 
++		test('a branch refresh does not persist the legacy session key', async () => {
++			const git = createNoopGitService();
++			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
++			git.computeSessionFileDiffs = async () => [gitDiff('/wd/history.ts', 16070, 634)];
++			const db = new TestSessionDatabase();
++			const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git, checkpoint: NULL_CHECKPOINT_SERVICE, db });
++
++			svc.refreshBranchChangeset(sessionStr);
++			await waitForCount(() => stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status === ChangesetStatus.Ready ? 1 : 0, 1);
++			assert.strictEqual(
++				stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status,
++				ChangesetStatus.Ready,
++				'branch changeset did not become ready',
++			);
++
++			// Precondition: the branch payload does land under its own key, so the
++			// assertion below cannot pass merely because nothing was persisted.
++			let branchRaw: string | undefined;
++			for (let i = 0; i < 200 && !branchRaw; i++) {
++				await timeout(2);
++				branchRaw = await db.getMetadata(META_CHANGESET_BRANCH);
++			}
++			assert.ok(branchRaw, 'expected the branch refresh to persist its own key');
++
++			// `parsePersistedStaticChangesets` reads the legacy key as the SESSION
++			// changeset and seeds it into session state, so branch-vs-upstream diffs
++			// mirrored here return on restore as the session's own work.
++			assert.strictEqual(
++				await db.getMetadata(META_LEGACY_DIFFS),
++				undefined,
++				'branch divergence must not be persisted where it is restored as session-owned work',
++			);
++		});
++
+ 		test('a repository whose branch diff throws is skipped and logged, without failing the aggregate', async () => {
+ 			const log = new RecordingLogService();
+ 			const git = createNoopGitService();
+
+From a0a685b004d219a4eb98be7993c4810b360febb8 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:50:14 -0400
+Subject: [PATCH 4/4] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline, and several of these ran to six, seven and eleven lines. The
+reasoning belongs in the commit message and the pull request, which is
+where it already is.
+---
+ .../node/agentHostChangesetService.ts         | 38 +++----------------
+ .../node/agentHostChangesetService.test.ts    | 20 +++-------
+ 2 files changed, 11 insertions(+), 47 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/agentHostChangesetService.ts b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+index 914d1c6090efe..4b98b587edaca 100644
+--- a/src/vs/platform/agentHost/node/agentHostChangesetService.ts
++++ b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+@@ -285,17 +285,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 			}
+ 		}
+ 
+-		// Nothing session-scoped is available. The `changeKind: 'branch'`
+-		// changeset is not a substitute: it measures the branch against its
+-		// upstream, which includes every commit made before the session existed
+-		// and by anyone else. Deriving the chip from it labels that divergence
+-		// as the session's own work — a session that has never run a turn, and
+-		// owns no file edits at all, still gets a count — and persisting it
+-		// makes the wrong number durable.
+-		//
+-		// A row with no chip is the honest rendering of "no session-scoped
+-		// evidence yet". The next completed turn writes `META_CHANGES_SUMMARY`
+-		// and the chip appears with the session's real counts.
++		// The branch changeset measures divergence from upstream, not this session's work.
+ 		return undefined;
+ 	}
+ 
+@@ -1256,12 +1246,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 			this._persistSessionFlag(session, persistKeyFor(kind), JSON.stringify(diffs));
+ 
+ 			if (kind === ChangesetKind.Branch) {
+-				// MULTI-folder: the primary-only `diffs` under-count the session,
+-				// so recompute the ALL-FOLDER aggregate independently from every
+-				// repository so a subsequent branch recompute keeps the all-folder
+-				// count instead of clobbering it back to the primary folder's. The
+-				// branch CHANGESET state is still published from the primary
+-				// `diffs` above (data unchanged); only the summary ownership moves.
++				// Recompute the all-folder aggregate so a later branch recompute cannot clobber it to primary-only.
+ 				const workingDirectories = this._configurationService.getEffectiveWorkingDirectories(session);
+ 				if (isMultiRootSession(workingDirectories)) {
+ 					// Reuse the primary branch `diffs` just computed above so the
+@@ -1271,26 +1256,13 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 				}
+ 			}
+ 
+-			// SINGLE-folder: the chip counts the session's own work, so it comes
+-			// from the session changeset. The branch changeset answers a
+-			// different question — how far the branch has diverged from its
+-			// upstream — which includes commits made before the session existed
+-			// and by other people; sourcing the chip from it labels all of that
+-			// as this session's changes.
++			// The chip counts the session's own work, so it comes from the session changeset.
+ 			if (kind === ChangesetKind.Session) {
+-				// Migration: mirror the session payload into the legacy `'diffs'`
+-				// key so older readers stay correct during the rollout window.
+-				// It belongs here and not on the branch path:
+-				// `parsePersistedStaticChangesets` reads this key as the SESSION
+-				// changeset and seeds it into session state, so branch diffs written
+-				// here come back on restore as the session's own work, which is the
+-				// very mislabelling this change removes from the chip.
++				// Older readers parse this key as the session changeset, so only the session payload belongs here.
+ 				this._persistSessionFlag(session, META_LEGACY_DIFFS, JSON.stringify(diffs));
+ 
+ 				const workingDirectories = this._configurationService.getEffectiveWorkingDirectories(session);
+-				// `summariseDiffs` separates "computed, and empty" (a zero chip,
+-				// which is a real answer) from "could not compute" (`undefined`),
+-				// which must leave the chip unset rather than claim zero.
++				// `undefined` means "could not compute", which must leave the chip unset rather than claim zero.
+ 				const changesSummary = summariseDiffs(diffs);
+ 				if (!isMultiRootSession(workingDirectories) && changesSummary) {
+ 					this.persistChangesSummary(session, changesSummary);
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+index 8857df8cefabd..c6474ecedce70 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+@@ -1946,8 +1946,7 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 		test('a session with no summary of its own advertises no chip, rather than the branch divergence', async () => {
+ 			const git = createNoopGitService();
+ 			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
+-			// The branch is far from its upstream — commits made before this
+-			// session existed, and by other people. None of it is this session's.
++			// Divergence from upstream: commits from before this session, and by other people.
+ 			git.computeSessionFileDiffs = async () => [gitDiff('/repoA/history.ts', 16070, 634)];
+ 			const db = new TestSessionDatabase();
+ 			const { svc, stateManager } = build({ workingDirectories: ['file:///repoA'], git, checkpoint: NULL_CHECKPOINT_SERVICE, db });
+@@ -1987,25 +1986,21 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 		test('a branch refresh no longer writes the chip from the branch divergence', async () => {
+ 			const git = createNoopGitService();
+ 			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
+-			// The branch has diverged far from its upstream — commits made before
+-			// this session existed, and by other people. None of it is the
+-			// session's own work, so none of it belongs in the session's chip.
++			// Divergence from upstream: commits from before this session, and by other people.
+ 			git.computeSessionFileDiffs = async () => [gitDiff('/wd/history.ts', 16070, 634)];
+ 			const db = new TestSessionDatabase();
+ 			const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git, checkpoint: NULL_CHECKPOINT_SERVICE, db });
+ 
+ 			svc.refreshBranchChangeset(sessionStr);
+ 			await waitForCount(() => stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status === ChangesetStatus.Ready ? 1 : 0, 1);
+-			// `waitForCount` gives up silently, so assert what it was waiting for
+-			// rather than letting a timeout surface as a confusing later failure.
++			// `waitForCount` gives up silently, so assert what it was waiting for.
+ 			assert.strictEqual(
+ 				stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.status,
+ 				ChangesetStatus.Ready,
+ 				'branch changeset did not become ready',
+ 			);
+ 
+-			// The branch changeset itself is still published — only its ownership
+-			// of the chip is withdrawn.
++			// The branch changeset is still published; only its ownership of the chip is withdrawn.
+ 			assert.deepStrictEqual(
+ 				stateManager.getChangesetState(buildBranchChangesetUri(sessionStr))?.files.map(f => f.id),
+ 				[URI.file('/wd/history.ts').toString()],
+@@ -2030,8 +2025,7 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 				'branch changeset did not become ready',
+ 			);
+ 
+-			// Precondition: the branch payload does land under its own key, so the
+-			// assertion below cannot pass merely because nothing was persisted.
++			// Precondition: otherwise the assertion below passes on an empty database.
+ 			let branchRaw: string | undefined;
+ 			for (let i = 0; i < 200 && !branchRaw; i++) {
+ 				await timeout(2);
+@@ -2039,9 +2033,7 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 			}
+ 			assert.ok(branchRaw, 'expected the branch refresh to persist its own key');
+ 
+-			// `parsePersistedStaticChangesets` reads the legacy key as the SESSION
+-			// changeset and seeds it into session state, so branch-vs-upstream diffs
+-			// mirrored here return on restore as the session's own work.
++			// The legacy key is parsed as the SESSION changeset and seeded into session state.
+ 			assert.strictEqual(
+ 				await db.getMetadata(META_LEGACY_DIFFS),
+ 				undefined,

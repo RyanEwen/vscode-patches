@@ -1,0 +1,454 @@
+From 1693c62d581870be197cf9937cabdabbb7043ada Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 11:03:21 -0400
+Subject: [PATCH] agentHost: keep tool attribution across a steering preempt
+
+A steering message is injected with priority 'now', which makes the SDK
+emit a result envelope for the preempted turn even though the protocol
+turn is still running. The mapper cleared the tool_use attribution map
+and drained foreground subagent spawns on every result envelope, so a
+tool call still in flight when the steer landed lost its attribution:
+its later tool_result hit the unknown tool_use_id path, no
+ChatToolCallComplete was emitted, and the tool stayed Running forever.
+A foreground subagent spawn vanished the same way, so subagent_started
+was never announced and its inner signals stayed buffered.
+
+The pipeline already decides whether a result is final (queue drained)
+or intermediate, and already defers ChatTurnComplete to that decision.
+This moves the turn-end cleanup to the same place rather than passing
+the decision into the mapper: mapResult no longer touches the mapper
+state or the registry, and the pipeline calls the router's new
+clearPendingTurnState on the final result only, just before it fires
+ChatTurnComplete. The router is the natural owner since it already
+holds both the mapper state and the registry reference, and the mapper
+no longer performs turn-end cleanup it cannot time correctly.
+
+Abort and dispose paths did not rely on the per-result clear: the
+consumer loop stops routing once the controller is aborted, and any
+stale entries are still dropped on the next final result with the
+existing orphan warnings. The registry's own dispose still clears
+everything.
+---
+ .../node/claude/claudeMapSessionEvents.ts     |  39 ++---
+ .../node/claude/claudeSdkMessageRouter.ts     |   8 +
+ .../node/claude/claudeSdkPipeline.ts          |  13 +-
+ .../node/claude/claudeToolCallRegistry.ts     |   4 +-
+ .../agentHost/test/node/claudeAgent.test.ts   | 143 ++++++++++++++++++
+ .../test/node/claudeMapSessionEvents.test.ts  |  64 ++++++--
+ 6 files changed, 227 insertions(+), 44 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts b/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
+index e7d56874155bd..a0a3ff9f77464 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts
+@@ -38,9 +38,10 @@ import { ToolCallConfirmationReason, ToolCallContributorKind, type StringOrMarkd
+  *   lands in one assistant message, the matching `tool_result` arrives
+  *   in a later synthetic `user` message. Keyed by the SDK's globally-
+  *   unique `block.id` so re-use of `index` between messages is harmless.
+- *   Drained on `tool_result` (happy path) or on the turn's `result`
+- *   envelope as a defense-in-depth fallback so an SDK that never
+- *   delivers `tool_result` cannot leak entries across turns.
++ *   Drained on `tool_result` (happy path) or, as a defense-in-depth
++ *   fallback, via `clearPendingToolCalls` once the pipeline reports the
++ *   protocol turn is over, so an SDK that never delivers `tool_result`
++ *   cannot leak entries across turns.
+  *
+  * Encapsulated as a class (vs. a plain interface) so the maps' mutators
+  * are not part of the public surface — Phase 6.1's lesson — and the
+@@ -171,12 +172,13 @@ export class ClaudeMapperState {
+ 	 * of a turn. A `tool_use` whose `tool_result` never arrives — model
+ 	 * misbehavior, transport drop, future cancellation — would otherwise
+ 	 * survive in the maps for the lifetime of the session and accumulate
+-	 * across turns. Called from {@link mapResult} on every `result`
+-	 * envelope; warns once per orphan to surface the protocol break.
++	 * across turns. Driven by the pipeline (via
++	 * `ClaudeSdkMessageRouter.clearPendingTurnState`) on the FINAL
++	 * `result` of a protocol turn only: a steering preempt's intermediate
++	 * `result` must keep in-flight attribution. Warns once per orphan.
+ 	 *
+ 	 * Phase 12 subagent state lives on {@link SubagentRegistry}, not
+-	 * here; the mapper drives that drain via
+-	 * `registry.drainForegroundSpawns()` from {@link mapResult}.
++	 * here; the router drains that alongside this call.
+ 	 */
+ 	clearPendingToolCalls(logService: ILogService): void {
+ 		this.toolCalls.clearPending(logService);
+@@ -254,7 +256,7 @@ export function mapSDKMessageToAgentSignals(
+ 				registry,
+ 			);
+ 		case 'result':
+-			return mapResult(message, chat, turnId, turnDuration, state, logService, registry);
++			return mapResult(message, chat, turnId, turnDuration);
+ 		case 'assistant':
+ 			return tagWithParent(
+ 				mapAssistantCanonical(message, chat, turnId, state, message.parent_tool_use_id, registry, clientToolOwner),
+@@ -446,14 +448,17 @@ function isToolResultTextBlock(block: unknown): block is { type: 'text'; text: s
+ 	return candidate.type === 'text' && typeof candidate.text === 'string';
+ }
+ 
++/**
++ * Map a `result` envelope to its usage / error signals. Turn-end work
++ * (`ChatTurnComplete`, dropping pending tool-call and subagent state) is
++ * the pipeline's, since only it knows whether this result closes the
++ * protocol Turn or is a steering preempt's intermediate one (CONTEXT.md M10).
++ */
+ function mapResult(
+ 	message: Extract<SDKMessage, { type: 'result' }>,
+ 	session: URI,
+ 	turnId: string,
+ 	turnDuration: number | undefined,
+-	state: ClaudeMapperState,
+-	logService: ILogService,
+-	registry: SubagentRegistry,
+ ): AgentSignal[] {
+ 	const signals: AgentSignal[] = [];
+ 	if (message.subtype === 'success') {
+@@ -505,18 +510,6 @@ function mapResult(
+ 			},
+ 		});
+ 	}
+-	// `ChatTurnComplete` is emitted by the session via
+-	// `ClaudeSdkPipeline.onTurnComplete`, NOT here. The pipeline knows
+-	// when the protocol Turn is truly done (queue fully drained vs an
+-	// intermediate result during a steering preempt — CONTEXT.md M10);
+-	// the mapper does not have that state.
+-	state.clearPendingToolCalls(logService);
+-	// Phase 12 — drain orphaned subagent-spawning entries (foreground
+-	// only; background entries survive across turns by design). The
+-	// registry owns this state; the mapper drives the drain at turn end.
+-	for (const orphan of registry.drainForegroundSpawns()) {
+-		logService.warn(`[claudeMapSessionEvents] turn ended with pending subagent-spawning tool_use ${orphan.toolUseId} (agentId=${orphan.agentId ?? '<unresolved>'}); dropping cross-message state`);
+-	}
+ 	return signals;
+ }
+ 
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+index 913c3b3617535..e1deea28ecb99 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+@@ -65,6 +65,14 @@ export class ClaudeSdkMessageRouter extends Disposable {
+ 		this._clientToolOwner = clientToolOwner;
+ 	}
+ 
++	/** Drop pending tool-call attribution and foreground subagent spawns; the pipeline calls this on the final `result` of a protocol turn. */
++	clearPendingTurnState(): void {
++		this._mapperState.clearPendingToolCalls(this._logService);
++		for (const orphan of this._subagents.drainForegroundSpawns()) {
++			this._logService.warn(`[ClaudeSdkMessageRouter] turn ended with pending subagent-spawning tool_use ${orphan.toolUseId} (agentId=${orphan.agentId ?? '<unresolved>'}); dropping cross-message state`);
++		}
++	}
++
+ 	async handle(message: SDKMessage, turnId: string | undefined, context?: IClaudeSdkMessageContext): Promise<void> {
+ 		if (message.type === 'assistant') {
+ 			this._editObserver.observeAssistant(message, context?.mode, context?.clientContext);
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 32655514ccb35..475c294c064c7 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -55,9 +55,9 @@ export interface IRematerializer {
+  *     Re-applied to a fresh Query on rebind.
+  *   • Drain the SDK message stream, dispatch each message to the
+  *     {@link ClaudeSdkMessageRouter}, settle the matching entry's
+- *     deferred on `result`, and emit `ChatTurnComplete` only when
+- *     the queue fully drains (intermediate results during steering
+- *     preemption do NOT fire turn-complete — CONTEXT.md M10).
++ *     deferred on `result`, and only when the queue fully drains drop
++ *     pending tool-call state and emit `ChatTurnComplete` (intermediate
++ *     results during steering preemption do neither; CONTEXT.md M10).
+  *
+  * Disposing the pipeline aborts the controller (terminating the SDK
+  * subprocess per `sdk.d.ts:982`) and async-disposes the WarmQuery.
+@@ -648,8 +648,8 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	 * Consumer loop. Drains the SDK iterator, dispatches each message
+ 	 * to the {@link ClaudeSdkMessageRouter} (awaited so async file-edit
+ 	 * observation completes before the next message), settles the head
+-	 * entry's deferred on `result`, and fires `ChatTurnComplete` only
+-	 * when the queue fully drains.
++	 * entry's deferred on `result`, and only when the queue fully drains
++	 * drops pending tool-call state and fires `ChatTurnComplete`.
+ 	 *
+ 	 * On any uncaught error (cancellation, transport failure, or the
+ 	 * post-loop "stream ended without result" guard) the catch block
+@@ -694,8 +694,9 @@ export class ClaudeSdkPipeline extends Disposable {
+ 					this._logService.info(`[Claude:${this.sessionId}] result for sdkUuid=${completed?.sdkUuid}`);
+ 					// Final result: queue fully drained → protocol turn done.
+ 					// Intermediate result (still pending entries from a
+-					// steering preempt) does NOT fire ChatTurnComplete.
++					// steering preempt) keeps tool-call state and fires nothing.
+ 					if (completed && this._queue.isEmpty) {
++						this._router.clearPendingTurnState();
+ 						this._onDidProduceSignal.fire({
+ 							kind: 'action',
+ 							resource: this.chatChannelUri,
+diff --git a/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts b/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts
+index 0d5579a5218b5..68ad212e2694e 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts
+@@ -227,8 +227,8 @@ export class ClaudeToolCallRegistry {
+ 	 * once per orphan. A `tool_use` whose `tool_result` never arrives
+ 	 * — model misbehavior, transport drop, future cancellation —
+ 	 * would otherwise survive in the maps for the lifetime of the
+-	 * session and accumulate across turns. Called from `mapResult`
+-	 * on every `result` envelope.
++	 * session and accumulate across turns. Called via
++	 * `ClaudeMapperState.clearPendingToolCalls` at the end of the protocol turn.
+ 	 */
+ 	clearPending(logService: ILogService): void {
+ 		if (this._entries.size === 0) {
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 12ba500c5b771..85d70b9ae1658 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -8198,6 +8198,149 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		await inFlight;
+ 		assert.strictEqual(inFlightResolved, true);
+ 	});
++
++	test('intermediate result during steering keeps tool-call attribution so a later tool_result still completes the tool', async () => {
++		const ctx = createTestContext(disposables);
++		await ctx.agent.authenticate('https://api.github.com', 'tok');
++		await tick();
++		const created = await createSession(ctx.agent, { workingDirectories: [URI.file('/workspace')], model: { id: 'claude-opus-4.6' } });
++		const sid = created.sdkSessionId;
++		const TOOL_USE_ID = 'toolu_steer_read';
++
++		// Park after the tool_use so steering lands while the tool is still in flight.
++		const advance = new DeferredPromise<void>();
++		ctx.sdk.queryAdvance = async (i) => { if (i === 5) { await advance.p; } };
++		ctx.sdk.nextQueryMessages = [
++			makeSystemInitMessage(sid),
++			makeStreamEvent(sid, makeMessageStart()),
++			makeStreamEvent(sid, makeContentBlockStartToolUse(0, TOOL_USE_ID, 'Read')),
++			makeStreamEvent(sid, makeContentBlockStop(0)),
++			makeStreamEvent(sid, makeMessageStop()),
++		];
++
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
++		const inFlight = ctx.agent.chats.sendMessage(defaultChatUri(created.session), 'long task', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++		await tick();
++		await tick();
++
++		ctx.agent.setPendingMessages!(defaultChatUri(created.session), { id: 'pending-steer', message: { text: 'moo', origin: { kind: MessageKind.User } } }, []);
++		await tick();
++		await tick();
++
++		// result#1 is the preempted turn's intermediate result; the tool_result lands after it.
++		ctx.sdk.nextQueryMessages.push(
++			makeResultSuccess(sid),
++			makeUserToolResultMessage(sid, TOOL_USE_ID, 'file contents'),
++			makeResultSuccess(sid),
++		);
++		advance.complete();
++		await inFlight;
++
++		assert.deepStrictEqual({
++			toolCallCompletes: signals.flatMap(s => s.kind === 'action' && s.action.type === ActionType.ChatToolCallComplete ? [{ turnId: s.action.turnId, toolCallId: s.action.toolCallId }] : []),
++			turnCompleteCount: signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatTurnComplete).length,
++		}, {
++			toolCallCompletes: [{ turnId: 'turn-1', toolCallId: TOOL_USE_ID }],
++			turnCompleteCount: 1,
++		});
++	});
++
++	test('intermediate result during steering keeps the foreground subagent spawn so inner content still announces subagent_started', async () => {
++		const ctx = createTestContext(disposables);
++		await ctx.agent.authenticate('https://api.github.com', 'tok');
++		await tick();
++		const created = await createSession(ctx.agent, { workingDirectories: [URI.file('/workspace')], model: { id: 'claude-opus-4.6' } });
++		const sid = created.sdkSessionId;
++		const PARENT = 'toolu_steer_task';
++
++		// Park after the spawning Task tool_use so steering lands while the subagent runs.
++		const advance = new DeferredPromise<void>();
++		ctx.sdk.queryAdvance = async (i) => { if (i === 5) { await advance.p; } };
++		ctx.sdk.nextQueryMessages = [
++			makeSystemInitMessage(sid),
++			makeStreamEvent(sid, makeMessageStart()),
++			makeStreamEvent(sid, makeContentBlockStartToolUse(0, PARENT, 'Task')),
++			makeStreamEvent(sid, makeContentBlockStop(0)),
++			makeStreamEvent(sid, makeMessageStop()),
++		];
++
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
++		const inFlight = ctx.agent.chats.sendMessage(defaultChatUri(created.session), 'long task', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++		await tick();
++		await tick();
++
++		ctx.agent.setPendingMessages!(defaultChatUri(created.session), { id: 'pending-steer', message: { text: 'moo', origin: { kind: MessageKind.User } } }, []);
++		await tick();
++		await tick();
++
++		const innerAssistant = makeAssistantMessage(sid, [{ type: 'text', text: 'searching the workspace', citations: null }]);
++		innerAssistant.parent_tool_use_id = PARENT;
++		ctx.sdk.nextQueryMessages.push(
++			makeResultSuccess(sid),
++			innerAssistant,
++			makeUserToolResultMessage(sid, PARENT, 'done'),
++			makeResultSuccess(sid),
++		);
++		advance.complete();
++		await inFlight;
++
++		assert.deepStrictEqual({
++			started: signals.flatMap(s => s.kind === 'subagent_started' ? [s.toolCallId] : []),
++			completed: signals.flatMap(s => s.kind === 'subagent_completed' ? [s.toolCallId] : []),
++		}, {
++			started: [PARENT],
++			completed: [PARENT],
++		});
++	});
++
++	test('final result drops pending tool-call attribution so a late tool_result is treated as unknown', async () => {
++		const log = new CapturingLogService();
++		const ctx = createTestContext(disposables, { logService: log });
++		await ctx.agent.authenticate('https://api.github.com', 'tok');
++		await tick();
++		const created = await createSession(ctx.agent, { workingDirectories: [URI.file('/workspace')], model: { id: 'claude-opus-4.6' } });
++		const sid = created.sdkSessionId;
++		const TOOL_USE_ID = 'toolu_orphan_read';
++
++		// Park after turn one's final result; its tool_use never gets a tool_result.
++		const advance = new DeferredPromise<void>();
++		ctx.sdk.queryAdvance = async (i) => { if (i === 6) { await advance.p; } };
++		ctx.sdk.nextQueryMessages = [
++			makeSystemInitMessage(sid),
++			makeStreamEvent(sid, makeMessageStart()),
++			makeStreamEvent(sid, makeContentBlockStartToolUse(0, TOOL_USE_ID, 'Read')),
++			makeStreamEvent(sid, makeContentBlockStop(0)),
++			makeStreamEvent(sid, makeMessageStop()),
++			makeResultSuccess(sid),
++		];
++
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
++		await ctx.agent.chats.sendMessage(defaultChatUri(created.session), 'first', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		ctx.sdk.nextQueryMessages.push(
++			makeUserToolResultMessage(sid, TOOL_USE_ID, 'late content'),
++			makeResultSuccess(sid),
++		);
++		const second = ctx.agent.chats.sendMessage(defaultChatUri(created.session), 'second', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(created.session)));
++		await tick();
++		advance.complete();
++		await second;
++
++		assert.deepStrictEqual({
++			toolCallCompleteCount: signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatToolCallComplete).length,
++			turnCompleteCount: signals.filter(s => s.kind === 'action' && s.action.type === ActionType.ChatTurnComplete).length,
++			warnedOrphan: log.warns.some(w => w.includes(`ended with pending tool_use ${TOOL_USE_ID}`)),
++			warnedUnknown: log.warns.some(w => w.includes(`tool_result for unknown tool_use_id ${TOOL_USE_ID}`)),
++		}, {
++			toolCallCompleteCount: 0,
++			turnCompleteCount: 2,
++			warnedOrphan: true,
++			warnedUnknown: true,
++		});
++	});
+ });
+ 
+ // #endregion
+diff --git a/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts b/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts
+index affbe13bec068..18690a9ce5198 100644
+--- a/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeMapSessionEvents.test.ts
+@@ -911,25 +911,63 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
+ 		assert.strictEqual(usage.action.usage.model, undefined);
+ 	});
+ 
+-	test('result drains pending tool_use entries that never received a tool_result and warns once per orphan', () => {
++	test('result keeps a pending tool_use so a tool_result that lands after a steering preempt still completes it', () => {
+ 		const log = new CapturingLogService();
+ 		const state = new ClaudeMapperState();
++		const registry = r();
++		const TOOL_USE_ID = 'toolu_in_flight_1';
+ 
+-		const TOOL_USE_ID = 'toolu_orphan_1';
++		mapSDKMessageToAgentSignals(makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, TOOL_USE_ID, 'Read')), SESSION, TURN_ID, state, log, registry);
++		mapSDKMessageToAgentSignals(makeStreamEvent(SESSION_ID, makeContentBlockStop(0)), SESSION, TURN_ID, state, log, registry);
++		// The preempted turn's `result` arrives while the tool is still running.
++		mapSDKMessageToAgentSignals(makeResultSuccess(SESSION_ID), SESSION, TURN_ID, state, log, registry);
+ 
+-		// Open a tool_use block that will never be paired with a tool_result.
+-		mapSDKMessageToAgentSignals(
+-			makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, TOOL_USE_ID, 'Read')),
++		const signals = mapSDKMessageToAgentSignals(
++			makeUserToolResultMessage(SESSION_ID, TOOL_USE_ID, 'file contents'),
+ 			SESSION,
+ 			TURN_ID,
+ 			state,
+ 			log,
+-			r(),
++			registry,
+ 		);
+ 
+-		// Turn ends with no tool_result for the tool_use.
+-		const resultSignals = mapSDKMessageToAgentSignals(
+-			makeResultSuccess(SESSION_ID),
++		assert.deepStrictEqual(signals, [{
++			kind: 'action',
++			resource: SESSION,
++			action: {
++				type: ActionType.ChatToolCallComplete,
++				turnId: TURN_ID,
++				toolCallId: TOOL_USE_ID,
++				result: {
++					success: true,
++					pastTenseMessage: 'Read file',
++					content: [{ type: ToolResultContentType.Text, text: 'file contents' }],
++				},
++			},
++		}]);
++		assert.deepStrictEqual(log.warns, []);
++	});
++
++	test('result keeps a foreground subagent spawn in the registry', () => {
++		const state = new ClaudeMapperState();
++		const registry = r();
++		const PARENT = 'toolu_task_in_flight';
++
++		mapSDKMessageToAgentSignals(makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, PARENT, 'Task')), SESSION, TURN_ID, state, new NullLogService(), registry);
++		mapSDKMessageToAgentSignals(makeResultSuccess(SESSION_ID), SESSION, TURN_ID, state, new NullLogService(), registry);
++
++		assert.strictEqual(registry.getSpawn(PARENT)?.toolUseId, PARENT);
++	});
++
++	test('clearPendingToolCalls drains tool_use entries that never received a tool_result and warns once per orphan', () => {
++		const log = new CapturingLogService();
++		const state = new ClaudeMapperState();
++
++		const TOOL_USE_ID = 'toolu_orphan_1';
++
++		// Open a tool_use block that will never be paired with a tool_result.
++		mapSDKMessageToAgentSignals(
++			makeStreamEvent(SESSION_ID, makeContentBlockStartToolUse(0, TOOL_USE_ID, 'Read')),
+ 			SESSION,
+ 			TURN_ID,
+ 			state,
+@@ -937,13 +975,14 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
+ 			r(),
+ 		);
+ 
+-		assert.strictEqual(resultSignals.length, 1);
++		// The pipeline drives this once the protocol turn's final result lands.
++		state.clearPendingToolCalls(log);
++
+ 		assert.strictEqual(log.warns.length, 1);
+ 		assert.ok(log.warns[0].includes(TOOL_USE_ID), `expected warn to mention orphan id, got: ${log.warns[0]}`);
+ 		assert.ok(log.warns[0].includes('Read'), `expected warn to mention tool name, got: ${log.warns[0]}`);
+ 
+-		// A late-arriving tool_result for the orphan must now be treated
+-		// as unknown — proving the cross-message state was actually cleared.
++		// A late tool_result for the orphan is now unknown, proving the state was cleared.
+ 		const lateSignals = mapSDKMessageToAgentSignals(
+ 			makeUserToolResultMessage(SESSION_ID, TOOL_USE_ID, 'late content'),
+ 			SESSION,
+@@ -958,7 +997,6 @@ suite('claudeMapSessionEvents — direct mapper tests', () => {
+ 		assert.ok(log.warns[1].includes(`tool_result for unknown tool_use_id ${TOOL_USE_ID}`));
+ 	});
+ 
+-
+ 	test('message_stop and unknown stream events emit nothing', () => {
+ 		const log = new NullLogService();
+ 		const state = new ClaudeMapperState();

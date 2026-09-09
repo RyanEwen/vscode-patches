@@ -1,0 +1,253 @@
+From 6171f7c74369c841ff4d3fbb89685c2457446fdf Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 21 Aug 2026 21:59:42 -0400
+Subject: [PATCH] agentHost: keep the parent's output after a background
+ subagent settles
+
+The pipeline takes the turn from the prompt queue head, so a parent that spawns
+background subagents ends its own turn and every message after it arrives with
+no turn id. `ClaudeSdkMessageRouter.handle` dropped those outright, silently at
+every log level, so once the subagents settled and the parent resumed the chat
+showed nothing further. The transcript kept all of it, which is why restarting
+the agent host made the whole response appear.
+
+Anchor a message that arrives with no active turn to the turn a background
+subagent was spawned in. The spawn records that turn first-writer-wins like its
+other fields, `task_started` writes it onto the registry as a resume anchor, and
+the router falls back to it before deciding to drop.
+
+The anchor lives on the registry rather than the spawn so it outlives the
+`removeSpawn` that completion performs, which is the moment the parent actually
+resumes. It is written by the concrete `task_started` event for that spawn's own
+tool use id, so several live background spawns resolve to the most recently
+started one rather than to whichever the spawn map happened to yield first.
+
+Fixes #332073
+---
+ .../node/claude/claudeSdkMessageRouter.ts     | 17 ++++++--
+ .../node/claude/claudeSubagentRegistry.ts     | 25 ++++++++++++
+ .../node/claude/claudeSubagentSignals.ts      |  3 +-
+ .../agentHost/test/node/claudeAgent.test.ts   | 40 +++++++++++++++++++
+ .../test/node/claudeSubagentSignals.test.ts   | 35 ++++++++++++++++
+ 5 files changed, 115 insertions(+), 5 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+index 913c3b3617535..89f523c46261b 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+@@ -65,20 +65,29 @@ export class ClaudeSdkMessageRouter extends Disposable {
+ 		this._clientToolOwner = clientToolOwner;
+ 	}
+ 
++	/**
++	 * Routes one SDK message. A message arriving with no active turn is anchored
++	 * to the turn a background subagent was spawned in, because the parent
++	 * resumes producing output after that subagent reports back.
++	 */
+ 	async handle(message: SDKMessage, turnId: string | undefined, context?: IClaudeSdkMessageContext): Promise<void> {
++		if (turnId !== undefined && turnId !== this._subagents.resumeTurnId) {
++			this._subagents.clearResumeTurn();
++		}
++		const resolvedTurnId = turnId ?? this._subagents.resumeTurnId;
+ 		if (message.type === 'assistant') {
+ 			this._editObserver.observeAssistant(message, context?.mode, context?.clientContext);
+-		} else if (message.type === 'user' && turnId !== undefined) {
+-			await this._editObserver.observeUser(message, turnId, this._mapperState);
++		} else if (message.type === 'user' && resolvedTurnId !== undefined) {
++			await this._editObserver.observeUser(message, resolvedTurnId, this._mapperState);
+ 		}
+-		if (turnId === undefined) {
++		if (resolvedTurnId === undefined) {
+ 			return;
+ 		}
+ 		try {
+ 			const signals = mapSDKMessageToAgentSignals(
+ 				message,
+ 				this._chatChannelUri,
+-				turnId,
++				resolvedTurnId,
+ 				this._mapperState,
+ 				this._logService,
+ 				this._subagents,
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+index e1b8414f72be1..59b74243c1ef2 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+@@ -56,6 +56,7 @@ export class SubagentSpawn {
+ 	subagentType: string | undefined;
+ 	description: string | undefined;
+ 	prompt: string | undefined;
++	turnId: string | undefined;
+ 
+ 	private _agentId: string | undefined;
+ 	private _announced = false;
+@@ -110,6 +111,7 @@ export interface ISubagentSpawnInit {
+ 	readonly subagentType?: string;
+ 	readonly description?: string;
+ 	readonly prompt?: string;
++	readonly turnId?: string;
+ }
+ 
+ /**
+@@ -126,10 +128,12 @@ export interface ISubagentSpawnInit {
+ export class SubagentRegistry extends Disposable {
+ 	private readonly _spawns = new Map<string, SubagentSpawn>();
+ 	private readonly _innerToParent = new Map<string, string>();
++	private _resumeTurnId: string | undefined;
+ 
+ 	override dispose(): void {
+ 		this._spawns.clear();
+ 		this._innerToParent.clear();
++		this._resumeTurnId = undefined;
+ 		super.dispose();
+ 	}
+ 
+@@ -159,9 +163,30 @@ export class SubagentRegistry extends Disposable {
+ 		if (init?.prompt !== undefined && spawn.prompt === undefined) {
+ 			spawn.prompt = init.prompt;
+ 		}
++		if (init?.turnId !== undefined && spawn.turnId === undefined) {
++			spawn.turnId = init.turnId;
++		}
+ 		return spawn;
+ 	}
+ 
++	/**
++	 * The turn a parent resumes into after a background subagent it spawned
++	 * reports back, recorded when that subagent starts so it outlives the spawn.
++	 */
++	get resumeTurnId(): string | undefined {
++		return this._resumeTurnId;
++	}
++
++	noteResumeTurn(turnId: string | undefined): void {
++		if (turnId !== undefined) {
++			this._resumeTurnId = turnId;
++		}
++	}
++
++	clearResumeTurn(): void {
++		this._resumeTurnId = undefined;
++	}
++
+ 	getSpawn(toolUseId: string): SubagentSpawn | undefined {
+ 		return this._spawns.get(toolUseId);
+ 	}
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSubagentSignals.ts b/src/vs/platform/agentHost/node/claude/claudeSubagentSignals.ts
+index f4b44e0d4a2df..fd857acd50245 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSubagentSignals.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSubagentSignals.ts
+@@ -108,6 +108,7 @@ export function mapSubagentSystemMessage(
+ 		const spawn = toolUseId ? registry.getSpawn(toolUseId) : undefined;
+ 		if (spawn) {
+ 			spawn.background = true;
++			registry.noteResumeTurn(spawn.turnId);
+ 		}
+ 		return [];
+ 	}
+@@ -165,7 +166,7 @@ export function buildTopLevelSubagentReadyAction(
+ 	const agentName = typeof input?.subagent_type === 'string' ? input.subagent_type : undefined;
+ 	const prompt = typeof input?.prompt === 'string' ? input.prompt : undefined;
+ 	const inputJson = block.input !== undefined ? safeStringify(block.input) : undefined;
+-	registry.recordSpawn(block.id, { subagentType: agentName, description, prompt });
++	registry.recordSpawn(block.id, { subagentType: agentName, description, prompt, turnId });
+ 	const meta: Mutable<IToolCallMeta> = { ...buildClaudeToolCallMeta(block.name) };
+ 	if (!meta.toolKind) {
+ 		meta.toolKind = 'subagent';
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 87d4340d0603c..702075c053048 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -4037,6 +4037,46 @@ suite('ClaudeAgent', () => {
+ 		});
+ 	});
+ 
++	test('output the parent produces after a background subagent settles still reaches the chat', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		const PARENT = 'toolu_bg_resume';
++
++		sdk.nextQueryMessages = [
++			makeSystemInitMessage(sessionId),
++			makeAssistantMessage(sessionId, [
++				{ type: 'tool_use', id: PARENT, name: 'Task', input: { description: 'Audit', subagent_type: 'Explore', prompt: 'go' } },
++			]),
++			{ type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: PARENT, description: 'bg' } as unknown as SDKMessage,
++			// The parent ends its own turn here, so the prompt queue drains.
++			makeResultSuccess(sessionId),
++			// The subagent settles, which removes its spawn record.
++			{ type: 'system', subtype: 'task_notification', task_id: 't1', tool_use_id: PARENT, status: 'completed', output_file: 'o', summary: 's' } as unknown as SDKMessage,
++			// The parent then resumes, so these arrive with no turn of their own.
++			makeStreamEvent(sessionId, makeMessageStart()),
++			makeStreamEvent(sessionId, makeContentBlockStartText(0)),
++			makeStreamEvent(sessionId, makeTextDelta(0, 'the audit agent came back')),
++			makeStreamEvent(sessionId, makeContentBlockStop(0)),
++			makeStreamEvent(sessionId, makeMessageStop()),
++		];
++
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(s => signals.push(s)));
++
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		// `sendMessage` settles on the result; the loop still drains what follows.
++		const resumed = () => signals.some(s => JSON.stringify(s).includes('the audit agent came back'));
++		for (let i = 0; i < 50 && !resumed(); i++) {
++			await tick();
++		}
++
++		assert.strictEqual(resumed(), true, `expected the resumed parent output to produce a signal; saw kinds: ${signals.map(s => s.kind).join(', ')}`);
++	});
++
+ 	test('canonical SDKAssistantMessage with text content does not double-emit signals already produced by stream_event partials (Phase 6.1 / Cycle F)', async () => {
+ 		// CONTEXT.md M8:875 — partials are advisory, final
+ 		// `SDKAssistantMessage` is canonical. With `includePartialMessages:
+diff --git a/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts b/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts
+index ea8a9ad81e6c0..385d973a2d82f 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts
+@@ -396,6 +396,41 @@ suite('claudeSubagentSignals — Phase 12 emission', () => {
+ 		});
+ 	});
+ 
++	test('the turn a parent resumes into outlives the background spawn that set it', () => {
++		const state = new ClaudeMapperState();
++		const log = new NullLogService();
++		const registry = r();
++		const PARENT = 'toolu_bg_anchor';
++
++		mapSDKMessageToAgentSignals(
++			makeAssistantMessage(SESSION_ID, [
++				{ type: 'tool_use', id: PARENT, name: 'Task', input: { description: 'Audit', subagent_type: 'Explore', prompt: 'go' } },
++			]),
++			SESSION, TURN_ID, state, log, registry,
++		);
++		mapSDKMessageToAgentSignals(
++			{ type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: PARENT, description: 'bg' } as unknown as SDKMessage,
++			SESSION, TURN_ID, state, log, registry,
++		);
++		const afterStart = registry.resumeTurnId;
++
++		mapSDKMessageToAgentSignals(
++			{ type: 'system', subtype: 'task_notification', task_id: 't1', tool_use_id: PARENT, status: 'completed', output_file: 'o', summary: 's' } as unknown as SDKMessage,
++			SESSION, TURN_ID, state, log, registry,
++		);
++
++		// The parent resumes after completion, so the anchor has to outlive the spawn.
++		assert.deepStrictEqual({
++			afterStart,
++			afterCompletion: registry.resumeTurnId,
++			spawnRemoved: registry.getSpawn(PARENT),
++		}, {
++			afterStart: TURN_ID,
++			afterCompletion: TURN_ID,
++			spawnRemoved: undefined,
++		});
++	});
++
+ 	// #region focused contract tests on the extracted exports
+ 
+ 	test('buildTopLevelSubagentReadyAction omits _meta description/agentName when input fields are missing or wrong-typed; still records the spawn', () => {

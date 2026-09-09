@@ -1,0 +1,221 @@
+From d6965ef6d09c3ef7e28f5eca2a01ce10eedd6ba6 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 18:16:24 -0400
+Subject: [PATCH] Keep a subagent spawn the transcript primed out of the
+ turn-end drain
+
+`SubagentRegistry` doubles as the agentId cache that `getSubagentTranscript`
+reads, and `primeFromTranscript` fills it on resume from the Task tool_result
+suffixes in the parent transcript. Those records described Tasks that had
+already produced a result, but they were written through `recordSpawn`, so
+`drainForegroundSpawns` treated every one of them as an in-flight foreground
+spawn and dropped it at the end of the next turn, with a warning claiming a
+pending spawn had been abandoned.
+
+Two things went with it. The resolver lost its warm cache one turn after
+priming it, so reopening a restored subagent chat re-ran the whole strategy
+chain. Worse, a background subagent that outlived a host restart has no
+`task_started` in the resumed stream to mark its spawn background, so its
+record was drained too and the later `system.task_notification` no longer
+found a spawn to complete.
+
+Record an agentId learned from a transcript through a separate `cacheAgentId`
+entry point that does not claim the spawn is in flight, and drain only spawns
+this process saw start.
+---
+ .../node/claude/claudeSubagentRegistry.ts     | 49 +++++++++++++------
+ .../node/claude/claudeSubagentResolver.ts     |  2 +-
+ .../test/node/claudeSubagentRegistry.test.ts  | 23 +++++++++
+ .../test/node/claudeSubagentSignals.test.ts   | 25 ++++++++++
+ 4 files changed, 84 insertions(+), 15 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+index e1b8414f72be1..84c138a82b83c 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+@@ -52,6 +52,11 @@ export const SUBAGENT_ID_SUFFIX_REGEX = /^\s*agentId:\s+([a-z0-9]+)\b/im;
+  *     `subagent_completed` signals.
+  */
+ export class SubagentSpawn {
++	/**
++	 * Whether the live stream observed this spawn in flight. A record created
++	 * only to cache a resolved agentId stays `false`.
++	 */
++	inFlight = false;
+ 	background = false;
+ 	subagentType: string | undefined;
+ 	description: string | undefined;
+@@ -134,19 +139,15 @@ export class SubagentRegistry extends Disposable {
+ 	}
+ 
+ 	/**
+-	 * Insert a spawn (or return the existing one) for `toolUseId`.
+-	 * Any fields supplied in `init` are written to the spawn under
+-	 * first-writer-wins semantics (see {@link ISubagentSpawnInit}).
+-	 * Idempotent so live writes (canUseTool / strategy resolution /
+-	 * transcript priming / canonical assistant) can converge on the
+-	 * same record.
++	 * Insert a spawn (or return the existing one) for `toolUseId` and mark it in
++	 * flight. Any fields supplied in `init` are written to the spawn under
++	 * first-writer-wins semantics (see {@link ISubagentSpawnInit}), so the live
++	 * writers (canUseTool / canonical assistant / stream mapper) converge on one
++	 * record.
+ 	 */
+ 	recordSpawn(toolUseId: string, init?: ISubagentSpawnInit): SubagentSpawn {
+-		let spawn = this._spawns.get(toolUseId);
+-		if (!spawn) {
+-			spawn = new SubagentSpawn(toolUseId);
+-			this._spawns.set(toolUseId, spawn);
+-		}
++		const spawn = this._ensureSpawn(toolUseId);
++		spawn.inFlight = true;
+ 		if (init?.agentId !== undefined) {
+ 			spawn.setAgentId(init.agentId);
+ 		}
+@@ -171,6 +172,15 @@ export class SubagentRegistry extends Disposable {
+ 		this._evictInnerEdgesFor(toolUseId);
+ 	}
+ 
++	/**
++	 * Record a resolved agentId for a Task without claiming it is in flight.
++	 * Replay priming and the resolver cache use this so the entry outlives the
++	 * turn-end drain, which exists to clear spawns this process saw start.
++	 */
++	cacheAgentId(toolUseId: string, agentId: string): void {
++		this._ensureSpawn(toolUseId).setAgentId(agentId);
++	}
++
+ 	/** Mapper records the parent of an inner `tool_use` block when an inner subagent message arrives. */
+ 	noteInnerTool(innerToolUseId: string, parentToolUseId: string): void {
+ 		this._innerToParent.set(innerToolUseId, parentToolUseId);
+@@ -188,11 +198,13 @@ export class SubagentRegistry extends Disposable {
+ 	 * turns by design (their completion arrives later via
+ 	 * `system.task_notification`). Inner-edge entries pointing at
+ 	 * drained spawns are evicted too. Caller logs each returned orphan.
++	 * Cache-only records (see {@link cacheAgentId}) never started here, so they
++	 * survive as well.
+ 	 */
+ 	drainForegroundSpawns(): readonly SubagentSpawn[] {
+ 		const drained: SubagentSpawn[] = [];
+ 		for (const spawn of this._spawns.values()) {
+-			if (!spawn.background) {
++			if (spawn.inFlight && !spawn.background) {
+ 				drained.push(spawn);
+ 			}
+ 		}
+@@ -206,14 +218,23 @@ export class SubagentRegistry extends Disposable {
+ 	/**
+ 	 * Replay-path bulk populate: scan a parent transcript for the
+ 	 * SDK's synthetic `agentId: <hex>` suffix on Task/Agent tool_result
+-	 * text blocks and record each `(toolUseId, agentId)` pair. Idempotent.
++	 * text blocks and cache each `(toolUseId, agentId)` pair. Idempotent.
+ 	 */
+ 	primeFromTranscript(transcript: readonly Turn[]): void {
+ 		for (const [toolCallId, agentId] of scanTranscriptForAgentIds(transcript)) {
+-			this.recordSpawn(toolCallId, { agentId });
++			this.cacheAgentId(toolCallId, agentId);
+ 		}
+ 	}
+ 
++	private _ensureSpawn(toolUseId: string): SubagentSpawn {
++		let spawn = this._spawns.get(toolUseId);
++		if (!spawn) {
++			spawn = new SubagentSpawn(toolUseId);
++			this._spawns.set(toolUseId, spawn);
++		}
++		return spawn;
++	}
++
+ 	private _evictInnerEdgesFor(parentToolUseId: string): void {
+ 		for (const [innerId, parentId] of this._innerToParent) {
+ 			if (parentId === parentToolUseId) {
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSubagentResolver.ts b/src/vs/platform/agentHost/node/claude/claudeSubagentResolver.ts
+index 9dae26320ba93..695904928c41a 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSubagentResolver.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSubagentResolver.ts
+@@ -423,7 +423,7 @@ export async function getSubagentTranscript(
+ 	}, {
+ 		strategies: buildDefaultStrategies(sdk, logService),
+ 		cacheGet: id => parentRegistry.getSpawn(id)?.agentId,
+-		cacheSet: (id, resolved) => { parentRegistry.recordSpawn(id, { agentId: resolved }); },
++		cacheSet: (id, resolved) => { parentRegistry.cacheAgentId(id, resolved); },
+ 	});
+ 	if (!agentId) {
+ 		return [];
+diff --git a/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts b/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
+index a231b4a33ddb6..0cd1bfbe00a3c 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
+@@ -161,6 +161,29 @@ suite('SubagentRegistry', () => {
+ 		});
+ 	});
+ 
++	test('drainForegroundSpawns keeps agentId-only records, so a spawn primed from the transcript survives the first resumed turn', () => {
++		const registry = r();
++		registry.primeFromTranscript([
++			makeAgentToolCallTurn('toolu_primed', { suffixText: 'agentId: agentprimed' }),
++		]);
++		registry.cacheAgentId('toolu_resolved', 'agentresolved');
++		registry.recordSpawn('toolu_live');
++
++		const drained = registry.drainForegroundSpawns();
++
++		assert.deepStrictEqual({
++			drainedIds: drained.map(s => s.toolUseId),
++			primed: registry.getSpawn('toolu_primed')?.agentId,
++			resolved: registry.getSpawn('toolu_resolved')?.agentId,
++			live: registry.getSpawn('toolu_live'),
++		}, {
++			drainedIds: ['toolu_live'],
++			primed: 'agentprimed',
++			resolved: 'agentresolved',
++			live: undefined,
++		});
++	});
++
+ 	test('primeFromTranscript scans Task tool_result text blocks for agentId suffix and records each pair (idempotent against repeat calls)', () => {
+ 		const registry = r();
+ 		const transcript: readonly Turn[] = [
+diff --git a/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts b/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts
+index ea8a9ad81e6c0..501e06018ae15 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSubagentSignals.test.ts
+@@ -17,6 +17,7 @@ import {
+ 	makeAssistantMessage,
+ 	makeContentBlockStartText,
+ 	makeContentBlockStartToolUse,
++	makeResultSuccess,
+ 	makeStreamEvent,
+ 	makeUserToolResultMessage,
+ } from './claudeMapSessionEventsTestUtils.js';
+@@ -424,6 +425,30 @@ suite('claudeSubagentSignals — Phase 12 emission', () => {
+ 		});
+ 	});
+ 
++	test('a background subagent known only from the transcript still completes after a turn ends', () => {
++		const state = new ClaudeMapperState();
++		const log = new NullLogService();
++		const registry = r();
++		const PARENT = 'toolu_bg_restored';
++
++		// After a restart no `task_started` arrives to mark the spawn background.
++		registry.cacheAgentId(PARENT, 'agentbg');
++		mapSDKMessageToAgentSignals(makeResultSuccess(SESSION_ID), SESSION, TURN_ID, state, log, registry);
++
++		const signals = mapSDKMessageToAgentSignals(
++			{ type: 'system', subtype: 'task_notification', task_id: 't1', tool_use_id: PARENT, status: 'completed', output_file: 'o', summary: 's' } as unknown as SDKMessage,
++			SESSION, TURN_ID, state, log, registry,
++		);
++
++		assert.deepStrictEqual({
++			signals,
++			spawnRemoved: registry.getSpawn(PARENT),
++		}, {
++			signals: [{ kind: 'subagent_completed', chat: SESSION, toolCallId: PARENT }],
++			spawnRemoved: undefined,
++		});
++	});
++
+ 	test('mapSubagentSystemMessage ignores task_notification with non-terminal status, missing tool_use_id, or unknown spawn', () => {
+ 		const registry = r();
+ 		registry.recordSpawn('toolu_known');

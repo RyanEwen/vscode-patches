@@ -1,0 +1,680 @@
+From 9310f27fc7ba768bbab3c9f567c8a7ddc0862a1d Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 13:01:35 -0400
+Subject: [PATCH 1/2] agentHost: mark a turn interrupted by a host crash on
+ restore
+
+Copilot already reports a turn that was in flight when the host died,
+because its SDK event log records abort and idle events. Claude's
+transcript carries no result marker, so its replay closed such a turn
+as complete or cancelled and the user was never told the request did
+not finish. Codex maps an in-progress rollout to a complete turn as
+well.
+
+Add a host-owned interruptedTurn chat contribution. On dispatch it
+records the open turn (id and start time) in the chat database's
+metadata when a turn starts or resumes, and clears it when the turn
+completes, is cancelled, errors, or the chat is truncated. On hydrate
+it reads the marker, clears it so later getMessages calls do not
+re-mark, and replaces the trailing restored turn with an error turn
+carrying a non-resumable executionInterrupted part, using the same
+message Copilot shows. The trailing turn is matched by id, or by start
+time for providers that re-key turns on replay, with a one second
+tolerance because Codex persists start times in whole seconds. A turn
+already restored as an error is left alone, so Copilot is unaffected,
+and subagent chats and chats with a live turn are skipped.
+---
+ .../agentHost/node/chatContributions/TODO.md  |   6 +-
+ .../builtInChatContributions.ts               |   2 +
+ .../interruptedTurnContribution.ts            | 153 ++++++++++++
+ .../test/node/chatContributions.test.ts       |  10 +-
+ .../interruptedTurnContribution.test.ts       | 220 ++++++++++++++++++
+ .../agentHost/test/node/claudeAgent.test.ts   |  38 ++-
+ 6 files changed, 424 insertions(+), 5 deletions(-)
+ create mode 100644 src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts
+ create mode 100644 src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts
+
+diff --git a/src/vs/platform/agentHost/node/chatContributions/TODO.md b/src/vs/platform/agentHost/node/chatContributions/TODO.md
+index ac9ee4ffec311..91b4155b5c910 100644
+--- a/src/vs/platform/agentHost/node/chatContributions/TODO.md
++++ b/src/vs/platform/agentHost/node/chatContributions/TODO.md
+@@ -12,9 +12,9 @@ different hooks; registration order only breaks ties.
+ ## Standing caveats
+ 
+ - A contribution on `onDidDispatchAction` must filter tightly, because the hook fires for
+-  every dispatched action. `sessionInputNeeded` and `persistedTurnUsage` both re-check
+-  `isAhpChatChannel` + `isChatAction`, reproducing the guard their code sat behind in
+-  `AgentSideEffects`. All three contributions on this hook also skip rejected actions,
++  every dispatched action. `sessionInputNeeded`, `persistedTurnUsage`, and `interruptedTurn`
++  re-check `isAhpChatChannel` + `isChatAction`, reproducing the guard their code sat behind
++  in `AgentSideEffects`. All four contributions on this hook also skip rejected actions,
+   except that `sessionFlags` still persists config values for one, matching the behavior
+   it was extracted from.
+ - `TurnEndReason` intentionally omits `AgentHostTurnFailureStage`: error-hook dispatch comes
+diff --git a/src/vs/platform/agentHost/node/chatContributions/builtInChatContributions.ts b/src/vs/platform/agentHost/node/chatContributions/builtInChatContributions.ts
+index 61cd96cc1b834..9eca9054c318f 100644
+--- a/src/vs/platform/agentHost/node/chatContributions/builtInChatContributions.ts
++++ b/src/vs/platform/agentHost/node/chatContributions/builtInChatContributions.ts
+@@ -10,6 +10,7 @@ import { ChatDraftContribution } from './chatDraft/chatDraftContribution.js';
+ import { ChatSurfaceContribution } from './chatSurface/chatSurfaceContribution.js';
+ import { CheckpointAndChangesetContribution } from './checkpointAndChangeset/checkpointAndChangesetContribution.js';
+ import { GitHubReferencesContribution } from './githubReferences/githubReferencesContribution.js';
++import { InterruptedTurnContribution } from './interruptedTurn/interruptedTurnContribution.js';
+ import { LocalCommandContribution } from './localCommand/localCommandContribution.js';
+ import { MarkdownPlanRichLinksContribution } from './markdownPlanRichLinks/markdownPlanRichLinksContribution.js';
+ import { MarkUnreadContribution } from './markUnread/markUnreadContribution.js';
+@@ -32,6 +33,7 @@ export function registerBuiltInChatContributions(
+ 	registrations.add(contributions.registerContribution(TurnAdmissionContribution));
+ 	registrations.add(contributions.registerContribution(TurnDelegationContribution));
+ 	registrations.add(contributions.registerContribution(PersistedTurnUsageContribution));
++	registrations.add(contributions.registerContribution(InterruptedTurnContribution));
+ 	registrations.add(contributions.registerContribution(WorktreeAnnouncementContribution));
+ 	registrations.add(contributions.registerContribution(CheckpointAndChangesetContribution));
+ 	registrations.add(contributions.registerContribution(QueueDrainContribution));
+diff --git a/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts b/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts
+new file mode 100644
+index 0000000000000..3414536105a96
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts
+@@ -0,0 +1,153 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { Disposable, type IReference } from '../../../../../base/common/lifecycle.js';
++import { localize } from '../../../../../nls.js';
++import { ILogService } from '../../../../log/common/log.js';
++import type { IAgentHostChatContribution, IAgentHostChatContributionContext, IDispatchedAction, IHydrationContext } from '../../../common/agentHostChatContributionsService.js';
++import { ISessionDatabase, ISessionDataService } from '../../../common/sessionDataService.js';
++import { ActionType, isChatAction, type ChatAction } from '../../../common/state/sessionActions.js';
++import { chatStorageUri, createErrorResponsePart, isAhpChatChannel, isSubagentChatUri, TurnState, type Turn, type URI as ProtocolURI } from '../../../common/state/sessionState.js';
++import { AgentHostStateManager, IAgentHostStateManager } from '../../agentHostStateManager.js';
++
++/** Chat metadata key holding the turn the host has in flight; empty once that turn ends. */
++export const OPEN_TURN_METADATA_KEY = 'ah.openTurn';
++
++interface IOpenTurnMarker {
++	readonly turnId: string;
++	readonly startedAt: string;
++}
++
++/**
++ * Records which turn a chat has in flight so that, after the host dies mid-turn, restore can
++ * mark the trailing turn as interrupted even when the provider's replay cannot tell.
++ */
++export class InterruptedTurnContribution extends Disposable implements IAgentHostChatContribution {
++
++	static readonly id = 'interruptedTurn';
++	readonly order = 150;
++
++	constructor(
++		protected readonly _context: IAgentHostChatContributionContext,
++		@ILogService private readonly _logService: ILogService,
++		@ISessionDataService private readonly _sessionDataService: ISessionDataService,
++		@IAgentHostStateManager private readonly _stateManager: AgentHostStateManager,
++	) {
++		super();
++	}
++
++	onDidDispatchAction(dispatched: IDispatchedAction): void {
++		if (dispatched.rejectionReason !== undefined || !isAhpChatChannel(dispatched.channel) || !isChatAction(dispatched.action) || isSubagentChatUri(dispatched.channel)) {
++			return;
++		}
++		const marker = this._markerAfter(dispatched.channel, dispatched.action);
++		if (marker !== undefined) {
++			this._writeMarker(dispatched.channel, marker);
++		}
++	}
++
++	async onHydrateTurns(context: IHydrationContext, turns: readonly Turn[]): Promise<readonly Turn[]> {
++		if (isSubagentChatUri(context.chat)) {
++			return turns;
++		}
++		const storage = chatStorageUri(context.chat);
++		if (!storage) {
++			return turns;
++		}
++		const ref = await this._sessionDataService.tryOpenDatabase(storage);
++		if (!ref) {
++			return turns;
++		}
++		try {
++			const raw = await ref.object.getMetadata(OPEN_TURN_METADATA_KEY);
++			// A marker alongside a live turn belongs to that turn, not to a restore.
++			if (!raw || this._stateManager.getChatState(context.chat)?.activeTurn) {
++				return turns;
++			}
++			await ref.object.setMetadata(OPEN_TURN_METADATA_KEY, '');
++			return this._markInterruptedTurn(context.chat, turns, parseOpenTurnMarker(raw));
++		} catch (err) {
++			this._logService.warn(`[InterruptedTurnContribution] Failed to resolve the open turn for ${context.chat}`, err);
++			return turns;
++		} finally {
++			ref.dispose();
++		}
++	}
++
++	private _markInterruptedTurn(chat: ProtocolURI, turns: readonly Turn[], marker: IOpenTurnMarker | undefined): readonly Turn[] {
++		const trailing = turns.at(-1);
++		if (!marker || !trailing || trailing.state === TurnState.Error || !isOpenTurn(trailing, marker)) {
++			this._logService.info(`[InterruptedTurnContribution] No restored turn matches open turn ${marker?.turnId} for ${chat}`);
++			return turns;
++		}
++		this._logService.info(`[InterruptedTurnContribution] Marking restored turn ${trailing.id} as interrupted for ${chat}`);
++		const part = createErrorResponsePart({
++			errorType: 'executionInterrupted',
++			message: localize('interruptedTurn.hostInterrupted', "The agent was interrupted before this request finished."),
++		});
++		return [...turns.slice(0, -1), { ...trailing, state: TurnState.Error, responseParts: [...trailing.responseParts, part] }];
++	}
++
++	/** The marker an action leaves behind: the newly open turn, `''` once a turn ends, or `undefined` when unaffected. */
++	private _markerAfter(channel: ProtocolURI, action: ChatAction): string | undefined {
++		switch (action.type) {
++			case ActionType.ChatTurnStarted:
++				return JSON.stringify({ turnId: action.turnId, startedAt: action.startedAt } satisfies IOpenTurnMarker);
++			case ActionType.ChatTurnResume: {
++				const activeTurn = this._stateManager.getChatState(channel)?.activeTurn;
++				return activeTurn?.id === action.turnId ? JSON.stringify({ turnId: activeTurn.id, startedAt: activeTurn.startedAt } satisfies IOpenTurnMarker) : undefined;
++			}
++			case ActionType.ChatTurnComplete:
++			case ActionType.ChatTurnCancelled:
++			case ActionType.ChatError:
++			case ActionType.ChatTruncated:
++				return '';
++			default:
++				return undefined;
++		}
++	}
++
++	private _writeMarker(channel: ProtocolURI, value: string): void {
++		const storage = chatStorageUri(channel);
++		if (!storage) {
++			return;
++		}
++		let ref: IReference<ISessionDatabase>;
++		try {
++			ref = this._sessionDataService.openDatabase(storage);
++		} catch (err) {
++			this._logService.warn(`[InterruptedTurnContribution] Failed to open database to record the open turn for ${channel}`, err);
++			return;
++		}
++		ref.object.setMetadata(OPEN_TURN_METADATA_KEY, value).catch(err => {
++			this._logService.warn(`[InterruptedTurnContribution] Failed to record the open turn for ${channel}`, err);
++		}).finally(() => ref.dispose());
++	}
++}
++
++function parseOpenTurnMarker(raw: string): IOpenTurnMarker | undefined {
++	try {
++		const parsed: unknown = JSON.parse(raw);
++		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
++			return undefined;
++		}
++		const { turnId, startedAt } = parsed as Partial<IOpenTurnMarker>;
++		return typeof turnId === 'string' && typeof startedAt === 'string' ? { turnId, startedAt } : undefined;
++	} catch {
++		return undefined;
++	}
++}
++
++/** Codex persists turn start times in whole seconds, which can floor a turn's start below the host's marker. */
++const START_TIME_TOLERANCE_MS = 1000;
++
++/** Matches by id, or by start time for providers whose replay re-keys turns (Claude keys them by transcript uuid). */
++function isOpenTurn(turn: Turn, marker: IOpenTurnMarker): boolean {
++	if (turn.id === marker.turnId) {
++		return true;
++	}
++	const startedAt = turn.startedAt === undefined ? Number.NaN : Date.parse(turn.startedAt);
++	return startedAt + START_TIME_TOLERANCE_MS >= Date.parse(marker.startedAt);
++}
+diff --git a/src/vs/platform/agentHost/test/node/chatContributions.test.ts b/src/vs/platform/agentHost/test/node/chatContributions.test.ts
+index 931bb10c53427..f79593bad4b73 100644
+--- a/src/vs/platform/agentHost/test/node/chatContributions.test.ts
++++ b/src/vs/platform/agentHost/test/node/chatContributions.test.ts
+@@ -41,6 +41,7 @@ import { AgentHostToolCallTracker, IAgentHostToolCallTracker } from '../../node/
+ import { AgentHostTurnTracker, IAgentHostTurnTracker } from '../../node/agentHostTurnTracker.js';
+ import { AgentHostLocalCommands, IAgentHostLocalCommands } from '../../node/localCommands/localChatCommand.js';
+ import { registerBuiltInChatContributions } from '../../node/chatContributions/builtInChatContributions.js';
++import { OPEN_TURN_METADATA_KEY } from '../../node/chatContributions/interruptedTurn/interruptedTurnContribution.js';
+ import { LocalCommandContribution } from '../../node/chatContributions/localCommand/localCommandContribution.js';
+ import { QueueDrainContribution } from '../../node/chatContributions/queueDrain/queueDrainContribution.js';
+ import { SessionTitleContribution } from '../../node/chatContributions/sessionTitle/sessionTitleContribution.js';
+@@ -812,6 +813,13 @@ function createBuiltInContributions(disposables: ReturnType<typeof ensureNoDispo
+ 		observed?.push('persistedTurnUsage');
+ 		return originalGetTurnUsages();
+ 	};
++	const originalGetMetadata = usageDatabase.getMetadata.bind(usageDatabase);
++	usageDatabase.getMetadata = async key => {
++		if (key === OPEN_TURN_METADATA_KEY) {
++			observed?.push('interruptedTurn');
++		}
++		return originalGetMetadata(key);
++	};
+ 	const agentConfigService = createConfigurationService(enableSendInstructions);
+ 	const sessionDataService = createSessionDataService(usageDatabase);
+ 	const services = new ServiceCollection(
+@@ -1474,7 +1482,7 @@ suite('AgentHostChatContributions', () => {
+ 			{ ...hydrationTurn('built-in-hydration-order'), message: { text: injectSideChatContext('side question'), origin: { kind: MessageKind.User } } },
+ 		]);
+ 
+-		assert.deepStrictEqual(observed, ['persistedTurnUsage']);
++		assert.deepStrictEqual(observed, ['persistedTurnUsage', 'interruptedTurn']);
+ 		assert.deepStrictEqual(calls, ['beforeSideChat:seed', 'afterSideChat:plain']);
+ 		assert.deepStrictEqual(turns.map(turn => [turn.id, turn.message.text]), [['built-in-hydration-order', 'side question']]);
+ 	});
+diff --git a/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts b/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts
+new file mode 100644
+index 0000000000000..5428828b4272c
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts
+@@ -0,0 +1,220 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import type { DisposableStore } from '../../../../../../base/common/lifecycle.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
++import { InstantiationService } from '../../../../../instantiation/common/instantiationService.js';
++import { ServiceCollection } from '../../../../../instantiation/common/serviceCollection.js';
++import { ILogService, NullLogService } from '../../../../../log/common/log.js';
++import { IAgentHostChatContributions, type IDispatchedAction } from '../../../../common/agentHostChatContributionsService.js';
++import { ISessionDataService } from '../../../../common/sessionDataService.js';
++import { ActionType, type ChatAction } from '../../../../common/state/sessionActions.js';
++import { buildDefaultChatUri, buildSubagentChatUri, createErrorResponsePart, MessageKind, parseRequiredSessionUriFromChatUri, ResponsePartKind, SessionStatus, TurnState, type Turn } from '../../../../common/state/sessionState.js';
++import { AgentHostChatContributions } from '../../../../node/agentHostChatContributionsService.js';
++import { AgentHostStateManager, IAgentHostStateManager } from '../../../../node/agentHostStateManager.js';
++import { InterruptedTurnContribution, OPEN_TURN_METADATA_KEY } from '../../../../node/chatContributions/interruptedTurn/interruptedTurnContribution.js';
++import { createSessionDataService, TestSessionDatabase } from '../../../common/sessionTestHelpers.js';
++
++const SESSION = 'agent-host-session://test';
++const CHAT = buildDefaultChatUri(SESSION);
++const INTERRUPTED_PART = { kind: ResponsePartKind.Error, error: { errorType: 'executionInterrupted', message: 'The agent was interrupted before this request finished.' } };
++
++function createContributions(disposables: Pick<DisposableStore, 'add'>) {
++	const logService = new NullLogService();
++	const database = new TestSessionDatabase();
++	const stateManager = disposables.add(new AgentHostStateManager(logService));
++	const services = new ServiceCollection(
++		[ILogService, logService],
++		[ISessionDataService, createSessionDataService(database)],
++		[IAgentHostStateManager, stateManager],
++	);
++	const instantiationService = disposables.add(new InstantiationService(services, /*strict*/ true));
++	const service: IAgentHostChatContributions = disposables.add(new AgentHostChatContributions(logService, instantiationService));
++	disposables.add(service.registerContribution(InterruptedTurnContribution));
++	return { service, database, stateManager, marker: () => database.getMetadata(OPEN_TURN_METADATA_KEY) };
++}
++
++function createSessionState(stateManager: AgentHostStateManager): void {
++	stateManager.createSession({
++		resource: SESSION,
++		provider: 'test',
++		title: 'Test',
++		status: SessionStatus.IsRead,
++		createdAt: '2025-01-01T00:00:00.000Z',
++		modifiedAt: '2025-01-01T00:00:00.000Z',
++	});
++}
++
++function at(seconds: number): string {
++	return new Date(Date.UTC(2025, 0, 1, 0, 0, seconds)).toISOString();
++}
++
++function dispatched(channel: string, action: ChatAction, rejectionReason?: string): IDispatchedAction {
++	return { channel, session: parseRequiredSessionUriFromChatUri(channel), action, ...(rejectionReason !== undefined ? { rejectionReason } : {}) };
++}
++
++function turnStarted(turnId: string, startedAt: string): ChatAction {
++	return { type: ActionType.ChatTurnStarted, turnId, startedAt, message: { text: 'hi', origin: { kind: MessageKind.User } } };
++}
++
++function restoredTurn(id: string, startedAt: string, state = TurnState.Complete): Turn {
++	return {
++		id,
++		startedAt,
++		state,
++		message: { text: id, origin: { kind: MessageKind.User } },
++		responseParts: [{ kind: ResponsePartKind.Markdown, id: `${id}-reply`, content: `reply to ${id}` }],
++		usage: undefined,
++	};
++}
++
++function hydrationContext(chat = CHAT) {
++	return { session: SESSION, chat };
++}
++
++function tick(): Promise<void> {
++	return new Promise(resolve => setImmediate(resolve));
++}
++
++suite('InterruptedTurnContribution', () => {
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('writes the open-turn marker on ChatTurnStarted and clears it on complete, cancel, error and truncate', async () => {
++		const contributions = createContributions(disposables);
++		const terminalActions: ChatAction[] = [
++			{ type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1 },
++			{ type: ActionType.ChatTurnCancelled, turnId: 'turn-1', duration: 1 },
++			{ type: ActionType.ChatError, turnId: 'turn-1', duration: 1, part: createErrorResponsePart({ errorType: 'boom', message: 'boom' }) },
++			{ type: ActionType.ChatTruncated },
++		];
++
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-1', at(0))));
++		await tick();
++		const written = await contributions.marker();
++		const cleared: (string | undefined)[] = [];
++		for (const terminal of terminalActions) {
++			contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-1', at(0))));
++			contributions.service.didDispatchAction(dispatched(CHAT, terminal));
++			await tick();
++			cleared.push(await contributions.marker());
++		}
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('rejected', at(5)), 'rejected'));
++		await tick();
++
++		assert.deepStrictEqual(JSON.parse(written!), { turnId: 'turn-1', startedAt: at(0) });
++		assert.deepStrictEqual(cleared, ['', '', '', '']);
++		assert.strictEqual(await contributions.marker(), '');
++	});
++
++	test('records the resumed turn with its original start on ChatTurnResume', async () => {
++		const contributions = createContributions(disposables);
++		createSessionState(contributions.stateManager);
++		const resume: ChatAction = { type: ActionType.ChatTurnResume, turnId: 'turn-1' };
++		contributions.stateManager.dispatchServerAction(CHAT, turnStarted('turn-1', at(0)));
++		contributions.stateManager.dispatchServerAction(CHAT, { type: ActionType.ChatError, turnId: 'turn-1', duration: 1, part: createErrorResponsePart({ errorType: 'boom', message: 'boom' }, true) });
++		contributions.stateManager.dispatchServerAction(CHAT, resume);
++
++		contributions.service.didDispatchAction(dispatched(CHAT, resume));
++		await tick();
++
++		assert.deepStrictEqual(JSON.parse((await contributions.marker())!), { turnId: 'turn-1', startedAt: at(0) });
++	});
++
++	test('marks the trailing restored turn as interrupted when a marker is present', async () => {
++		const contributions = createContributions(disposables);
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-2', at(60))));
++		await tick();
++		const restored = [restoredTurn('turn-1', at(0)), restoredTurn('turn-2', at(60))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, [
++			restored[0],
++			{ ...restored[1], state: TurnState.Error, responseParts: [...restored[1].responseParts, INTERRUPTED_PART] },
++		]);
++		assert.strictEqual(await contributions.marker(), '');
++	});
++
++	test('does not mark a trailing turn that is already an error', async () => {
++		const contributions = createContributions(disposables);
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-1', at(0))));
++		await tick();
++		const restored = [restoredTurn('turn-1', at(0), TurnState.Error)];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, restored);
++		assert.strictEqual(await contributions.marker(), '');
++	});
++
++	test('does not mark when the trailing turn predates the marker', async () => {
++		const contributions = createContributions(disposables);
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('host-turn', at(60))));
++		await tick();
++		const restored = [restoredTurn('u1', at(0))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, restored);
++		assert.strictEqual(await contributions.marker(), '');
++	});
++
++	test('falls back to startedAt when turn ids differ', async () => {
++		const contributions = createContributions(disposables);
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('host-turn', at(60))));
++		await tick();
++		const restored = [restoredTurn('u1', at(0)), restoredTurn('u2', at(61))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, [
++			restored[0],
++			{ ...restored[1], state: TurnState.Error, responseParts: [...restored[1].responseParts, INTERRUPTED_PART] },
++		]);
++		assert.strictEqual(await contributions.marker(), '');
++	});
++
++	test('tolerates a trailing turn whose start time was floored to the second', async () => {
++		const contributions = createContributions(disposables);
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('host-turn', '2025-01-01T00:01:00.750Z')));
++		await tick();
++		const restored = [restoredTurn('codex-turn', at(60))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, [{ ...restored[0], state: TurnState.Error, responseParts: [...restored[0].responseParts, INTERRUPTED_PART] }]);
++	});
++
++	test('leaves the marker alone while the chat has a live turn', async () => {
++		const contributions = createContributions(disposables);
++		createSessionState(contributions.stateManager);
++		contributions.stateManager.dispatchServerAction(CHAT, turnStarted('turn-1', at(0)));
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-1', at(0))));
++		await tick();
++		const restored = [restoredTurn('turn-1', at(0))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, restored);
++		assert.deepStrictEqual(JSON.parse((await contributions.marker())!), { turnId: 'turn-1', startedAt: at(0) });
++	});
++
++	test('does not touch subagent chats', async () => {
++		const contributions = createContributions(disposables);
++		const subagentChat = buildSubagentChatUri(SESSION, 'tool-call');
++		contributions.service.didDispatchAction(dispatched(subagentChat, turnStarted('turn-1', at(0))));
++		await tick();
++		const writes = contributions.database.setMetadataCalls.length;
++		await contributions.database.setMetadata(OPEN_TURN_METADATA_KEY, JSON.stringify({ turnId: 'turn-1', startedAt: at(0) }));
++		const restored = [restoredTurn('turn-1', at(0))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(subagentChat), restored);
++
++		assert.strictEqual(writes, 0);
++		assert.deepStrictEqual(turns, restored);
++		assert.deepStrictEqual(JSON.parse((await contributions.marker())!), { turnId: 'turn-1', startedAt: at(0) });
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 12ba500c5b771..9957677b29a9b 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -52,7 +52,7 @@ import { AgentFeedbackAttachmentDisplayKind } from '../../common/meta/agentFeedb
+ import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../common/meta/agentChatInputRequestMeta.js';
+ import { toClientPluginMcpDefaultCwdsMeta } from '../../common/meta/clientPluginCustomizationMeta.js';
+ import { ActionType } from '../../common/state/sessionActions.js';
+-import { CustomizationLoadStatus, CustomizationType, MessageAttachmentKind, MessageKind, ResponsePartKind, ChatInputResponseKind, SessionStatus, ToolResultContentType, buildChatUri, buildDefaultChatUri, buildSubagentChatUri, buildSubagentSessionUri, customizationId, isDefaultChatUri, parseChatUri, parseDefaultChatUri, parseRequiredSessionUriFromChatUri, type ClientPluginCustomization, type Customization, type PluginCustomization } from '../../common/state/sessionState.js';
++import { CustomizationLoadStatus, CustomizationType, MessageAttachmentKind, MessageKind, ResponsePartKind, ChatInputResponseKind, SessionStatus, ToolResultContentType, TurnState, buildChatUri, buildDefaultChatUri, buildSubagentChatUri, buildSubagentSessionUri, customizationId, isDefaultChatUri, parseChatUri, parseDefaultChatUri, parseRequiredSessionUriFromChatUri, type ClientPluginCustomization, type Customization, type PluginCustomization } from '../../common/state/sessionState.js';
+ import { McpServerStatus as McpCustomizationServerStatus, type ChildCustomization, type CustomizationEnablement, type McpServerCustomization } from '../../common/state/protocol/channels-session/state.js';
+ import { ISessionDataService } from '../../common/sessionDataService.js';
+ import { AHP_AUTH_REQUIRED, ProtocolError } from '../../common/state/sessionProtocol.js';
+@@ -88,6 +88,9 @@ import { resolvePromptToContentBlocks } from '../../node/claude/claudePromptReso
+ import { ICopilotApiService, type ICopilotApiServiceRequestOptions } from '../../node/shared/copilotApiService.js';
+ import { createAgentChatContext } from '../../node/agentChatContext.js';
+ import { createNoopGitService, createNullSessionDataService, createSessionDataService, RecordingCheckpointService, TestSessionDatabase } from '../common/sessionTestHelpers.js';
++import { IAgentHostChatContributions } from '../../common/agentHostChatContributionsService.js';
++import { AgentHostChatContributions } from '../../node/agentHostChatContributionsService.js';
++import { InterruptedTurnContribution, OPEN_TURN_METADATA_KEY } from '../../node/chatContributions/interruptedTurn/interruptedTurnContribution.js';
+ 
+ // #region Test fakes
+ 
+@@ -8252,6 +8255,39 @@ suite('ClaudeAgent (Phase 13 — transcript reconstruction)', () => {
+ 		});
+ 	});
+ 
++	test('restore after an interrupted turn marks the trailing turn as an error', async () => {
++		const database = new TestSessionDatabase();
++		const { agent, sdk, instantiationService } = createTestContext(disposables, { database });
++		const contributions: IAgentHostChatContributions = disposables.add(new AgentHostChatContributions(new NullLogService(), instantiationService));
++		disposables.add(contributions.registerContribution(InterruptedTurnContribution));
++		const sessionId = 'phase13-interrupted';
++		const sessionUri = AgentSession.uri(agent.id, sessionId);
++		const chat = defaultChatUri(sessionUri);
++		await bindDefaultChat(agent, sessionUri);
++		contributions.didDispatchAction({
++			channel: chat.toString(),
++			session: sessionUri.toString(),
++			action: { type: ActionType.ChatTurnStarted, turnId: 'host-turn', startedAt: '2025-01-01T00:00:00.000Z', message: { text: 'hi', origin: { kind: MessageKind.User } } },
++		});
++		await tick();
++		// The host died here: the transcript holds the prompt and a partial reply but no result.
++		sdk.sessionMessagesById.set(sessionId, [
++			{ ...makeUserSessionMessage('u1', 'hi'), timestamp: '2025-01-01T00:00:01.000Z' } as SessionMessage,
++			{ ...makeAssistantSessionMessage('a1', 'partial'), timestamp: '2025-01-01T00:00:02.000Z' } as SessionMessage,
++		]);
++
++		const providerTurns = await agent.chats.getMessages(chat, chatContext(chat));
++		const turns = await contributions.hydrateTurns({ session: sessionUri.toString(), chat: chat.toString() }, providerTurns);
++
++		assert.deepStrictEqual(providerTurns.map(turn => [turn.id, turn.state]), [['u1', TurnState.Complete]]);
++		assert.deepStrictEqual(turns.map(turn => ({ id: turn.id, state: turn.state, lastPart: turn.responseParts.at(-1) })), [{
++			id: 'u1',
++			state: TurnState.Error,
++			lastPart: { kind: ResponsePartKind.Error, error: { errorType: 'executionInterrupted', message: 'The agent was interrupted before this request finished.' } },
++		}]);
++		assert.strictEqual(await database.getMetadata(OPEN_TURN_METADATA_KEY), '');
++	});
++
+ 	test('getMessages resolves a released peer-chat subagent through the exact source backing', async () => {
+ 		const { agent, sdk, stateManager } = createTestContext(disposables);
+ 		const parentSessionId = 'sdk-parent';
+
+From f78cd4a433d79b13c4aa24b5060e5b899b91e883 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 14:22:43 -0400
+Subject: [PATCH 2/2] agentHost: keep interrupted marking when clearing the
+ marker fails
+
+Clearing the open-turn marker on hydrate is best effort, but it ran
+before the trailing turn was marked and inside the same try block, so a
+transient failure of that write threw past the marking and returned the
+provider's turn unchanged. The database had already been read
+successfully and the turn genuinely was interrupted, so the user was
+shown a turn that falsely reads as complete: the exact bug this
+contribution exists to prevent. Recovering the turn and cleaning up the
+marker are independent, so compute the marked turns first and clear in
+a helper that logs and swallows its own failure.
+
+A marker that survives a failed clear is read again by the next
+hydrate, which marks the same turn again. That is acceptable and needs
+no extra guard. The provider replays the same unmarked turns, so the
+second pass produces the same single error part rather than a second
+one, and a list that already carries the error is left alone by the
+existing check for an already errored trailing turn. The marker is also
+self healing: any later turn on that chat overwrites it on start and
+clears it on completion.
+---
+ .../interruptedTurnContribution.ts            | 17 +++++++-
+ .../interruptedTurnContribution.test.ts       | 40 ++++++++++++++++++-
+ 2 files changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts b/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts
+index 3414536105a96..a255ddcddf2b1 100644
+--- a/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts
++++ b/src/vs/platform/agentHost/node/chatContributions/interruptedTurn/interruptedTurnContribution.ts
+@@ -66,8 +66,9 @@ export class InterruptedTurnContribution extends Disposable implements IAgentHos
+ 			if (!raw || this._stateManager.getChatState(context.chat)?.activeTurn) {
+ 				return turns;
+ 			}
+-			await ref.object.setMetadata(OPEN_TURN_METADATA_KEY, '');
+-			return this._markInterruptedTurn(context.chat, turns, parseOpenTurnMarker(raw));
++			const marked = this._markInterruptedTurn(context.chat, turns, parseOpenTurnMarker(raw));
++			await this._clearMarker(ref.object, context.chat);
++			return marked;
+ 		} catch (err) {
+ 			this._logService.warn(`[InterruptedTurnContribution] Failed to resolve the open turn for ${context.chat}`, err);
+ 			return turns;
+@@ -76,6 +77,18 @@ export class InterruptedTurnContribution extends Disposable implements IAgentHos
+ 		}
+ 	}
+ 
++	/**
++	 * Clears the marker so later `getMessages` calls do not re-mark. Best effort: a marker that
++	 * survives is re-read by the next hydrate, which marks the same turn again.
++	 */
++	private async _clearMarker(database: ISessionDatabase, chat: ProtocolURI): Promise<void> {
++		try {
++			await database.setMetadata(OPEN_TURN_METADATA_KEY, '');
++		} catch (err) {
++			this._logService.warn(`[InterruptedTurnContribution] Failed to clear the open turn marker for ${chat}`, err);
++		}
++	}
++
+ 	private _markInterruptedTurn(chat: ProtocolURI, turns: readonly Turn[], marker: IOpenTurnMarker | undefined): readonly Turn[] {
+ 		const trailing = turns.at(-1);
+ 		if (!marker || !trailing || trailing.state === TurnState.Error || !isOpenTurn(trailing, marker)) {
+diff --git a/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts b/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts
+index 5428828b4272c..c6652af336b64 100644
+--- a/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts
++++ b/src/vs/platform/agentHost/test/node/chatContributions/interruptedTurn/interruptedTurnContribution.test.ts
+@@ -22,9 +22,18 @@ const SESSION = 'agent-host-session://test';
+ const CHAT = buildDefaultChatUri(SESSION);
+ const INTERRUPTED_PART = { kind: ResponsePartKind.Error, error: { errorType: 'executionInterrupted', message: 'The agent was interrupted before this request finished.' } };
+ 
+-function createContributions(disposables: Pick<DisposableStore, 'add'>) {
++/** A database that accepts the open-turn marker but fails every attempt to clear it. */
++class ClearFailingSessionDatabase extends TestSessionDatabase {
++	override async setMetadata(key: string, value: string): Promise<void> {
++		if (key === OPEN_TURN_METADATA_KEY && value === '') {
++			throw new Error('metadata write failed');
++		}
++		return super.setMetadata(key, value);
++	}
++}
++
++function createContributions(disposables: Pick<DisposableStore, 'add'>, database: TestSessionDatabase = new TestSessionDatabase()) {
+ 	const logService = new NullLogService();
+-	const database = new TestSessionDatabase();
+ 	const stateManager = disposables.add(new AgentHostStateManager(logService));
+ 	const services = new ServiceCollection(
+ 		[ILogService, logService],
+@@ -202,6 +211,33 @@ suite('InterruptedTurnContribution', () => {
+ 		assert.deepStrictEqual(JSON.parse((await contributions.marker())!), { turnId: 'turn-1', startedAt: at(0) });
+ 	});
+ 
++	test('still marks the trailing turn when clearing the marker fails', async () => {
++		const contributions = createContributions(disposables, new ClearFailingSessionDatabase());
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-1', at(0))));
++		await tick();
++		const restored = [restoredTurn('turn-1', at(0))];
++
++		const turns = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		assert.deepStrictEqual(turns, [{ ...restored[0], state: TurnState.Error, responseParts: [...restored[0].responseParts, INTERRUPTED_PART] }]);
++		assert.deepStrictEqual(JSON.parse((await contributions.marker())!), { turnId: 'turn-1', startedAt: at(0) });
++	});
++
++	test('re-marks the same turn after a failed clear without duplicating the error part', async () => {
++		const contributions = createContributions(disposables, new ClearFailingSessionDatabase());
++		contributions.service.didDispatchAction(dispatched(CHAT, turnStarted('turn-1', at(0))));
++		await tick();
++		const restored = [restoredTurn('turn-1', at(0))];
++		const marked = await contributions.service.hydrateTurns(hydrationContext(), restored);
++
++		const reprovided = await contributions.service.hydrateTurns(hydrationContext(), restored);
++		const rehydrated = await contributions.service.hydrateTurns(hydrationContext(), marked);
++
++		assert.deepStrictEqual(marked.at(-1)?.responseParts.at(-1), INTERRUPTED_PART);
++		assert.deepStrictEqual(reprovided, marked);
++		assert.deepStrictEqual(rehydrated, marked);
++	});
++
+ 	test('does not touch subagent chats', async () => {
+ 		const contributions = createContributions(disposables);
+ 		const subagentChat = buildSubagentChatUri(SESSION, 'tool-call');

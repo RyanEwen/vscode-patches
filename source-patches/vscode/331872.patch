@@ -1,0 +1,161 @@
+From bda38d5939b7971f5f801c980d57f3979a9f5615 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 20 Aug 2026 17:18:14 -0400
+Subject: [PATCH 1/2] Complete a background subagent that settles after its
+ turn
+
+The router takes its turn id from the prompt queue head and returns
+early when there is none, so once the queue drains every SDK message is
+dropped before it reaches the mapper. A background subagent settles
+after the turn that spawned it has ended, which is exactly when the
+queue is empty, so its `system.task_notification` never becomes a
+`subagent_completed` signal. Its row spins for the life of the session
+and the spawn record is never evicted from the registry.
+
+That contradicts the registry's own contract, which says background
+spawns survive across turns by design because their completion arrives
+later via `system.task_notification`.
+
+Route the subagent system messages when there is no turn. They carry
+their own chat and tool call id, so they do not need one, and
+completeSubagentSession resolves the turn on the subagent's chat rather
+than the parent's. Turn-scoped messages are still dropped as before.
+---
+ .../node/claude/claudeSdkMessageRouter.ts     | 33 ++++++++++++-------
+ .../test/node/claudeSdkMessageRouter.test.ts  | 23 +++++++++++--
+ 2 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+index 913c3b3617535..4dc2849350b31 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+@@ -15,6 +15,7 @@ import { ISessionDatabase } from '../../common/sessionDataService.js';
+ import { ClaudeFileEditObserver } from './claudeFileEditObserver.js';
+ import { ClaudeMapperState, mapSDKMessageToAgentSignals } from './claudeMapSessionEvents.js';
+ import type { SubagentRegistry } from './claudeSubagentRegistry.js';
++import { mapSubagentSystemMessage } from './claudeSubagentSignals.js';
+ 
+ interface IClaudeSdkMessageContext {
+ 	readonly turnDuration?: number;
+@@ -72,20 +73,30 @@ export class ClaudeSdkMessageRouter extends Disposable {
+ 			await this._editObserver.observeUser(message, turnId, this._mapperState);
+ 		}
+ 		if (turnId === undefined) {
++			// A background subagent settles after the turn that spawned it has
++			// ended, so the queue is drained by the time its completion arrives.
++			// The signal carries its own chat and tool call id, so route it
++			// rather than dropping it with the turn-scoped messages.
++			if (message.type === 'system') {
++				this._produceSignals(() => mapSubagentSystemMessage(message, this._chatChannelUri, this._subagents));
++			}
+ 			return;
+ 		}
++		this._produceSignals(() => mapSDKMessageToAgentSignals(
++			message,
++			this._chatChannelUri,
++			turnId,
++			this._mapperState,
++			this._logService,
++			this._subagents,
++			this._clientToolOwner,
++			context?.turnDuration,
++		));
++	}
++
++	private _produceSignals(map: () => readonly AgentSignal[]): void {
+ 		try {
+-			const signals = mapSDKMessageToAgentSignals(
+-				message,
+-				this._chatChannelUri,
+-				turnId,
+-				this._mapperState,
+-				this._logService,
+-				this._subagents,
+-				this._clientToolOwner,
+-				context?.turnDuration,
+-			);
+-			for (const signal of signals) {
++			for (const signal of map()) {
+ 				this._onDidProduceSignal.fire(signal);
+ 			}
+ 		} catch (mapperErr) {
+diff --git a/src/vs/platform/agentHost/test/node/claudeSdkMessageRouter.test.ts b/src/vs/platform/agentHost/test/node/claudeSdkMessageRouter.test.ts
+index 497b1860ea47e..fd4a3514cdaff 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSdkMessageRouter.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSdkMessageRouter.test.ts
+@@ -40,6 +40,7 @@ interface IRouterHarness {
+ 	readonly router: ClaudeSdkMessageRouter;
+ 	readonly signals: AgentSignal[];
+ 	readonly fileService: FileService;
++	readonly subagents: SubagentRegistry;
+ }
+ 
+ class RecordingAgentEditAttributionService extends NullAgentEditAttributionService {
+@@ -88,7 +89,7 @@ function createRouter(
+ 	));
+ 	const signals: AgentSignal[] = [];
+ 	disposables.add(router.onDidProduceSignal(s => signals.push(s)));
+-	return { router, signals, fileService };
++	return { router, signals, fileService, subagents };
+ }
+ 
+ function assistantMessage(content: unknown): Extract<SDKMessage, { type: 'assistant' }> {
+@@ -103,12 +104,30 @@ suite('ClaudeSdkMessageRouter', () => {
+ 
+ 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+ 
+-	test('handle with turnId=undefined produces no signals (turn-less messages are routed to nowhere)', async () => {
++	test('handle with turnId=undefined drops turn-scoped messages', async () => {
+ 		const { router, signals } = createRouter(disposables);
+ 		await router.handle(makeStreamEvent('sess-1', makeMessageStart()), undefined);
+ 		assert.deepStrictEqual(signals, []);
+ 	});
+ 
++	test('a background subagent that settles after its turn still completes', async () => {
++		const { router, signals, subagents } = createRouter(disposables);
++		subagents.recordSpawn('tu-1');
++		subagents.getSpawn('tu-1')!.background = true;
++
++		// The queue has drained by the time a background task notification
++		// arrives, so there is no turn id to scope it to.
++		await router.handle({
++			type: 'system',
++			subtype: 'task_notification',
++			tool_use_id: 'tu-1',
++			status: 'completed',
++		} as unknown as SDKMessage, undefined);
++
++		assert.deepStrictEqual(signals.map(s => s.kind), ['subagent_completed']);
++		assert.strictEqual(subagents.getSpawn('tu-1'), undefined);
++	});
++
+ 	test('handle with a turnId on a text content block produces ChatResponsePart + ChatDelta signals', async () => {
+ 		const { router, signals } = createRouter(disposables);
+ 		await router.handle(makeStreamEvent('sess-1', makeMessageStart()), 'turn-1');
+
+From 63e05d449c96833f83496c465d110ed3e6510f98 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 20 Aug 2026 19:41:22 -0400
+Subject: [PATCH 2/2] Keep the inline note to one line per the coding
+ guidelines
+
+---
+ .../platform/agentHost/node/claude/claudeSdkMessageRouter.ts | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+index 4dc2849350b31..fec82a153c7e2 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkMessageRouter.ts
+@@ -73,10 +73,7 @@ export class ClaudeSdkMessageRouter extends Disposable {
+ 			await this._editObserver.observeUser(message, turnId, this._mapperState);
+ 		}
+ 		if (turnId === undefined) {
+-			// A background subagent settles after the turn that spawned it has
+-			// ended, so the queue is drained by the time its completion arrives.
+-			// The signal carries its own chat and tool call id, so route it
+-			// rather than dropping it with the turn-scoped messages.
++			// A background subagent settles with the queue already drained.
+ 			if (message.type === 'system') {
+ 				this._produceSignals(() => mapSubagentSystemMessage(message, this._chatChannelUri, this._subagents));
+ 			}

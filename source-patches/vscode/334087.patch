@@ -1,0 +1,411 @@
+From 8d5033e5e427406ad94f308e0bdf20b228e8c844 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 14:42:12 -0400
+Subject: [PATCH 1/2] Add a setting for the starting permission mode of new
+ Claude sessions
+
+The Claude provider's session `permissionMode` is chosen per session and
+always starts at the hardcoded `default` seed in `resolveChatConfig`, so a
+user who always wants the same mode has to change it by hand in every new
+session.
+
+Add `chat.agentHost.claudeAgent.defaultPermissionMode`, mirrored to the agent
+host as the `claudeDefaultPermissionMode` root config key through the existing
+declarative `agentHost` configuration sync. `ClaudeAgent.resolveChatConfig`
+reads it as the `validateOrDefault` fallback, the single point where a new
+chat's initial mode is decided. A session that already carries a mode keeps
+it: the restore path re-resolves with the persisted values, and
+`validateOrDefault` gives a valid incoming value precedence over the fallback.
+
+The setting is Claude-scoped rather than shared across providers because the
+three providers do not share an approval axis. Copilot uses the platform
+`autoApprove` key, Codex uses `codex.permissionsPreset`, and both value sets
+are disjoint from Claude's `permissionMode`, so one cross-provider setting
+would have to invent equivalences between modes the providers do not share.
+
+Scope it APPLICATION_MACHINE rather than APPLICATION. Its location in the
+agent-host settings family argues for APPLICATION, but the closer precedent is
+by purpose: `chat.tools.global.autoApprove` and `chat.autoReply` are both
+APPLICATION_MACHINE because they suppress confirmation prompts, and this
+setting can carry `bypassPermissions`. Machine scope keeps the value tied to
+the machine it was set on, so a remote window resolves and writes it against
+the remote user settings, and it is excluded from profile export and import.
+
+A configured mode that auto-approves tool calls (`acceptEdits`, `auto`,
+`bypassPermissions`) degrades to `default` while managed policy restricts
+auto-approval, matching how the sessions provider already clamps its
+new-session approval seed.
+---
+ .../agentHost/common/agentHostSchema.ts       | 15 +++++
+ .../agentHostStarter.config.contribution.ts   | 18 ++++++
+ .../platform/agentHost/common/agentService.ts |  7 +++
+ .../agentHost/node/claude/claudeAgent.ts      | 17 +++++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 57 ++++++++++++++++++-
+ 5 files changed, 111 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostSchema.ts b/src/vs/platform/agentHost/common/agentHostSchema.ts
+index 6a516e4a56eb6..8181719387b9d 100644
+--- a/src/vs/platform/agentHost/common/agentHostSchema.ts
++++ b/src/vs/platform/agentHost/common/agentHostSchema.ts
+@@ -10,6 +10,7 @@ import { ChatExternalSessionsMode, DEFAULT_EDIT_AUTO_APPROVE_PATTERNS, type Chat
+ import type { IMcpServerConfiguration } from '../../mcp/common/mcpPlatformTypes.js';
+ import { TelemetryConfiguration, TelemetryLevel } from '../../telemetry/common/telemetry.js';
+ import { telemetryLevelToAgentHostValue } from './agentHostTelemetry.js';
++import type { ClaudePermissionMode } from './claudeSessionConfigKeys.js';
+ import { SessionConfigKey } from './sessionConfigKeys.js';
+ import type { IShellInitScript } from './shellInitScript.js';
+ import type { SessionConfigPropertySchema, SessionConfigSchema } from './state/protocol/commands.js';
+@@ -568,6 +569,13 @@ export const AgentHostCopilotMultiRootEnabledConfigKey = 'copilotMultiRootEnable
+  */
+ export const AgentHostClaudeMultiRootEnabledConfigKey = 'claudeMultiRootEnabled';
+ 
++/**
++ * Root config key forwarded from the renderer that supplies the approval mode
++ * new Claude sessions start in. Mirrors the
++ * `chat.agentHost.claudeAgent.defaultPermissionMode` VS Code setting.
++ */
++export const AgentHostClaudeDefaultPermissionModeConfigKey = 'claudeDefaultPermissionMode';
++
+ /** Root config key forwarded from the renderer that gates Codex multiple-working-directory support. */
+ export const AgentHostCodexMultiRootEnabledConfigKey = 'codexMultiRootEnabled';
+ 
+@@ -880,6 +888,13 @@ export const platformRootSchema = createSchema({
+ 		description: localize('agentHost.config.claudeMultiRootEnabled.description', "Whether the Claude provider advertises support for multiple working directories, letting a session span every folder of a multi-root workspace."),
+ 		default: false,
+ 	}),
++	[AgentHostClaudeDefaultPermissionModeConfigKey]: schemaProperty<ClaudePermissionMode>({
++		type: 'string',
++		title: localize('agentHost.config.claudeDefaultPermissionMode.title', "Claude Default Approvals"),
++		description: localize('agentHost.config.claudeDefaultPermissionMode.description', "The approval mode new Claude sessions start in. A session that already carries a mode keeps it."),
++		enum: ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'],
++		default: 'default',
++	}),
+ 	[AgentHostCodexMultiRootEnabledConfigKey]: schemaProperty<boolean>({
+ 		type: 'boolean',
+ 		title: localize('agentHost.config.codexMultiRootEnabled.title', "Codex Multiple Working Directories"),
+diff --git a/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts b/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
+index 467867a1dc372..a30d2967f6128 100644
+--- a/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
++++ b/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
+@@ -15,6 +15,7 @@ import {
+ 	AgentHostGitHubMcpServerEnabledSettingId,
+ 	AgentHostActiveAgentTitleGenerationSettingId,
+ 	AgentHostClaudeAgentEnabledSettingId,
++	AgentHostClaudeDefaultPermissionModeSettingId,
+ 	AgentHostClaudeMultiRootEnabledSettingId,
+ 	AgentHostCodexAgentBinaryArgsSettingId,
+ 	AgentHostCodexAgentEnabledSettingId,
+@@ -36,6 +37,7 @@ import {
+ 	ArtifactToolsSettingId,
+ } from './agentService.js';
+ import {
++	AgentHostClaudeDefaultPermissionModeConfigKey,
+ 	AgentHostClaudeMultiRootEnabledConfigKey,
+ 	AgentHostActiveAgentTitleGenerationConfigKey,
+ 	AgentHostArtifactToolsConfigKey,
+@@ -243,6 +245,22 @@ configurationRegistry.registerConfiguration({
+ 			included: false,
+ 			agentHost: { key: AgentHostClaudeMultiRootEnabledConfigKey },
+ 		},
++		[AgentHostClaudeDefaultPermissionModeSettingId]: {
++			type: 'string',
++			enum: ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'],
++			enumDescriptions: [
++				nls.localize('chat.agentHost.claudeAgent.defaultPermissionMode.default', "Claude asks before editing files."),
++				nls.localize('chat.agentHost.claudeAgent.defaultPermissionMode.acceptEdits', "Claude edits files without asking, and asks before using other tools."),
++				nls.localize('chat.agentHost.claudeAgent.defaultPermissionMode.plan', "Claude creates a plan before making changes."),
++				nls.localize('chat.agentHost.claudeAgent.defaultPermissionMode.auto', "Claude decides whether to ask for each tool operation."),
++				nls.localize('chat.agentHost.claudeAgent.defaultPermissionMode.bypassPermissions', "Claude runs all tools without asking. As a default this removes every approval prompt from new sessions, so only pick it for an isolated environment such as a container."),
++			],
++			markdownDescription: nls.localize('chat.agentHost.claudeAgent.defaultPermissionMode', "The approval mode new Claude agent sessions start in. A restored session keeps the mode it was left in, and changing the mode of a running session always wins over this setting. When organization policy disables `#chat.tools.global.autoApprove#`, a value that auto-approves tool calls falls back to Ask Before Edits."),
++			default: 'default',
++			scope: ConfigurationScope.APPLICATION_MACHINE,
++			tags: ['experimental', 'advanced'],
++			agentHost: { key: AgentHostClaudeDefaultPermissionModeConfigKey },
++		},
+ 		[AgentHostCodexMultiRootEnabledSettingId]: {
+ 			type: 'boolean',
+ 			description: nls.localize('chat.agentHost.codexAgent.multiRootEnabled', "When enabled, Codex agent-host sessions advertise support for multiple working directories, so a session created in a multi-root workspace can span every workspace folder. Experimental; newly created sessions pick up a change without restarting the agent host."),
+diff --git a/src/vs/platform/agentHost/common/agentService.ts b/src/vs/platform/agentHost/common/agentService.ts
+index 1a612f35d36bc..b67170aaee56d 100644
+--- a/src/vs/platform/agentHost/common/agentService.ts
++++ b/src/vs/platform/agentHost/common/agentService.ts
+@@ -143,6 +143,13 @@ export const AgentHostCopilotMultiRootEnabledSettingId = 'chat.agentHost.copilot
+  */
+ export const AgentHostClaudeMultiRootEnabledSettingId = 'chat.agentHost.claudeAgent.multiRootEnabled';
+ 
++/**
++ * Configuration key supplying the approval mode new Claude agent-host sessions
++ * start in. Only newly created sessions read it; a restored session keeps its
++ * persisted mode and a mid-session pick always wins.
++ */
++export const AgentHostClaudeDefaultPermissionModeSettingId = 'chat.agentHost.claudeAgent.defaultPermissionMode';
++
+ /**
+  * Configuration key gating multiple-working-directory support for the Codex
+  * agent-host provider. Hidden from the Settings UI and off by default while the
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index dbb1d79a5b592..8ab8bba67278a 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -24,7 +24,7 @@ import { IAgentSdkDownloader } from '../agentSdkDownloader.js';
+ import { AgentSdkSetupChannel } from '../agentSdkSetupChannel.js';
+ import { decodeProviderData, encodeProviderData, type IPersistedChat } from '../agentChatBackings.js';
+ import { AgentHostConfigKey, agentHostCustomizationConfigSchema } from '../../common/agentHostCustomizationConfig.js';
+-import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, createSchema, platformRootSchema, platformSessionSchema, schemaProperty } from '../../common/agentHostSchema.js';
++import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeDefaultPermissionModeConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, createSchema, platformRootSchema, platformSessionSchema, schemaProperty } from '../../common/agentHostSchema.js';
+ import { ClaudePermissionMode, ClaudeSessionConfigKey, narrowClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { createClaudeThinkingLevelSchema, isClaudeEffortLevel } from '../../common/claudeModelConfig.js';
+ import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
+@@ -179,6 +179,9 @@ export function fromSdkModelInfo(m: ModelInfo, provider: AgentProvider): IAgentM
+ 	};
+ }
+ 
++/** Modes that auto-approve tool calls `default` would prompt for. */
++const ELEVATED_CLAUDE_PERMISSION_MODES: ReadonlySet<ClaudePermissionMode> = new Set(['acceptEdits', 'auto', 'bypassPermissions']);
++
+ // Narrowing an arbitrary runtime value to the closed `ClaudePermissionMode`
+ // union lives in `../../common/claudeSessionConfigKeys.ts` so it is shared by
+ // `ClaudeAgent`, `ClaudeSessionMetadataStore`, and other consumers. The live
+@@ -2217,7 +2220,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		});
+ 
+ 		const values = sessionSchema.validateOrDefault(_params.config, {
+-			[ClaudeSessionConfigKey.PermissionMode]: 'default' satisfies ClaudePermissionMode,
++			[ClaudeSessionConfigKey.PermissionMode]: this._defaultPermissionMode(),
+ 			// Permissions intentionally omitted from defaults — leave
+ 			// unset so auto-approval falls through to the host-level
+ 			// default, materializing on the session only once the user
+@@ -2230,6 +2233,16 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		});
+ 	}
+ 
++	/**
++	 * The configured approval mode new chats start in. A mode that auto-approves
++	 * tool calls degrades to `'default'` while policy restricts auto-approval.
++	 */
++	private _defaultPermissionMode(): ClaudePermissionMode {
++		const configured = narrowClaudePermissionMode(this._configurationService.getRootValue(platformRootSchema, AgentHostClaudeDefaultPermissionModeConfigKey)) ?? 'default';
++		const policyRestricted = this._configurationService.getRootValue(platformRootSchema, AgentHostAutoApprovePolicyRestrictedConfigKey) === true;
++		return policyRestricted && ELEVATED_CLAUDE_PERMISSION_MODES.has(configured) ? 'default' : configured;
++	}
++
+ 	getInheritedChatConfig(config: Readonly<Record<string, unknown>>): Record<string, unknown> | undefined {
+ 		const inherited: Record<string, unknown> = {};
+ 		for (const key of [ClaudeSessionConfigKey.PermissionMode, SessionConfigKey.Permissions]) {
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 12ba500c5b771..46407ab2f4102 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -46,7 +46,7 @@ import { InMemoryFileSystemProvider } from '../../../files/common/inMemoryFilesy
+ import { Schemas } from '../../../../base/common/network.js';
+ import { INativeEnvironmentService } from '../../../environment/common/environment.js';
+ import { AgentChatMigrationDeferred, IActiveClient, IAgent, IAgentChatContext, IAgentChatDataChange, IAgentChatMetadata, IAgentCreateChatOptions, IAgentCreateChatResult, IAgentCreateSessionConfig, IAgentCreateSessionResult, IAgentMaterializeChatEvent, IAgentSpawnChatEvent, AgentSession, AgentSignal, GITHUB_COPILOT_PROTECTED_RESOURCE } from '../../common/agent.js';
+-import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, AgentHostGitHubMcpServerEnabledConfigKey } from '../../common/agentHostSchema.js';
++import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostClaudeDefaultPermissionModeConfigKey, AgentHostClaudeMultiRootEnabledConfigKey, AgentHostGitHubMcpServerEnabledConfigKey } from '../../common/agentHostSchema.js';
+ import { AgentHostConfigKey } from '../../common/agentHostCustomizationConfig.js';
+ import { AgentFeedbackAttachmentDisplayKind } from '../../common/meta/agentFeedbackAttachments.js';
+ import { ChatInputRequestPurpose, readChatInputRequestPurpose } from '../../common/meta/agentChatInputRequestMeta.js';
+@@ -1335,6 +1335,61 @@ suite('ClaudeAgent', () => {
+ 		});
+ 	});
+ 
++	test('seeds a new chat from the configured default permission mode', async () => {
++		const { agent, configService } = createTestContext(disposables);
++		const readSeed = async () => (await agent.resolveChatConfig({})).values[ClaudeSessionConfigKey.PermissionMode];
++
++		const unset = await readSeed();
++		configService.updateRootConfig({ [AgentHostClaudeDefaultPermissionModeConfigKey]: 'plan' });
++		const configured = await readSeed();
++		configService.updateRootConfig({ [AgentHostClaudeDefaultPermissionModeConfigKey]: 'dontAsk' });
++		const unsupported = await readSeed();
++		configService.updateRootConfig({ [AgentHostClaudeDefaultPermissionModeConfigKey]: 17 });
++		const malformed = await readSeed();
++
++		assert.deepStrictEqual({ unset, configured, unsupported, malformed }, {
++			unset: 'default',
++			configured: 'plan',
++			unsupported: 'default',
++			malformed: 'default',
++		});
++	});
++
++	test('a chat that carries a permission mode keeps it over the configured default', async () => {
++		const { agent, configService } = createTestContext(disposables);
++		configService.updateRootConfig({ [AgentHostClaudeDefaultPermissionModeConfigKey]: 'acceptEdits' });
++		const config = { [ClaudeSessionConfigKey.PermissionMode]: 'plan' };
++
++		// The restore path re-resolves with the persisted values, so they outrank the setting.
++		const restored = (await agent.resolveChatConfig({ config })).values[ClaudeSessionConfigKey.PermissionMode];
++
++		assert.deepStrictEqual({ restored, unchanged: config }, {
++			restored: 'plan',
++			unchanged: { [ClaudeSessionConfigKey.PermissionMode]: 'plan' },
++		});
++	});
++
++	test('an elevated configured default degrades while policy restricts auto-approval', async () => {
++		const { agent, configService } = createTestContext(disposables);
++		const readSeed = async () => (await agent.resolveChatConfig({})).values[ClaudeSessionConfigKey.PermissionMode];
++
++		configService.updateRootConfig({
++			[AgentHostClaudeDefaultPermissionModeConfigKey]: 'bypassPermissions',
++			[AgentHostAutoApprovePolicyRestrictedConfigKey]: true,
++		});
++		const elevated = await readSeed();
++		configService.updateRootConfig({ [AgentHostClaudeDefaultPermissionModeConfigKey]: 'plan' });
++		const unelevated = await readSeed();
++		configService.updateRootConfig({ [AgentHostAutoApprovePolicyRestrictedConfigKey]: false, [AgentHostClaudeDefaultPermissionModeConfigKey]: 'bypassPermissions' });
++		const unrestricted = await readSeed();
++
++		assert.deepStrictEqual({ elevated, unelevated, unrestricted }, {
++			elevated: 'default',
++			unelevated: 'plan',
++			unrestricted: 'bypassPermissions',
++		});
++	});
++
+ 	test('getProtectedResources returns the GitHub resource', () => {
+ 		const { agent } = createTestContext(disposables);
+ 		assert.deepStrictEqual(agent.getProtectedResources(), [{
+
+From 0381acc3a76a3402909c98829086a2ce2b6f9cb2 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 15:00:38 -0400
+Subject: [PATCH 2/2] Do not restore a persisted default permission mode, and
+ honour it for workspace-less chats
+
+Two review findings on the new
+`chat.agentHost.claudeAgent.defaultPermissionMode` setting.
+
+The mirrored root key can carry `bypassPermissions` but was missing from
+`clientOwnedApprovalRootConfigKeys`, so `AgentConfigurationService` restored it
+from `agent-host-config.json` on startup. That is the case the set exists to
+prevent: the persisted value is a snapshot of one client's settings, and
+reviving it re-grants an elevated mode that a setting or a policy may have
+tightened while the host was stopped. The connected client re-pushes this key
+on every connect and reconnect through the declarative `agentHost` sync, just
+like the other members, so falling back to the schema default until it does is
+the fail-safe direction. The policy clamp only guarded the live read, not this
+one.
+
+A workspace-less create supplies neither config nor working directories, so
+`AgentService._resolveCreatedSessionConfig` returns early and the chat gets no
+resolved session config. `_bindFreshConversation` then decided the mode through
+`_resolvePermissionMode`, whose fallback was still a hardcoded `default`, so
+those chats ignored the setting entirely. Route that fallback through the same
+`_defaultPermissionMode` helper `resolveChatConfig` uses, so both creation
+paths read the setting in one place and neither can diverge on the policy
+clamp.
+---
+ .../agentHost/common/agentHostSchema.ts       |  1 +
+ .../agentHost/node/claude/claudeAgent.ts      | 13 +++++-----
+ .../node/agentConfigurationService.test.ts    |  5 +++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 24 +++++++++++++++++++
+ 4 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostSchema.ts b/src/vs/platform/agentHost/common/agentHostSchema.ts
+index 8181719387b9d..15add218f985c 100644
+--- a/src/vs/platform/agentHost/common/agentHostSchema.ts
++++ b/src/vs/platform/agentHost/common/agentHostSchema.ts
+@@ -940,4 +940,5 @@ export const clientOwnedApprovalRootConfigKeys: ReadonlySet<string> = new Set([
+ 	AgentHostTerminalAutoApproveRulesConfigKey,
+ 	AgentHostEditAutoApprovePatternsConfigKey,
+ 	AgentHostAutoReplyEnabledConfigKey,
++	AgentHostClaudeDefaultPermissionModeConfigKey,
+ ]);
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index 8ab8bba67278a..2c78525e721de 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -1308,14 +1308,15 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 	}
+ 
+ 	/**
+-	 * Pull `permissionMode` out of the post-validation `IAgentCreateChatOptions.config`
+-	 * bag, narrowing the runtime `unknown` value to the SDK's `PermissionMode`
+-	 * union (5/6 values, excluding `dontAsk`; sdk.d.ts:1560). Falls back to
+-	 * `'default'` when the bag is absent or carries something the schema
+-	 * validator shouldn't have accepted (defense-in-depth).
++	 * Pull `permissionMode` out of the `IAgentCreateChatOptions.config` bag,
++	 * narrowing the runtime `unknown` value to the SDK's `PermissionMode` union
++	 * (5/6 values, excluding `dontAsk`; sdk.d.ts:1560). Falls back to the
++	 * configured default when the bag is absent or carries something the schema
++	 * validator shouldn't have accepted, so a workspace-less create for which
++	 * the host resolves no session config lands on the same mode.
+ 	 */
+ 	private _resolvePermissionMode(config: Record<string, unknown> | undefined): ClaudePermissionMode {
+-		return narrowClaudePermissionMode(config?.[ClaudeSessionConfigKey.PermissionMode]) ?? 'default';
++		return narrowClaudePermissionMode(config?.[ClaudeSessionConfigKey.PermissionMode]) ?? this._defaultPermissionMode();
+ 	}
+ 
+ 	private async _disposeLiveSession(session: ClaudeAgentSession): Promise<void> {
+diff --git a/src/vs/platform/agentHost/test/node/agentConfigurationService.test.ts b/src/vs/platform/agentHost/test/node/agentConfigurationService.test.ts
+index 53be40936030b..0d51b796c2402 100644
+--- a/src/vs/platform/agentHost/test/node/agentConfigurationService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentConfigurationService.test.ts
+@@ -11,7 +11,7 @@ import { join } from '../../../../base/common/path.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+ import { NullLogService } from '../../../log/common/log.js';
+-import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostAutoReplyEnabledConfigKey, AgentHostEditAutoApprovePatternsConfigKey, AgentHostExternalSessionsMode, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostMcpServersConfigKey, AgentHostProxyConfigKey, AgentHostShowExternalSessionsConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, clientOwnedApprovalRootConfigKeys, createSchema, platformRootSchema, schemaProperty } from '../../common/agentHostSchema.js';
++import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostAutoReplyEnabledConfigKey, AgentHostClaudeDefaultPermissionModeConfigKey, AgentHostEditAutoApprovePatternsConfigKey, AgentHostExternalSessionsMode, AgentHostGlobalAutoApproveEnabledConfigKey, AgentHostMcpServersConfigKey, AgentHostProxyConfigKey, AgentHostShowExternalSessionsConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, clientOwnedApprovalRootConfigKeys, createSchema, platformRootSchema, schemaProperty } from '../../common/agentHostSchema.js';
+ import { AGENT_CUSTOMIZATION_SETTINGS_META_KEY, getAgentCustomizationSettingsEntries } from '../../common/agentCustomizationSettings.js';
+ import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
+ import type { RootConfigState } from '../../common/state/protocol/state.js';
+@@ -324,6 +324,7 @@ suite('AgentConfigurationService', () => {
+ 			[AgentHostTerminalAutoApproveRulesConfigKey]: { rm: true },
+ 			[AgentHostEditAutoApprovePatternsConfigKey]: { '**/*': true },
+ 			[AgentHostAutoReplyEnabledConfigKey]: true,
++			[AgentHostClaudeDefaultPermissionModeConfigKey]: 'bypassPermissions',
+ 		});
+ 		await firstService.whenIdle();
+ 
+@@ -337,10 +338,12 @@ suite('AgentConfigurationService', () => {
+ 			// The state manager seeds empty permissions; nothing else survives.
+ 			restoredKeys: [...clientOwnedApprovalRootConfigKeys].filter(key => restored[key] !== undefined).sort(),
+ 			permissions: restored[SessionConfigKey.Permissions],
++			claudeDefaultPermissionMode: restartedService.getRootValue(platformRootSchema, AgentHostClaudeDefaultPermissionModeConfigKey),
+ 		}, {
+ 			persistedKeys: [...clientOwnedApprovalRootConfigKeys].sort(),
+ 			restoredKeys: [SessionConfigKey.Permissions],
+ 			permissions: { allow: [], deny: [] },
++			claudeDefaultPermissionMode: undefined,
+ 		});
+ 		fs.rmSync(directory, { recursive: true, force: true });
+ 	});
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 46407ab2f4102..a43d6c9515dd1 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -2328,6 +2328,30 @@ suite('ClaudeAgent', () => {
+ 		}
+ 	});
+ 
++	test('a workspace-less chat starts in the configured default permission mode', async () => {
++		const userHome = URI.file(await fs.mkdtemp(`${os.tmpdir()}/claude-permdef-home-`));
++		const { agent, sdk, configService } = createTestContext(disposables, { userHome });
++		try {
++			await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++			// No config and no working directories, so the host resolves no session config.
++			const materialize = async () => {
++				const created = await createSession(agent, {});
++				sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++				await agent.chats.sendMessage(defaultChatUri(created.session), 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++				return sdk.capturedStartupOptions.at(-1)?.permissionMode;
++			};
++
++			configService.updateRootConfig({ [AgentHostClaudeDefaultPermissionModeConfigKey]: 'acceptEdits' });
++			const configured = await materialize();
++			configService.updateRootConfig({ [AgentHostAutoApprovePolicyRestrictedConfigKey]: true });
++			const restricted = await materialize();
++
++			assert.deepStrictEqual({ configured, restricted }, { configured: 'acceptEdits', restricted: 'default' });
++		} finally {
++			await fs.rm(userHome.fsPath, { recursive: true, force: true });
++		}
++	});
++
+ 	test('createProvisional creates a session without SDK startup contact', async () => {
+ 		const { sdk, instantiationService } = createTestContext(disposables);
+ 

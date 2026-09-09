@@ -1,0 +1,228 @@
+From ed85a2bc83bb2eb245cad71663a63360428bb197 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 1 Sep 2026 20:22:57 -0400
+Subject: [PATCH 1/2] Ignore a steering message that is re-delivered while
+ still in flight
+
+`setPendingMessages` is a state sync rather than a command. The queue drain
+contribution re-delivers the current steering message to the provider on every
+pending-message action, so the same `PendingMessage.id` arrives repeatedly
+until it is consumed. `ClaudeSdkPipeline.injectSteering` queued it each time,
+so a single steering message could reach the model twice, and the second copy
+could open a turn that no work would ever fill.
+
+Track the ids accepted into the queue and not yet consumed, and ignore a
+repeat. The set is cleared when the queue reports the steer consumed, and on
+abort, since an aborted queue consumes nothing.
+
+Codex and Copilot already guard this way; this brings the Claude path to
+parity with them.
+---
+ .../node/claude/claudeSdkPipeline.ts          | 26 +++++++++++++++----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 32655514ccb35..6ece16985b7b7 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -201,6 +201,13 @@ export class ClaudeSdkPipeline extends Disposable {
+ 
+ 	private readonly _queue: ClaudePromptQueue;
+ 
++	/**
++	 * Steering ids accepted into the queue and not yet consumed. The drain
++	 * contribution re-delivers the current steering message on every
++	 * pending-message action, so the same id arrives until it is consumed.
++	 */
++	private readonly _steeringInFlight = new Set<string>();
++
+ 	/** Flips to `true` on the first `system:init` SDK message. Drives `Options.resume` decisions for downstream phases. */
+ 	private _isResumed = false;
+ 
+@@ -265,11 +272,14 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			ClaudePromptQueue,
+ 			sessionId,
+ 			() => this._abortController.signal,
+-			(pendingId: string) => this._onDidProduceSignal.fire({
+-				kind: 'steering_consumed',
+-				chat: this.chatChannelUri,
+-				id: pendingId,
+-			}),
++			(pendingId: string) => {
++				this._steeringInFlight.delete(pendingId);
++				this._onDidProduceSignal.fire({
++					kind: 'steering_consumed',
++					chat: this.chatChannelUri,
++					id: pendingId,
++				});
++			},
+ 		));
+ 		this._router = this._register(instantiationService.createInstance(
+ 			ClaudeSdkMessageRouter, chatChannelUri, resource, dbRef, subagents, clientToolOwner,
+@@ -460,6 +470,10 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	 * into the in-progress protocol Turn).
+ 	 */
+ 	injectSteering(prompt: SDKUserMessage, pendingMessageId: string): void {
++		if (this._steeringInFlight.has(pendingMessageId)) {
++			this._logService.trace(`[Claude:${this.sessionId}] injectSteering: already in flight id=${pendingMessageId}`);
++			return;
++		}
+ 		if (this._abortController.signal.aborted) {
+ 			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (controller aborted) id=${pendingMessageId}`);
+ 			return;
+@@ -474,6 +488,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		// promise is the original entry's deferred); attach a no-op catch
+ 		// so a `failAll` rejection on abort/crash doesn't surface as an
+ 		// unhandled rejection.
++		this._steeringInFlight.add(pendingMessageId);
+ 		this._queue.push({
+ 			sdkMessage: prompt,
+ 			sdkUuid,
+@@ -523,6 +538,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 
+ 	private _wireAbortHandler(controller: AbortController): void {
+ 		controller.signal.addEventListener('abort', () => {
++			this._steeringInFlight.clear();
+ 			this._queue.notifyAborted();
+ 		}, { once: true });
+ 	}
+
+From 84870a06f220e042b10595860e4da2132035955b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 10:29:46 -0400
+Subject: [PATCH 2/2] Release steering ids on every queue-failure path, and
+ cover the guard
+
+The guard released its tracked ids only when the abort controller fired, but
+two paths fail the queue without aborting it: an aborted rebind, and a fatal
+stream error in `_processMessages`. A steer whose id was recorded and never
+consumed stayed recorded, so every later delivery of that still-pending
+message was ignored. The message was silently dropped rather than duplicated,
+which is worse than the problem the guard exists to solve.
+
+Fail the queue through one helper that clears the tracking with it, so every
+failure path releases the ids.
+
+Adds two regression tests: the same id delivered repeatedly before it is
+consumed reaches the SDK once, and the same id is accepted again once the
+first delivery has been consumed.
+---
+ .../node/claude/claudeSdkPipeline.ts          | 18 +++++--
+ .../agentHost/test/node/claudeAgent.test.ts   | 54 +++++++++++++++++++
+ 2 files changed, 69 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 6ece16985b7b7..199b496795371 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -517,7 +517,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			return;
+ 		}
+ 		this._abortController.abort();
+-		this._queue.failAll(new CancellationError());
++		this._failQueue(new CancellationError());
+ 		// Mark unhealthy but keep the `_query` handle: the next `send` rebinds,
+ 		// and `shutdownAndWait` still needs it to await the subprocess exit.
+ 		this._needsRebind = true;
+@@ -536,6 +536,18 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		}
+ 	}
+ 
++	/**
++	 * Fails every queued entry and releases the steering ids that went with them.
++	 *
++	 * A crash or an aborted rebind fails the queue without aborting the
++	 * controller. Leaving the ids behind would make the guard reject every
++	 * later delivery of a steer that was never actually run, dropping it.
++	 */
++	private _failQueue(error: Error): void {
++		this._queue.failAll(error);
++		this._steeringInFlight.clear();
++	}
++
+ 	private _wireAbortHandler(controller: AbortController): void {
+ 		controller.signal.addEventListener('abort', () => {
+ 			this._steeringInFlight.clear();
+@@ -638,7 +650,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind-aborted: warm dispose failed: ${err}`));
+ 			void Promise.resolve(oldWarm[Symbol.asyncDispose]()).catch((err: unknown) =>
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] previous WarmQuery dispose failed during aborted rebind: ${err}`));
+-			this._queue.failAll(new CancellationError());
++			this._failQueue(new CancellationError());
+ 			this._needsRebind = true;
+ 			throw new CancellationError();
+ 		}
+@@ -744,7 +756,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			// not clobber the fresh one. Mark unhealthy (keep the handle for
+ 			// teardown); the next `send` rebinds.
+ 			if (this._query === query) {
+-				this._queue.failAll(fatal);
++				this._failQueue(fatal);
+ 				this._needsRebind = true;
+ 			}
+ 			if (!isCancellationError(fatal)) {
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 5a97f83094385..4379602fd62c6 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7928,6 +7928,60 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		await longSend;
+ 	});
+ 
++	test('a steering message re-delivered before it is consumed is only queued once', async () => {
++		const { ctx, sessionUri, query, advance } = await materialize();
++		const sid = AgentSession.id(sessionUri);
++
++		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
++		await tick();
++
++		// The drain contribution re-delivers the current steer on every pending-state change.
++		const steer = { id: 'pending-dup', message: { text: 'switch topic', origin: { kind: MessageKind.User } } };
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), steer, []);
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), steer, []);
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), steer, []);
++		await tick();
++		await tick();
++
++		assert.strictEqual(
++			query.drainedPrompts.filter(p => p.priority === 'now').length,
++			1,
++			'the same steering id must reach the model once, however often it is delivered',
++		);
++
++		const steered = query.drainedPrompts.find(p => p.priority === 'now')!;
++		ctx.sdk.nextQueryMessages.push(
++			{ type: 'user', message: { role: 'user', content: 'switch topic' }, session_id: sid, parent_tool_use_id: null, uuid: steered.uuid },
++			makeResultSuccess(sid),
++		);
++		advance.complete();
++		await longSend;
++	});
++
++	test('a steering id is accepted again once the first delivery has been consumed', async () => {
++		const { ctx, sessionUri, query, advance } = await materialize();
++		const sid = AgentSession.id(sessionUri);
++		const steer = { id: 'pending-reset', message: { text: 'switch topic', origin: { kind: MessageKind.User } } };
++
++		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
++		await tick();
++
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), steer, []);
++		await tick();
++		await tick();
++		assert.strictEqual(query.drainedPrompts.filter(p => p.priority === 'now').length, 1, 'the first delivery is queued');
++
++		// Consuming the steer releases its id, so a later delivery is a new message rather than a duplicate.
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), steer, []);
++		await tick();
++		await tick();
++		assert.strictEqual(query.drainedPrompts.filter(p => p.priority === 'now').length, 2, 'the id is accepted again once consumed');
++
++		ctx.sdk.nextQueryMessages.push(makeResultSuccess(sid), makeResultSuccess(sid));
++		advance.complete();
++		await longSend.catch(() => { /* may cancel */ });
++	});
++
+ 	test('setPendingMessages with empty steering and non-empty queued is a no-op', async () => {
+ 		const { ctx, sessionUri, query, advance } = await materialize();
+ 		const before = query.drainedPrompts.length;

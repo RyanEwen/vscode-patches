@@ -1,0 +1,1860 @@
+From 49e2012f6c848ee173b639385e6ddd255e7ef081 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 20:13:25 -0400
+Subject: [PATCH 1/2] chat: report progress for a running tool call
+
+A host has no way to say that a running tool call is still working, so a
+long call is indistinguishable from a stalled session. Every existing
+mechanism fails on a specific ground: `chat/toolCallContentChanged` is
+the only action valid on a running call but replaces its content
+wholesale, so a liveness report would have to fabricate or clobber tool
+output; `chat/activityChanged` is chat-scoped and carries no tool call
+id; `root/progress` is root-channel-only, obtainable only from a
+`createSession` token, and is not replayed on reconnect;
+`chat/toolCallDelta` no-ops unless the call is still streaming its
+parameters.
+
+`chat/toolCallProgress` carries the elapsed time on the producer's own
+clock plus an optional description of the current step, reducing onto
+`ToolCallRunningState.progress`. It is state rather than an ephemeral
+notification so a client that reconnects mid-call can still render that
+work is ongoing rather than silence.
+
+Each report replaces the previous one wholesale, and progress is dropped
+when the call leaves `running`: a completed call states its own duration,
+so stale elapsed time could only contradict it. `elapsedMs` is
+milliseconds, matching every other duration in the protocol, which also
+keeps sub-second reporting representable without a float.
+
+Reducer parity across the Go, Kotlin, Rust and Swift clients, with five
+shared conformance fixtures covering the running update, a bare liveness
+report, wholesale replacement, and the two no-op paths.
+---
+ clients/go/ahp/reducers.go                    | 13 +++
+ clients/go/ahptypes/actions.generated.go      | 46 ++++++++++
+ clients/go/ahptypes/state.generated.go        | 15 ++++
+ .../microsoft/agenthostprotocol/Reducers.kt   | 14 +++
+ .../generated/Actions.generated.kt            | 37 ++++++++
+ .../generated/State.generated.kt              | 23 ++++-
+ clients/rust/crates/ahp-types/src/actions.rs  | 45 ++++++++++
+ clients/rust/crates/ahp-types/src/state.rs    | 19 ++++
+ clients/rust/crates/ahp/src/reducers.rs       | 29 +++++-
+ .../Generated/Actions.generated.swift         | 50 +++++++++++
+ .../Generated/State.generated.swift           | 27 +++++-
+ .../Sources/AgentHostProtocol/Reducers.swift  | 10 +++
+ .../.changes/20260818-tool-call-progress.json |  4 +
+ docs/guide/actions.md                         |  1 +
+ docs/guide/state-model.md                     |  3 +-
+ schema/actions.schema.json                    | 63 +++++++++++++
+ schema/commands.schema.json                   | 60 +++++++++++++
+ schema/errors.schema.json                     | 60 +++++++++++++
+ schema/notifications.schema.json              | 21 +++++
+ schema/state.schema.json                      | 21 +++++
+ scripts/generate-go.ts                        |  2 +
+ scripts/generate-kotlin.ts                    |  3 +-
+ scripts/generate-rust.ts                      |  2 +
+ scripts/generate-swift.ts                     |  3 +-
+ types/action-origin.generated.ts              |  4 +
+ types/channels-chat/actions.ts                | 36 ++++++++
+ types/channels-chat/reducer.ts                | 14 +++
+ types/channels-chat/state.ts                  | 23 +++++
+ types/common/actions.ts                       |  3 +
+ ...271-toolcall-progress-updates-running.json | 87 ++++++++++++++++++
+ ...272-toolcall-progress-without-message.json | 85 ++++++++++++++++++
+ ...3-toolcall-progress-replaces-previous.json | 89 +++++++++++++++++++
+ ...74-toolcall-progress-noop-non-running.json | 87 ++++++++++++++++++
+ ...olcall-progress-noop-unknown-toolcall.json | 82 +++++++++++++++++
+ types/version/registry.ts                     |  1 +
+ 35 files changed, 1076 insertions(+), 6 deletions(-)
+ create mode 100644 docs/.changes/20260818-tool-call-progress.json
+ create mode 100644 types/test-cases/reducers/271-toolcall-progress-updates-running.json
+ create mode 100644 types/test-cases/reducers/272-toolcall-progress-without-message.json
+ create mode 100644 types/test-cases/reducers/273-toolcall-progress-replaces-previous.json
+ create mode 100644 types/test-cases/reducers/274-toolcall-progress-noop-non-running.json
+ create mode 100644 types/test-cases/reducers/275-toolcall-progress-noop-unknown-toolcall.json
+
+diff --git a/clients/go/ahp/reducers.go b/clients/go/ahp/reducers.go
+index 3e84dbe01..bdab06d6d 100644
+--- a/clients/go/ahp/reducers.go
++++ b/clients/go/ahp/reducers.go
+@@ -617,6 +617,19 @@ func ApplyActionToChat(state *ahptypes.ChatState, action ahptypes.StateAction) R
+ 			}
+ 			return tc
+ 		})
++	case *ahptypes.ChatToolCallProgressAction:
++		return updateToolCall(state, a.TurnId, a.ToolCallId, func(tc ahptypes.ToolCallState) ahptypes.ToolCallState {
++			if r, ok := tc.Value.(*ahptypes.ToolCallRunningState); ok {
++				if a.Meta != nil {
++					r.Meta = a.Meta
++				}
++				r.Progress = &ahptypes.ToolCallProgress{
++					ElapsedMs: a.ElapsedMs,
++					Message:   a.Message,
++				}
++			}
++			return tc
++		})
+ 	case *ahptypes.ChatToolCallAuthRequiredAction:
+ 		res := applyToolCallAuthRequired(state, a)
+ 		if res == ReduceOutcomeApplied {
+diff --git a/clients/go/ahptypes/actions.generated.go b/clients/go/ahptypes/actions.generated.go
+index 0d7e3e864..80b14c742 100644
+--- a/clients/go/ahptypes/actions.generated.go
++++ b/clients/go/ahptypes/actions.generated.go
+@@ -37,6 +37,7 @@ const (
+ 	ActionTypeChatToolCallComplete              ActionType = "chat/toolCallComplete"
+ 	ActionTypeChatToolCallResultConfirmed       ActionType = "chat/toolCallResultConfirmed"
+ 	ActionTypeChatToolCallContentChanged        ActionType = "chat/toolCallContentChanged"
++	ActionTypeChatToolCallProgress              ActionType = "chat/toolCallProgress"
+ 	ActionTypeChatToolCallAuthRequired          ActionType = "chat/toolCallAuthRequired"
+ 	ActionTypeChatToolCallAuthResolved          ActionType = "chat/toolCallAuthResolved"
+ 	ActionTypeChatTurnComplete                  ActionType = "chat/turnComplete"
+@@ -488,6 +489,44 @@ type ChatToolCallContentChangedAction struct {
+ 	Content []ToolResultContent `json:"content"`
+ }
+ 
++// A running tool call is still working.
++//
++// Hosts SHOULD dispatch this periodically while a tool call executes, so a
++// client can tell slow work apart from a stalled session. It carries no
++// result and does not change the tool call status, and a call that reports
++// no progress is not thereby stalled.
++//
++// `elapsedMs` is measured by the producer's own clock and is milliseconds,
++// like every other duration in the protocol. Clients MUST NOT derive it by
++// subtracting timestamps, since cross-client clocks may differ; treat it as
++// opaque, producer-supplied data, exactly as with
++// {@link ChatTurnCompleteAction.duration}.
++//
++// For client-provided tools (whose tool call state carries a client
++// {@link ToolCallContributor} with a `clientId`), the owning client
++// dispatches this while executing, since the server cannot observe that
++// work. The server SHOULD reject this action if the dispatching client does
++// not match the contributor's `clientId`.
++type ChatToolCallProgressAction struct {
++	// Turn identifier
++	TurnId string `json:"turnId"`
++	// Tool call identifier
++	ToolCallId string `json:"toolCallId"`
++	// Additional provider-specific metadata for this tool call.
++	//
++	// Clients MAY look for well-known keys here to provide enhanced UI.
++	// For example, a `ptyTerminal` key with `{ input: string; output: string }`
++	// indicates the tool operated on a terminal (both `input` and `output` may
++	// contain escape sequences).
++	Meta map[string]json.RawMessage `json:"_meta,omitempty"`
++	Type ActionType                 `json:"type"`
++	// Milliseconds the tool call has been executing, per the producer's own clock
++	ElapsedMs int64 `json:"elapsedMs"`
++	// What the tool is doing right now, when the host knows. Absent for a bare
++	// liveness report.
++	Message *StringOrMarkdown `json:"message,omitempty"`
++}
++
+ // A running tool call is paused pending MCP authentication. Transitions the
+ // tool call from `running` to `auth-required`.
+ //
+@@ -1543,6 +1582,7 @@ func (*ChatToolCallConfirmedAction) isStateAction()             {}
+ func (*ChatToolCallCompleteAction) isStateAction()              {}
+ func (*ChatToolCallResultConfirmedAction) isStateAction()       {}
+ func (*ChatToolCallContentChangedAction) isStateAction()        {}
++func (*ChatToolCallProgressAction) isStateAction()              {}
+ func (*ChatToolCallAuthRequiredAction) isStateAction()          {}
+ func (*ChatToolCallAuthResolvedAction) isStateAction()          {}
+ func (*ChatTurnCompleteAction) isStateAction()                  {}
+@@ -1739,6 +1779,12 @@ func (u *StateAction) UnmarshalJSON(data []byte) error {
+ 			return err
+ 		}
+ 		u.Value = &value
++	case "chat/toolCallProgress":
++		var value ChatToolCallProgressAction
++		if err := json.Unmarshal(data, &value); err != nil {
++			return err
++		}
++		u.Value = &value
+ 	case "chat/toolCallAuthRequired":
+ 		var value ChatToolCallAuthRequiredAction
+ 		if err := json.Unmarshal(data, &value); err != nil {
+diff --git a/clients/go/ahptypes/state.generated.go b/clients/go/ahptypes/state.generated.go
+index f56192929..f9637eba2 100644
+--- a/clients/go/ahptypes/state.generated.go
++++ b/clients/go/ahptypes/state.generated.go
+@@ -2042,6 +2042,21 @@ type ToolCallRunningState struct {
+ 	// For example, a terminal content block lets clients subscribe to live
+ 	// output before the tool completes.
+ 	Content []ToolResultContent `json:"content,omitempty"`
++	// Most recent progress reported while the tool has been executing.
++	//
++	// Replaced wholesale by each `chat/toolCallProgress`. Absent until the host
++	// reports any, and not carried out of `running`: a completed call states
++	// its own duration, so stale progress would only contradict it.
++	Progress *ToolCallProgress `json:"progress,omitempty"`
++}
++
++// A point-in-time report that a running tool call is still working.
++type ToolCallProgress struct {
++	// Milliseconds the tool call has been executing, per the producer's own clock
++	ElapsedMs int64 `json:"elapsedMs"`
++	// What the tool is doing right now, when the host knows. Absent for a bare
++	// liveness report.
++	Message *StringOrMarkdown `json:"message,omitempty"`
+ }
+ 
+ // A running tool call is paused because the MCP server backing it needs
+diff --git a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt
+index f641eaccb..00ca3f964 100644
+--- a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt
++++ b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt
+@@ -1253,6 +1253,20 @@ public fun chatReducer(state: ChatState, action: StateAction): ChatState = when
+         }
+     }
+ 
++    is StateActionChatToolCallProgress -> {
++        val a = action.value
++        updateToolCallInParts(state, a.turnId, a.toolCallId) { tc ->
++            if (tc !is ToolCallStateRunning) tc else {
++                ToolCallStateRunning(
++                    tc.value.copy(
++                        meta = a.meta ?: tc.value.meta,
++                        progress = ToolCallProgress(elapsedMs = a.elapsedMs, message = a.message),
++                    ),
++                )
++            }
++        }
++    }
++
+     is StateActionChatToolCallAuthRequired -> {
+         val a = action.value
+         refreshChatSummaryStatus(
+diff --git a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/Actions.generated.kt b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/Actions.generated.kt
+index 83efbd904..50c3b971a 100644
+--- a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/Actions.generated.kt
++++ b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/Actions.generated.kt
+@@ -62,6 +62,8 @@ enum class ActionType {
+     CHAT_TOOL_CALL_RESULT_CONFIRMED,
+     @SerialName("chat/toolCallContentChanged")
+     CHAT_TOOL_CALL_CONTENT_CHANGED,
++    @SerialName("chat/toolCallProgress")
++    CHAT_TOOL_CALL_PROGRESS,
+     @SerialName("chat/toolCallAuthRequired")
+     CHAT_TOOL_CALL_AUTH_REQUIRED,
+     @SerialName("chat/toolCallAuthResolved")
+@@ -634,6 +636,38 @@ data class ChatToolCallContentChangedAction(
+     val content: List<ToolResultContent>
+ )
+ 
++@Serializable
++data class ChatToolCallProgressAction(
++    /**
++     * Turn identifier
++     */
++    val turnId: String,
++    /**
++     * Tool call identifier
++     */
++    val toolCallId: String,
++    /**
++     * Additional provider-specific metadata for this tool call.
++     *
++     * Clients MAY look for well-known keys here to provide enhanced UI.
++     * For example, a `ptyTerminal` key with `{ input: string; output: string }`
++     * indicates the tool operated on a terminal (both `input` and `output` may
++     * contain escape sequences).
++     */
++    @SerialName("_meta")
++    val meta: Map<String, JsonElement>? = null,
++    val type: ActionType,
++    /**
++     * Milliseconds the tool call has been executing, per the producer's own clock
++     */
++    val elapsedMs: Long,
++    /**
++     * What the tool is doing right now, when the host knows. Absent for a bare
++     * liveness report.
++     */
++    val message: StringOrMarkdown? = null
++)
++
+ @Serializable
+ data class ChatToolCallAuthRequiredAction(
+     /**
+@@ -1570,6 +1604,7 @@ sealed interface StateAction
+ @JvmInline value class StateActionChatToolCallComplete(val value: ChatToolCallCompleteAction) : StateAction
+ @JvmInline value class StateActionChatToolCallResultConfirmed(val value: ChatToolCallResultConfirmedAction) : StateAction
+ @JvmInline value class StateActionChatToolCallContentChanged(val value: ChatToolCallContentChangedAction) : StateAction
++@JvmInline value class StateActionChatToolCallProgress(val value: ChatToolCallProgressAction) : StateAction
+ @JvmInline value class StateActionChatToolCallAuthRequired(val value: ChatToolCallAuthRequiredAction) : StateAction
+ @JvmInline value class StateActionChatToolCallAuthResolved(val value: ChatToolCallAuthResolvedAction) : StateAction
+ @JvmInline value class StateActionChatTurnComplete(val value: ChatTurnCompleteAction) : StateAction
+@@ -1671,6 +1706,7 @@ internal object StateActionSerializer : KSerializer<StateAction> {
+             "chat/toolCallComplete" -> StateActionChatToolCallComplete(input.json.decodeFromJsonElement(ChatToolCallCompleteAction.serializer(), element))
+             "chat/toolCallResultConfirmed" -> StateActionChatToolCallResultConfirmed(input.json.decodeFromJsonElement(ChatToolCallResultConfirmedAction.serializer(), element))
+             "chat/toolCallContentChanged" -> StateActionChatToolCallContentChanged(input.json.decodeFromJsonElement(ChatToolCallContentChangedAction.serializer(), element))
++            "chat/toolCallProgress" -> StateActionChatToolCallProgress(input.json.decodeFromJsonElement(ChatToolCallProgressAction.serializer(), element))
+             "chat/toolCallAuthRequired" -> StateActionChatToolCallAuthRequired(input.json.decodeFromJsonElement(ChatToolCallAuthRequiredAction.serializer(), element))
+             "chat/toolCallAuthResolved" -> StateActionChatToolCallAuthResolved(input.json.decodeFromJsonElement(ChatToolCallAuthResolvedAction.serializer(), element))
+             "chat/turnComplete" -> StateActionChatTurnComplete(input.json.decodeFromJsonElement(ChatTurnCompleteAction.serializer(), element))
+@@ -1765,6 +1801,7 @@ internal object StateActionSerializer : KSerializer<StateAction> {
+             is StateActionChatToolCallComplete -> output.json.encodeToJsonElement(ChatToolCallCompleteAction.serializer(), value.value)
+             is StateActionChatToolCallResultConfirmed -> output.json.encodeToJsonElement(ChatToolCallResultConfirmedAction.serializer(), value.value)
+             is StateActionChatToolCallContentChanged -> output.json.encodeToJsonElement(ChatToolCallContentChangedAction.serializer(), value.value)
++            is StateActionChatToolCallProgress -> output.json.encodeToJsonElement(ChatToolCallProgressAction.serializer(), value.value)
+             is StateActionChatToolCallAuthRequired -> output.json.encodeToJsonElement(ChatToolCallAuthRequiredAction.serializer(), value.value)
+             is StateActionChatToolCallAuthResolved -> output.json.encodeToJsonElement(ChatToolCallAuthResolvedAction.serializer(), value.value)
+             is StateActionChatTurnComplete -> output.json.encodeToJsonElement(ChatTurnCompleteAction.serializer(), value.value)
+diff --git a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/State.generated.kt b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/State.generated.kt
+index 7ba5fdefc..02fa3f750 100644
+--- a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/State.generated.kt
++++ b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/generated/State.generated.kt
+@@ -2743,7 +2743,28 @@ data class ToolCallRunningState(
+      * For example, a terminal content block lets clients subscribe to live
+      * output before the tool completes.
+      */
+-    val content: List<ToolResultContent>? = null
++    val content: List<ToolResultContent>? = null,
++    /**
++     * Most recent progress reported while the tool has been executing.
++     *
++     * Replaced wholesale by each `chat/toolCallProgress`. Absent until the host
++     * reports any, and not carried out of `running`: a completed call states
++     * its own duration, so stale progress would only contradict it.
++     */
++    val progress: ToolCallProgress? = null
++)
++
++@Serializable
++data class ToolCallProgress(
++    /**
++     * Milliseconds the tool call has been executing, per the producer's own clock
++     */
++    val elapsedMs: Long,
++    /**
++     * What the tool is doing right now, when the host knows. Absent for a bare
++     * liveness report.
++     */
++    val message: StringOrMarkdown? = null
+ )
+ 
+ @Serializable
+diff --git a/clients/rust/crates/ahp-types/src/actions.rs b/clients/rust/crates/ahp-types/src/actions.rs
+index 6191c8699..18bde2b74 100644
+--- a/clients/rust/crates/ahp-types/src/actions.rs
++++ b/clients/rust/crates/ahp-types/src/actions.rs
+@@ -65,6 +65,8 @@ pub enum ActionType {
+     ChatToolCallResultConfirmed,
+     #[serde(rename = "chat/toolCallContentChanged")]
+     ChatToolCallContentChanged,
++    #[serde(rename = "chat/toolCallProgress")]
++    ChatToolCallProgress,
+     #[serde(rename = "chat/toolCallAuthRequired")]
+     ChatToolCallAuthRequired,
+     #[serde(rename = "chat/toolCallAuthResolved")]
+@@ -653,6 +655,47 @@ pub struct ChatToolCallContentChangedAction {
+     pub content: Vec<ToolResultContent>,
+ }
+ 
++/// A running tool call is still working.
++///
++/// Hosts SHOULD dispatch this periodically while a tool call executes, so a
++/// client can tell slow work apart from a stalled session. It carries no
++/// result and does not change the tool call status, and a call that reports
++/// no progress is not thereby stalled.
++///
++/// `elapsedMs` is measured by the producer's own clock and is milliseconds,
++/// like every other duration in the protocol. Clients MUST NOT derive it by
++/// subtracting timestamps, since cross-client clocks may differ; treat it as
++/// opaque, producer-supplied data, exactly as with
++/// {@link ChatTurnCompleteAction.duration}.
++///
++/// For client-provided tools (whose tool call state carries a client
++/// {@link ToolCallContributor} with a `clientId`), the owning client
++/// dispatches this while executing, since the server cannot observe that
++/// work. The server SHOULD reject this action if the dispatching client does
++/// not match the contributor's `clientId`.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ChatToolCallProgressAction {
++    /// Turn identifier
++    pub turn_id: String,
++    /// Tool call identifier
++    pub tool_call_id: String,
++    /// Additional provider-specific metadata for this tool call.
++    ///
++    /// Clients MAY look for well-known keys here to provide enhanced UI.
++    /// For example, a `ptyTerminal` key with `{ input: string; output: string }`
++    /// indicates the tool operated on a terminal (both `input` and `output` may
++    /// contain escape sequences).
++    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
++    pub meta: Option<JsonObject>,
++    /// Milliseconds the tool call has been executing, per the producer's own clock
++    pub elapsed_ms: i64,
++    /// What the tool is doing right now, when the host knows. Absent for a bare
++    /// liveness report.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub message: Option<StringOrMarkdown>,
++}
++
+ /// A running tool call is paused pending MCP authentication. Transitions the
+ /// tool call from `running` to `auth-required`.
+ ///
+@@ -1853,6 +1896,8 @@ pub enum StateAction {
+     ChatToolCallResultConfirmed(ChatToolCallResultConfirmedAction),
+     #[serde(rename = "chat/toolCallContentChanged")]
+     ChatToolCallContentChanged(ChatToolCallContentChangedAction),
++    #[serde(rename = "chat/toolCallProgress")]
++    ChatToolCallProgress(ChatToolCallProgressAction),
+     #[serde(rename = "chat/toolCallAuthRequired")]
+     ChatToolCallAuthRequired(ChatToolCallAuthRequiredAction),
+     #[serde(rename = "chat/toolCallAuthResolved")]
+diff --git a/clients/rust/crates/ahp-types/src/state.rs b/clients/rust/crates/ahp-types/src/state.rs
+index 4804e5968..e1444e396 100644
+--- a/clients/rust/crates/ahp-types/src/state.rs
++++ b/clients/rust/crates/ahp-types/src/state.rs
+@@ -2505,6 +2505,25 @@ pub struct ToolCallRunningState {
+     /// output before the tool completes.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub content: Option<Vec<ToolResultContent>>,
++    /// Most recent progress reported while the tool has been executing.
++    ///
++    /// Replaced wholesale by each `chat/toolCallProgress`. Absent until the host
++    /// reports any, and not carried out of `running`: a completed call states
++    /// its own duration, so stale progress would only contradict it.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub progress: Option<ToolCallProgress>,
++}
++
++/// A point-in-time report that a running tool call is still working.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ToolCallProgress {
++    /// Milliseconds the tool call has been executing, per the producer's own clock
++    pub elapsed_ms: i64,
++    /// What the tool is doing right now, when the host knows. Absent for a bare
++    /// liveness report.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub message: Option<StringOrMarkdown>,
+ }
+ 
+ /// A running tool call is paused because the MCP server backing it needs
+diff --git a/clients/rust/crates/ahp/src/reducers.rs b/clients/rust/crates/ahp/src/reducers.rs
+index fa37fb880..66837b0e3 100644
+--- a/clients/rust/crates/ahp/src/reducers.rs
++++ b/clients/rust/crates/ahp/src/reducers.rs
+@@ -54,6 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
+ use ahp_types::actions::{
+     ChatInputAnswerChangedAction, ChatToolCallAuthRequiredAction, ChatToolCallAuthResolvedAction,
+     ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction,
++    ChatToolCallProgressAction,
+     ChatToolCallDeltaAction, ChatToolCallReadyAction, ChatToolCallResultConfirmedAction,
+     ChatTurnStartedAction, StateAction,
+ };
+@@ -67,7 +68,8 @@ use ahp_types::state::{
+     ToolCallAuthRequiredState, ToolCallCancellationReason, ToolCallCancelledState,
+     ToolCallCompletedState, ToolCallConfirmationReason, ToolCallContributor,
+     ToolCallPendingConfirmationState, ToolCallPendingResultConfirmationState, ToolCallResponsePart,
+-    ToolCallRunningState, ToolCallState, ToolCallStatus, ToolCallStreamingState, ToolInput, Turn,
++    ToolCallProgress, ToolCallRunningState, ToolCallState, ToolCallStatus, ToolCallStreamingState,
++    ToolInput, Turn,
+     TurnState,
+ };
+ 
+@@ -1130,6 +1132,7 @@ pub fn apply_action_to_chat(state: &mut ChatState, action: &StateAction) -> Redu
+             res
+         }
+         StateAction::ChatToolCallContentChanged(a) => apply_tool_call_content_changed(state, a),
++        StateAction::ChatToolCallProgress(a) => apply_tool_call_progress(state, a),
+         StateAction::ChatToolCallAuthRequired(a) => {
+             let res = apply_tool_call_auth_required(state, a);
+             if res == ReduceOutcome::Applied {
+@@ -1346,6 +1349,9 @@ fn apply_tool_call_ready(state: &mut ChatState, a: &ChatToolCallReadyAction) ->
+             | ToolCallState::PendingConfirmation(_) => {
+                 if let Some(confirmed) = a.confirmed {
+                     ToolCallState::Running(ToolCallRunningState {
++                        // A transition into `running` starts a fresh run, so it carries no
++                        // progress until the host reports some.
++                        progress: None,
+                         tool_call_id: base.tool_call_id,
+                         tool_name: base.tool_name,
+                         display_name: base.display_name,
+@@ -1427,6 +1433,9 @@ fn apply_tool_call_confirmed(
+                 (_, tool_input) => tool_input,
+             };
+             ToolCallState::Running(ToolCallRunningState {
++                // A transition into `running` starts a fresh run, so it carries no
++                // progress until the host reports some.
++                progress: None,
+                 tool_call_id,
+                 tool_name,
+                 display_name,
+@@ -1615,6 +1624,21 @@ fn apply_tool_call_content_changed(
+         other => other,
+     })
+ }
++fn apply_tool_call_progress(state: &mut ChatState, a: &ChatToolCallProgressAction) -> ReduceOutcome {
++    update_tool_call(state, &a.turn_id, &a.tool_call_id, |tc| match tc {
++        ToolCallState::Running(mut s) => {
++            if let Some(meta) = &a.meta {
++                s.meta = Some(meta.clone());
++            }
++            s.progress = Some(ToolCallProgress {
++                elapsed_ms: a.elapsed_ms,
++                message: a.message.clone(),
++            });
++            ToolCallState::Running(s)
++        }
++        other => other,
++    })
++}
+ 
+ fn apply_tool_call_auth_required(
+     state: &mut ChatState,
+@@ -1658,6 +1682,9 @@ fn apply_tool_call_auth_resolved(
+         let meta = a.meta.clone().or(base.meta);
+         match tc {
+             ToolCallState::AuthRequired(s) => ToolCallState::Running(ToolCallRunningState {
++                // A transition into `running` starts a fresh run, so it carries no
++                // progress until the host reports some.
++                progress: None,
+                 tool_call_id: base.tool_call_id,
+                 tool_name: base.tool_name,
+                 display_name: base.display_name,
+diff --git a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/Actions.generated.swift b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/Actions.generated.swift
+index e34b3cef0..f2a681573 100644
+--- a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/Actions.generated.swift
++++ b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/Actions.generated.swift
+@@ -24,6 +24,7 @@ public enum ActionType: String, Codable, Sendable {
+     case chatToolCallComplete = "chat/toolCallComplete"
+     case chatToolCallResultConfirmed = "chat/toolCallResultConfirmed"
+     case chatToolCallContentChanged = "chat/toolCallContentChanged"
++    case chatToolCallProgress = "chat/toolCallProgress"
+     case chatToolCallAuthRequired = "chat/toolCallAuthRequired"
+     case chatToolCallAuthResolved = "chat/toolCallAuthResolved"
+     case chatTurnComplete = "chat/turnComplete"
+@@ -736,6 +737,51 @@ public struct ChatToolCallContentChangedAction: Codable, Sendable {
+     }
+ }
+ 
++public struct ChatToolCallProgressAction: Codable, Sendable {
++    /// Turn identifier
++    public var turnId: String
++    /// Tool call identifier
++    public var toolCallId: String
++    /// Additional provider-specific metadata for this tool call.
++    ///
++    /// Clients MAY look for well-known keys here to provide enhanced UI.
++    /// For example, a `ptyTerminal` key with `{ input: string; output: string }`
++    /// indicates the tool operated on a terminal (both `input` and `output` may
++    /// contain escape sequences).
++    public var meta: [String: AnyCodable]?
++    public var type: ActionType
++    /// Milliseconds the tool call has been executing, per the producer's own clock
++    public var elapsedMs: Int
++    /// What the tool is doing right now, when the host knows. Absent for a bare
++    /// liveness report.
++    public var message: StringOrMarkdown?
++
++    enum CodingKeys: String, CodingKey {
++        case turnId
++        case toolCallId
++        case meta = "_meta"
++        case type
++        case elapsedMs
++        case message
++    }
++
++    public init(
++        turnId: String,
++        toolCallId: String,
++        meta: [String: AnyCodable]? = nil,
++        type: ActionType,
++        elapsedMs: Int,
++        message: StringOrMarkdown? = nil
++    ) {
++        self.turnId = turnId
++        self.toolCallId = toolCallId
++        self.meta = meta
++        self.type = type
++        self.elapsedMs = elapsedMs
++        self.message = message
++    }
++}
++
+ public struct ChatToolCallAuthRequiredAction: Codable, Sendable {
+     /// Turn identifier
+     public var turnId: String
+@@ -2054,6 +2100,7 @@ public enum StateAction: Codable, Sendable {
+     case chatToolCallComplete(ChatToolCallCompleteAction)
+     case chatToolCallResultConfirmed(ChatToolCallResultConfirmedAction)
+     case chatToolCallContentChanged(ChatToolCallContentChangedAction)
++    case chatToolCallProgress(ChatToolCallProgressAction)
+     case chatToolCallAuthRequired(ChatToolCallAuthRequiredAction)
+     case chatToolCallAuthResolved(ChatToolCallAuthResolvedAction)
+     case chatTurnComplete(ChatTurnCompleteAction)
+@@ -2170,6 +2217,8 @@ public enum StateAction: Codable, Sendable {
+             self = .chatToolCallResultConfirmed(try ChatToolCallResultConfirmedAction(from: decoder))
+         case "chat/toolCallContentChanged":
+             self = .chatToolCallContentChanged(try ChatToolCallContentChangedAction(from: decoder))
++        case "chat/toolCallProgress":
++            self = .chatToolCallProgress(try ChatToolCallProgressAction(from: decoder))
+         case "chat/toolCallAuthRequired":
+             self = .chatToolCallAuthRequired(try ChatToolCallAuthRequiredAction(from: decoder))
+         case "chat/toolCallAuthResolved":
+@@ -2331,6 +2380,7 @@ public enum StateAction: Codable, Sendable {
+         case .chatToolCallComplete(let v): try v.encode(to: encoder)
+         case .chatToolCallResultConfirmed(let v): try v.encode(to: encoder)
+         case .chatToolCallContentChanged(let v): try v.encode(to: encoder)
++        case .chatToolCallProgress(let v): try v.encode(to: encoder)
+         case .chatToolCallAuthRequired(let v): try v.encode(to: encoder)
+         case .chatToolCallAuthResolved(let v): try v.encode(to: encoder)
+         case .chatTurnComplete(let v): try v.encode(to: encoder)
+diff --git a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/State.generated.swift b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/State.generated.swift
+index a0b32c0a2..7fde34bff 100644
+--- a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/State.generated.swift
++++ b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Generated/State.generated.swift
+@@ -2773,6 +2773,12 @@ public struct ToolCallRunningState: Codable, Sendable {
+     /// For example, a terminal content block lets clients subscribe to live
+     /// output before the tool completes.
+     public var content: [ToolResultContent]?
++    /// Most recent progress reported while the tool has been executing.
++    ///
++    /// Replaced wholesale by each `chat/toolCallProgress`. Absent until the host
++    /// reports any, and not carried out of `running`: a completed call states
++    /// its own duration, so stale progress would only contradict it.
++    public var progress: ToolCallProgress?
+ 
+     enum CodingKeys: String, CodingKey {
+         case toolCallId
+@@ -2787,6 +2793,7 @@ public struct ToolCallRunningState: Codable, Sendable {
+         case selectedOption
+         case status
+         case content
++        case progress
+     }
+ 
+     public init(
+@@ -2801,7 +2808,8 @@ public struct ToolCallRunningState: Codable, Sendable {
+         confirmed: ToolCallConfirmationReason,
+         selectedOption: ConfirmationOption? = nil,
+         status: ToolCallStatus,
+-        content: [ToolResultContent]? = nil
++        content: [ToolResultContent]? = nil,
++        progress: ToolCallProgress? = nil
+     ) {
+         self.toolCallId = toolCallId
+         self.toolName = toolName
+@@ -2815,6 +2823,23 @@ public struct ToolCallRunningState: Codable, Sendable {
+         self.selectedOption = selectedOption
+         self.status = status
+         self.content = content
++        self.progress = progress
++    }
++}
++
++public struct ToolCallProgress: Codable, Sendable {
++    /// Milliseconds the tool call has been executing, per the producer's own clock
++    public var elapsedMs: Int
++    /// What the tool is doing right now, when the host knows. Absent for a bare
++    /// liveness report.
++    public var message: StringOrMarkdown?
++
++    public init(
++        elapsedMs: Int,
++        message: StringOrMarkdown? = nil
++    ) {
++        self.elapsedMs = elapsedMs
++        self.message = message
+     }
+ }
+ 
+diff --git a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift
+index e9b877c7a..f6d452dca 100644
+--- a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift
++++ b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift
+@@ -460,6 +460,16 @@ public func chatReducer(state: ChatState, action: StateAction) -> ChatState {
+             return .running(r)
+         }
+ 
++    case .chatToolCallProgress(let a):
++        return updateToolCall(state: state, turnId: a.turnId, toolCallId: a.toolCallId) { tc in
++            guard case .running(var r) = tc else { return tc }
++            r.meta = a.meta ?? r.meta
++            // Each report replaces the previous one wholesale, so a report without a
++            // message clears the message the last one carried.
++            r.progress = ToolCallProgress(elapsedMs: a.elapsedMs, message: a.message)
++            return .running(r)
++        }
++
+     case .chatToolCallAuthRequired(let a):
+         return refreshChatSummaryStatus(updateToolCall(state: state, turnId: a.turnId, toolCallId: a.toolCallId) { tc in
+             guard case .running(let running) = tc else { return tc }
+diff --git a/docs/.changes/20260818-tool-call-progress.json b/docs/.changes/20260818-tool-call-progress.json
+new file mode 100644
+index 000000000..4465a804f
+--- /dev/null
++++ b/docs/.changes/20260818-tool-call-progress.json
+@@ -0,0 +1,4 @@
++{
++  "type": "added",
++  "message": "`chat/toolCallProgress` action and `ToolCallRunningState.progress`, so a host can report that a running tool call is still working: the elapsed time on the producer's own clock plus an optional description of the current step. Progress is replaced wholesale by each report and is dropped when the call leaves `running`, so a replayed snapshot never shows stale elapsed time."
++}
+diff --git a/docs/guide/actions.md b/docs/guide/actions.md
+index db0ad6a88..7d612ac76 100644
+--- a/docs/guide/actions.md
++++ b/docs/guide/actions.md
+@@ -72,6 +72,7 @@ Tool calls follow a discriminated-union state machine — see [State Model — T
+ | `chat/toolCallComplete` | **Yes**¹ | Tool execution finished |
+ | `chat/toolCallResultConfirmed` | **Yes** | Client approves or denies a pending result |
+ | `chat/toolCallContentChanged` | **Yes**¹ | Streaming intermediate content while a tool is running |
++| `chat/toolCallProgress` | **Yes**¹ | Running tool is still working; elapsed time and an optional description of the current step |
+ | `chat/toolCallAuthRequired` | No | Running MCP-contributed tool call pauses pending authentication |
+ | `chat/toolCallAuthResolved` | No | Authentication resolved; tool call resumes to `running` |
+ 
+diff --git a/docs/guide/state-model.md b/docs/guide/state-model.md
+index fdac79e61..aa19bf2e7 100644
+--- a/docs/guide/state-model.md
++++ b/docs/guide/state-model.md
+@@ -369,6 +369,7 @@ stateDiagram-v2
+   pending_confirmation --> cancelled : toolCallConfirmed (denied/skipped)
+ 
+   running --> pending_confirmation : toolCallReady (re‑confirmation)
++  running --> running : toolCallProgress
+   running --> auth_required : toolCallAuthRequired
+   running --> completed : toolCallComplete
+   running --> pending_result_confirmation : toolCallComplete (requiresResultConfirmation)
+@@ -389,7 +390,7 @@ stateDiagram-v2
+ | ----------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+ | `streaming`                   | `partialInput?`, `invocationMessage?`                                | LM is streaming tool call parameters. `partialInput` accumulates when deltas include parameter content. |
+ | `pending-confirmation`        | `invocationMessage`, `toolInput?`, `edits?`, `editable?`, `options?` | Parameters complete or mid-execution confirmation needed. `toolInput` may be inline or a `ContentRef`, at the host's discretion. `edits` previews file changes. `editable` indicates the client may edit parameters before confirming. `options` provides server-defined choices beyond simple approve/deny (see below). Uses `_meta` for additional context. |
+-| `running`                     | `confirmed`, `selectedOption?`                                       | Tool is executing. `confirmed` records how it was approved. `selectedOption` holds the chosen confirmation option, if any.                                                                                                                                                             |
++| `running`                     | `confirmed`, `selectedOption?`, `progress?`                          | Tool is executing. `confirmed` records how it was approved. `selectedOption` holds the chosen confirmation option, if any. `progress` holds the most recent `chat/toolCallProgress` report and is dropped when the call leaves `running`, since a completed call states its own duration.                                                                                                                                                             |
+ | `auth-required`               | `confirmed`, `selectedOption?`, `contributor` (MCP), `auth`          | Execution paused pending MCP authentication (see below). Only reachable for MCP-contributed tool calls.                                                                                                                                                                               |
+ | `pending-result-confirmation` | `success`, `pastTenseMessage`, `content?`, `selectedOption?`         | Execution finished, waiting for client to approve the result.                                                                                                                                                                                                                          |
+ | `completed`                   | `success`, `pastTenseMessage`, `content?`, `selectedOption?`         | Terminal state. Tool finished.                                                                                                                                                                                                                                                         |
+diff --git a/schema/actions.schema.json b/schema/actions.schema.json
+index 32bada2a4..3d8d2343e 100644
+--- a/schema/actions.schema.json
++++ b/schema/actions.schema.json
+@@ -1155,6 +1155,42 @@
+         "content"
+       ]
+     },
++    "ChatToolCallProgressAction": {
++      "type": "object",
++      "description": "A running tool call is still working.\n\nHosts SHOULD dispatch this periodically while a tool call executes, so a\nclient can tell slow work apart from a stalled session. It carries no\nresult and does not change the tool call status, and a call that reports\nno progress is not thereby stalled.\n\n`elapsedMs` is measured by the producer's own clock and is milliseconds,\nlike every other duration in the protocol. Clients MUST NOT derive it by\nsubtracting timestamps, since cross-client clocks may differ; treat it as\nopaque, producer-supplied data, exactly as with\n{@link ChatTurnCompleteAction.duration}.\n\nFor client-provided tools (whose tool call state carries a client\n{@link ToolCallContributor} with a `clientId`), the owning client\ndispatches this while executing, since the server cannot observe that\nwork. The server SHOULD reject this action if the dispatching client does\nnot match the contributor's `clientId`.",
++      "properties": {
++        "turnId": {
++          "type": "string",
++          "description": "Turn identifier"
++        },
++        "toolCallId": {
++          "type": "string",
++          "description": "Tool call identifier"
++        },
++        "_meta": {
++          "type": "object",
++          "additionalProperties": {},
++          "description": "Additional provider-specific metadata for this tool call.\n\nClients MAY look for well-known keys here to provide enhanced UI.\nFor example, a `ptyTerminal` key with `{ input: string; output: string }`\nindicates the tool operated on a terminal (both `input` and `output` may\ncontain escape sequences)."
++        },
++        "type": {
++          "const": "chat/toolCallProgress"
++        },
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "turnId",
++        "toolCallId",
++        "type",
++        "elapsedMs"
++      ]
++    },
+     "ChatToolCallAuthRequiredAction": {
+       "type": "object",
+       "description": "A running tool call is paused pending MCP authentication. Transitions the\ntool call from `running` to `auth-required`.\n\nThe server dispatches this when the MCP server backing the call responds\nwith a 401/403 challenge mid-execution (see\n{@link McpAuthRequirement.reason | `insufficientScope`}). The host SHOULD\npair this with `session/inputNeededSet` (kind `toolAuthentication`) so the\nblock is visible at the session-summary level, mirroring\n{@link McpServerAuthRequiredState}'s own `InputNeeded` guidance.\n\nOnly valid for tool calls contributed by an MCP server — the reducer is a\nno-op if the tool call's `contributor` is not\n{@link ToolCallContributorKind.MCP | MCP-kind}.",
+@@ -2155,6 +2191,9 @@
+         {
+           "$ref": "#/$defs/ChatToolCallContentChangedAction"
+         },
++        {
++          "$ref": "#/$defs/ChatToolCallProgressAction"
++        },
+         {
+           "$ref": "#/$defs/ChatToolCallAuthRequiredAction"
+         },
+@@ -5988,6 +6027,23 @@
+         "confirmed"
+       ]
+     },
++    "ToolCallProgress": {
++      "type": "object",
++      "description": "A point-in-time report that a running tool call is still working.",
++      "properties": {
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "elapsedMs"
++      ]
++    },
+     "ToolCallRunningState": {
+       "type": "object",
+       "description": "Tool is actively executing.",
+@@ -6042,6 +6098,10 @@
+             "$ref": "#/$defs/ToolResultContent"
+           },
+           "description": "Partial content produced while the tool is still executing.\n\nFor example, a terminal content block lets clients subscribe to live\noutput before the tool completes."
++        },
++        "progress": {
++          "$ref": "#/$defs/ToolCallProgress",
++          "description": "Most recent progress reported while the tool has been executing.\n\nReplaced wholesale by each `chat/toolCallProgress`. Absent until the host\nreports any, and not carried out of `running`: a completed call states\nits own duration, so stale progress would only contradict it."
+         }
+       },
+       "required": [
+@@ -7731,6 +7791,9 @@
+         {
+           "$ref": "#/$defs/ChatToolCallContentChangedAction"
+         },
++        {
++          "$ref": "#/$defs/ChatToolCallProgressAction"
++        },
+         {
+           "$ref": "#/$defs/ChatToolCallAuthRequiredAction"
+         },
+diff --git a/schema/commands.schema.json b/schema/commands.schema.json
+index 86f74db48..bbe1e1c36 100644
+--- a/schema/commands.schema.json
++++ b/schema/commands.schema.json
+@@ -5272,6 +5272,23 @@
+         "confirmed"
+       ]
+     },
++    "ToolCallProgress": {
++      "type": "object",
++      "description": "A point-in-time report that a running tool call is still working.",
++      "properties": {
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "elapsedMs"
++      ]
++    },
+     "ToolCallRunningState": {
+       "type": "object",
+       "description": "Tool is actively executing.",
+@@ -5326,6 +5343,10 @@
+             "$ref": "#/$defs/ToolResultContent"
+           },
+           "description": "Partial content produced while the tool is still executing.\n\nFor example, a terminal content block lets clients subscribe to live\noutput before the tool completes."
++        },
++        "progress": {
++          "$ref": "#/$defs/ToolCallProgress",
++          "description": "Most recent progress reported while the tool has been executing.\n\nReplaced wholesale by each `chat/toolCallProgress`. Absent until the host\nreports any, and not carried out of `running`: a completed call states\nits own duration, so stale progress would only contradict it."
+         }
+       },
+       "required": [
+@@ -7548,6 +7569,42 @@
+         "content"
+       ]
+     },
++    "ChatToolCallProgressAction": {
++      "type": "object",
++      "description": "A running tool call is still working.\n\nHosts SHOULD dispatch this periodically while a tool call executes, so a\nclient can tell slow work apart from a stalled session. It carries no\nresult and does not change the tool call status, and a call that reports\nno progress is not thereby stalled.\n\n`elapsedMs` is measured by the producer's own clock and is milliseconds,\nlike every other duration in the protocol. Clients MUST NOT derive it by\nsubtracting timestamps, since cross-client clocks may differ; treat it as\nopaque, producer-supplied data, exactly as with\n{@link ChatTurnCompleteAction.duration}.\n\nFor client-provided tools (whose tool call state carries a client\n{@link ToolCallContributor} with a `clientId`), the owning client\ndispatches this while executing, since the server cannot observe that\nwork. The server SHOULD reject this action if the dispatching client does\nnot match the contributor's `clientId`.",
++      "properties": {
++        "turnId": {
++          "type": "string",
++          "description": "Turn identifier"
++        },
++        "toolCallId": {
++          "type": "string",
++          "description": "Tool call identifier"
++        },
++        "_meta": {
++          "type": "object",
++          "additionalProperties": {},
++          "description": "Additional provider-specific metadata for this tool call.\n\nClients MAY look for well-known keys here to provide enhanced UI.\nFor example, a `ptyTerminal` key with `{ input: string; output: string }`\nindicates the tool operated on a terminal (both `input` and `output` may\ncontain escape sequences)."
++        },
++        "type": {
++          "const": "chat/toolCallProgress"
++        },
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "turnId",
++        "toolCallId",
++        "type",
++        "elapsedMs"
++      ]
++    },
+     "ChatToolCallAuthRequiredAction": {
+       "type": "object",
+       "description": "A running tool call is paused pending MCP authentication. Transitions the\ntool call from `running` to `auth-required`.\n\nThe server dispatches this when the MCP server backing the call responds\nwith a 401/403 challenge mid-execution (see\n{@link McpAuthRequirement.reason | `insufficientScope`}). The host SHOULD\npair this with `session/inputNeededSet` (kind `toolAuthentication`) so the\nblock is visible at the session-summary level, mirroring\n{@link McpServerAuthRequiredState}'s own `InputNeeded` guidance.\n\nOnly valid for tool calls contributed by an MCP server — the reducer is a\nno-op if the tool call's `contributor` is not\n{@link ToolCallContributorKind.MCP | MCP-kind}.",
+@@ -8637,6 +8694,9 @@
+         {
+           "$ref": "#/$defs/ChatToolCallContentChangedAction"
+         },
++        {
++          "$ref": "#/$defs/ChatToolCallProgressAction"
++        },
+         {
+           "$ref": "#/$defs/ChatToolCallAuthRequiredAction"
+         },
+diff --git a/schema/errors.schema.json b/schema/errors.schema.json
+index 893efc16c..927779e2d 100644
+--- a/schema/errors.schema.json
++++ b/schema/errors.schema.json
+@@ -3868,6 +3868,23 @@
+         "confirmed"
+       ]
+     },
++    "ToolCallProgress": {
++      "type": "object",
++      "description": "A point-in-time report that a running tool call is still working.",
++      "properties": {
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "elapsedMs"
++      ]
++    },
+     "ToolCallRunningState": {
+       "type": "object",
+       "description": "Tool is actively executing.",
+@@ -3922,6 +3939,10 @@
+             "$ref": "#/$defs/ToolResultContent"
+           },
+           "description": "Partial content produced while the tool is still executing.\n\nFor example, a terminal content block lets clients subscribe to live\noutput before the tool completes."
++        },
++        "progress": {
++          "$ref": "#/$defs/ToolCallProgress",
++          "description": "Most recent progress reported while the tool has been executing.\n\nReplaced wholesale by each `chat/toolCallProgress`. Absent until the host\nreports any, and not carried out of `running`: a completed call states\nits own duration, so stale progress would only contradict it."
+         }
+       },
+       "required": [
+@@ -7277,6 +7298,9 @@
+         {
+           "$ref": "#/$defs/ChatToolCallContentChangedAction"
+         },
++        {
++          "$ref": "#/$defs/ChatToolCallProgressAction"
++        },
+         {
+           "$ref": "#/$defs/ChatToolCallAuthRequiredAction"
+         },
+@@ -8521,6 +8545,42 @@
+         "content"
+       ]
+     },
++    "ChatToolCallProgressAction": {
++      "type": "object",
++      "description": "A running tool call is still working.\n\nHosts SHOULD dispatch this periodically while a tool call executes, so a\nclient can tell slow work apart from a stalled session. It carries no\nresult and does not change the tool call status, and a call that reports\nno progress is not thereby stalled.\n\n`elapsedMs` is measured by the producer's own clock and is milliseconds,\nlike every other duration in the protocol. Clients MUST NOT derive it by\nsubtracting timestamps, since cross-client clocks may differ; treat it as\nopaque, producer-supplied data, exactly as with\n{@link ChatTurnCompleteAction.duration}.\n\nFor client-provided tools (whose tool call state carries a client\n{@link ToolCallContributor} with a `clientId`), the owning client\ndispatches this while executing, since the server cannot observe that\nwork. The server SHOULD reject this action if the dispatching client does\nnot match the contributor's `clientId`.",
++      "properties": {
++        "turnId": {
++          "type": "string",
++          "description": "Turn identifier"
++        },
++        "toolCallId": {
++          "type": "string",
++          "description": "Tool call identifier"
++        },
++        "_meta": {
++          "type": "object",
++          "additionalProperties": {},
++          "description": "Additional provider-specific metadata for this tool call.\n\nClients MAY look for well-known keys here to provide enhanced UI.\nFor example, a `ptyTerminal` key with `{ input: string; output: string }`\nindicates the tool operated on a terminal (both `input` and `output` may\ncontain escape sequences)."
++        },
++        "type": {
++          "const": "chat/toolCallProgress"
++        },
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "turnId",
++        "toolCallId",
++        "type",
++        "elapsedMs"
++      ]
++    },
+     "ChatToolCallAuthRequiredAction": {
+       "type": "object",
+       "description": "A running tool call is paused pending MCP authentication. Transitions the\ntool call from `running` to `auth-required`.\n\nThe server dispatches this when the MCP server backing the call responds\nwith a 401/403 challenge mid-execution (see\n{@link McpAuthRequirement.reason | `insufficientScope`}). The host SHOULD\npair this with `session/inputNeededSet` (kind `toolAuthentication`) so the\nblock is visible at the session-summary level, mirroring\n{@link McpServerAuthRequiredState}'s own `InputNeeded` guidance.\n\nOnly valid for tool calls contributed by an MCP server — the reducer is a\nno-op if the tool call's `contributor` is not\n{@link ToolCallContributorKind.MCP | MCP-kind}.",
+diff --git a/schema/notifications.schema.json b/schema/notifications.schema.json
+index be00480fd..708920dba 100644
+--- a/schema/notifications.schema.json
++++ b/schema/notifications.schema.json
+@@ -4031,6 +4031,23 @@
+         "confirmed"
+       ]
+     },
++    "ToolCallProgress": {
++      "type": "object",
++      "description": "A point-in-time report that a running tool call is still working.",
++      "properties": {
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "elapsedMs"
++      ]
++    },
+     "ToolCallRunningState": {
+       "type": "object",
+       "description": "Tool is actively executing.",
+@@ -4085,6 +4102,10 @@
+             "$ref": "#/$defs/ToolResultContent"
+           },
+           "description": "Partial content produced while the tool is still executing.\n\nFor example, a terminal content block lets clients subscribe to live\noutput before the tool completes."
++        },
++        "progress": {
++          "$ref": "#/$defs/ToolCallProgress",
++          "description": "Most recent progress reported while the tool has been executing.\n\nReplaced wholesale by each `chat/toolCallProgress`. Absent until the host\nreports any, and not carried out of `running`: a completed call states\nits own duration, so stale progress would only contradict it."
+         }
+       },
+       "required": [
+diff --git a/schema/state.schema.json b/schema/state.schema.json
+index 1101ab338..cfd9f5560 100644
+--- a/schema/state.schema.json
++++ b/schema/state.schema.json
+@@ -3779,6 +3779,23 @@
+         "confirmed"
+       ]
+     },
++    "ToolCallProgress": {
++      "type": "object",
++      "description": "A point-in-time report that a running tool call is still working.",
++      "properties": {
++        "elapsedMs": {
++          "type": "number",
++          "description": "Milliseconds the tool call has been executing, per the producer's own clock"
++        },
++        "message": {
++          "$ref": "#/$defs/StringOrMarkdown",
++          "description": "What the tool is doing right now, when the host knows. Absent for a bare\nliveness report."
++        }
++      },
++      "required": [
++        "elapsedMs"
++      ]
++    },
+     "ToolCallRunningState": {
+       "type": "object",
+       "description": "Tool is actively executing.",
+@@ -3833,6 +3850,10 @@
+             "$ref": "#/$defs/ToolResultContent"
+           },
+           "description": "Partial content produced while the tool is still executing.\n\nFor example, a terminal content block lets clients subscribe to live\noutput before the tool completes."
++        },
++        "progress": {
++          "$ref": "#/$defs/ToolCallProgress",
++          "description": "Most recent progress reported while the tool has been executing.\n\nReplaced wholesale by each `chat/toolCallProgress`. Absent until the host\nreports any, and not carried out of `running`: a completed call states\nits own duration, so stale progress would only contradict it."
+         }
+       },
+       "required": [
+diff --git a/scripts/generate-go.ts b/scripts/generate-go.ts
+index d9710e193..b09552f89 100644
+--- a/scripts/generate-go.ts
++++ b/scripts/generate-go.ts
+@@ -770,6 +770,7 @@ const STATE_STRUCTS: { name: string; omitDiscriminants?: boolean; goName?: strin
+   { name: 'ToolCallStreamingState' },
+   { name: 'ToolCallPendingConfirmationState' },
+   { name: 'ToolCallRunningState' },
++  { name: 'ToolCallProgress' },
+   { name: 'ToolCallAuthRequiredState' },
+   { name: 'ToolCallPendingResultConfirmationState' },
+   { name: 'ToolCallCompletedState' },
+@@ -1392,6 +1393,7 @@ const ACTION_VARIANTS: {
+   { type: 'chat/toolCallComplete', variantName: 'ChatToolCallComplete', tsInterface: 'ChatToolCallCompleteAction' },
+   { type: 'chat/toolCallResultConfirmed', variantName: 'ChatToolCallResultConfirmed', tsInterface: 'ChatToolCallResultConfirmedAction' },
+   { type: 'chat/toolCallContentChanged', variantName: 'ChatToolCallContentChanged', tsInterface: 'ChatToolCallContentChangedAction' },
++  { type: 'chat/toolCallProgress', variantName: 'ChatToolCallProgress', tsInterface: 'ChatToolCallProgressAction' },
+   { type: 'chat/toolCallAuthRequired', variantName: 'ChatToolCallAuthRequired', tsInterface: 'ChatToolCallAuthRequiredAction' },
+   { type: 'chat/toolCallAuthResolved', variantName: 'ChatToolCallAuthResolved', tsInterface: 'ChatToolCallAuthResolvedAction' },
+   { type: 'chat/turnComplete', variantName: 'ChatTurnComplete', tsInterface: 'ChatTurnCompleteAction' },
+diff --git a/scripts/generate-kotlin.ts b/scripts/generate-kotlin.ts
+index 4a1d12536..d666d54a5 100644
+--- a/scripts/generate-kotlin.ts
++++ b/scripts/generate-kotlin.ts
+@@ -932,7 +932,7 @@ const STATE_STRUCTS = [
+   'ResourceResponsePart', 'ToolCallResponsePart', 'ReasoningResponsePart',
+   'SystemNotificationResponsePart', 'InputRequestResponsePart',
+   'ToolCallResult', 'ToolCallStreamingState',
+-  'ToolCallPendingConfirmationState', 'ToolCallRunningState', 'ToolCallAuthRequiredState',
++  'ToolCallPendingConfirmationState', 'ToolCallRunningState', 'ToolCallProgress', 'ToolCallAuthRequiredState',
+   'ToolCallPendingResultConfirmationState', 'ToolCallCompletedState',
+   'ToolCallCancelledState', 'ToolCallRiskAssessmentLoadingState',
+   'ToolCallRiskAssessmentCompleteState', 'ConfirmationOption',
+@@ -1331,6 +1331,7 @@ const ACTION_VARIANTS: { type: string; caseName: string; tsInterface: string }[]
+   { type: 'chat/toolCallComplete', caseName: 'ChatToolCallComplete', tsInterface: 'ChatToolCallCompleteAction' },
+   { type: 'chat/toolCallResultConfirmed', caseName: 'ChatToolCallResultConfirmed', tsInterface: 'ChatToolCallResultConfirmedAction' },
+   { type: 'chat/toolCallContentChanged', caseName: 'ChatToolCallContentChanged', tsInterface: 'ChatToolCallContentChangedAction' },
++  { type: 'chat/toolCallProgress', caseName: 'ChatToolCallProgress', tsInterface: 'ChatToolCallProgressAction' },
+   { type: 'chat/toolCallAuthRequired', caseName: 'ChatToolCallAuthRequired', tsInterface: 'ChatToolCallAuthRequiredAction' },
+   { type: 'chat/toolCallAuthResolved', caseName: 'ChatToolCallAuthResolved', tsInterface: 'ChatToolCallAuthResolvedAction' },
+   { type: 'chat/turnComplete', caseName: 'ChatTurnComplete', tsInterface: 'ChatTurnCompleteAction' },
+diff --git a/scripts/generate-rust.ts b/scripts/generate-rust.ts
+index 5524b3ae4..cb09e069c 100644
+--- a/scripts/generate-rust.ts
++++ b/scripts/generate-rust.ts
+@@ -753,6 +753,7 @@ const STATE_STRUCTS: { name: string; omitDiscriminants?: boolean; rustName?: str
+   { name: 'ToolCallStreamingState', omitDiscriminants: true },
+   { name: 'ToolCallPendingConfirmationState', omitDiscriminants: true },
+   { name: 'ToolCallRunningState', omitDiscriminants: true },
++  { name: 'ToolCallProgress' },
+   { name: 'ToolCallAuthRequiredState' },
+   { name: 'ToolCallPendingResultConfirmationState', omitDiscriminants: true },
+   { name: 'ToolCallCompletedState', omitDiscriminants: true },
+@@ -1230,6 +1231,7 @@ const ACTION_VARIANTS: {
+   { type: 'chat/toolCallComplete', variantName: 'ChatToolCallComplete', tsInterface: 'ChatToolCallCompleteAction' },
+   { type: 'chat/toolCallResultConfirmed', variantName: 'ChatToolCallResultConfirmed', tsInterface: 'ChatToolCallResultConfirmedAction' },
+   { type: 'chat/toolCallContentChanged', variantName: 'ChatToolCallContentChanged', tsInterface: 'ChatToolCallContentChangedAction' },
++  { type: 'chat/toolCallProgress', variantName: 'ChatToolCallProgress', tsInterface: 'ChatToolCallProgressAction' },
+   { type: 'chat/toolCallAuthRequired', variantName: 'ChatToolCallAuthRequired', tsInterface: 'ChatToolCallAuthRequiredAction' },
+   { type: 'chat/toolCallAuthResolved', variantName: 'ChatToolCallAuthResolved', tsInterface: 'ChatToolCallAuthResolvedAction' },
+   { type: 'chat/turnComplete', variantName: 'ChatTurnComplete', tsInterface: 'ChatTurnCompleteAction' },
+diff --git a/scripts/generate-swift.ts b/scripts/generate-swift.ts
+index 3126947eb..3de9149d1 100644
+--- a/scripts/generate-swift.ts
++++ b/scripts/generate-swift.ts
+@@ -641,7 +641,7 @@ const STATE_STRUCTS = [
+   'ResourceResponsePart', 'ToolCallResponsePart', 'ReasoningResponsePart',
+   'SystemNotificationResponsePart', 'InputRequestResponsePart',
+   'ToolCallResult', 'ToolCallStreamingState',
+-  'ToolCallPendingConfirmationState', 'ToolCallRunningState', 'ToolCallAuthRequiredState',
++  'ToolCallPendingConfirmationState', 'ToolCallRunningState', 'ToolCallProgress', 'ToolCallAuthRequiredState',
+   'ToolCallPendingResultConfirmationState', 'ToolCallCompletedState',
+   'ToolCallCancelledState', 'ToolCallRiskAssessmentLoadingState',
+   'ToolCallRiskAssessmentCompleteState', 'ConfirmationOption',
+@@ -1224,6 +1224,7 @@ const ACTION_VARIANTS: { type: string; caseName: string; tsInterface: string }[]
+   { type: 'chat/toolCallComplete', caseName: 'chatToolCallComplete', tsInterface: 'ChatToolCallCompleteAction' },
+   { type: 'chat/toolCallResultConfirmed', caseName: 'chatToolCallResultConfirmed', tsInterface: 'ChatToolCallResultConfirmedAction' },
+   { type: 'chat/toolCallContentChanged', caseName: 'chatToolCallContentChanged', tsInterface: 'ChatToolCallContentChangedAction' },
++  { type: 'chat/toolCallProgress', caseName: 'chatToolCallProgress', tsInterface: 'ChatToolCallProgressAction' },
+   { type: 'chat/toolCallAuthRequired', caseName: 'chatToolCallAuthRequired', tsInterface: 'ChatToolCallAuthRequiredAction' },
+   { type: 'chat/toolCallAuthResolved', caseName: 'chatToolCallAuthResolved', tsInterface: 'ChatToolCallAuthResolvedAction' },
+   { type: 'chat/turnComplete', caseName: 'chatTurnComplete', tsInterface: 'ChatTurnCompleteAction' },
+diff --git a/types/action-origin.generated.ts b/types/action-origin.generated.ts
+index b1f4a7840..5175800fc 100644
+--- a/types/action-origin.generated.ts
++++ b/types/action-origin.generated.ts
+@@ -45,6 +45,7 @@ import type {
+   ChatToolCallCompleteAction,
+   ChatToolCallResultConfirmedAction,
+   ChatToolCallContentChangedAction,
++  ChatToolCallProgressAction,
+   ChatToolCallAuthRequiredAction,
+   ChatToolCallAuthResolvedAction,
+   ChatTurnCompleteAction,
+@@ -195,6 +196,7 @@ export type ChatAction =
+   | ChatToolCallCompleteAction
+   | ChatToolCallResultConfirmedAction
+   | ChatToolCallContentChangedAction
++  | ChatToolCallProgressAction
+   | ChatToolCallAuthRequiredAction
+   | ChatToolCallAuthResolvedAction
+   | ChatTurnCompleteAction
+@@ -223,6 +225,7 @@ export type ClientChatAction =
+   | ChatToolCallCompleteAction
+   | ChatToolCallResultConfirmedAction
+   | ChatToolCallContentChangedAction
++  | ChatToolCallProgressAction
+   | ChatTurnCancelledAction
+   | ChatWorkingDirectorySetAction
+   | ChatWorkingDirectoryRemovedAction
+@@ -402,6 +405,7 @@ export const IS_CLIENT_DISPATCHABLE: { readonly [K in StateAction['type']]: bool
+   [ActionType.ChatToolCallComplete]: true,
+   [ActionType.ChatToolCallResultConfirmed]: true,
+   [ActionType.ChatToolCallContentChanged]: true,
++  [ActionType.ChatToolCallProgress]: true,
+   [ActionType.ChatToolCallAuthRequired]: false,
+   [ActionType.ChatToolCallAuthResolved]: false,
+   [ActionType.ChatTurnComplete]: false,
+diff --git a/types/channels-chat/actions.ts b/types/channels-chat/actions.ts
+index caecaeb11..e944a3e0c 100644
+--- a/types/channels-chat/actions.ts
++++ b/types/channels-chat/actions.ts
+@@ -372,6 +372,41 @@ export interface ChatToolCallContentChangedAction extends ToolCallActionBase {
+   content: ToolResultContent[];
+ }
+ 
++/**
++ * A running tool call is still working.
++ *
++ * Hosts SHOULD dispatch this periodically while a tool call executes, so a
++ * client can tell slow work apart from a stalled session. It carries no
++ * result and does not change the tool call status, and a call that reports
++ * no progress is not thereby stalled.
++ *
++ * `elapsedMs` is measured by the producer's own clock and is milliseconds,
++ * like every other duration in the protocol. Clients MUST NOT derive it by
++ * subtracting timestamps, since cross-client clocks may differ; treat it as
++ * opaque, producer-supplied data, exactly as with
++ * {@link ChatTurnCompleteAction.duration}.
++ *
++ * For client-provided tools (whose tool call state carries a client
++ * {@link ToolCallContributor} with a `clientId`), the owning client
++ * dispatches this while executing, since the server cannot observe that
++ * work. The server SHOULD reject this action if the dispatching client does
++ * not match the contributor's `clientId`.
++ *
++ * @category Chat Actions
++ * @version 1
++ * @clientDispatchable
++ */
++export interface ChatToolCallProgressAction extends ToolCallActionBase {
++  type: ActionType.ChatToolCallProgress;
++  /** Milliseconds the tool call has been executing, per the producer's own clock */
++  elapsedMs: number;
++  /**
++   * What the tool is doing right now, when the host knows. Absent for a bare
++   * liveness report.
++   */
++  message?: StringOrMarkdown;
++}
++
+ /**
+  * A running tool call is paused pending MCP authentication. Transitions the
+  * tool call from `running` to `auth-required`.
+@@ -816,6 +851,7 @@ export type ChatAction =
+   | ChatToolCallCompleteAction
+   | ChatToolCallResultConfirmedAction
+   | ChatToolCallContentChangedAction
++  | ChatToolCallProgressAction
+   | ChatToolCallAuthRequiredAction
+   | ChatToolCallAuthResolvedAction
+   | ChatTurnCompleteAction
+diff --git a/types/channels-chat/reducer.ts b/types/channels-chat/reducer.ts
+index b170cefb2..e5b849b3f 100644
+--- a/types/channels-chat/reducer.ts
++++ b/types/channels-chat/reducer.ts
+@@ -643,6 +643,20 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+           content: action.content,
+         };
+       });
++    case ActionType.ChatToolCallProgress:
++      return updateToolCallInParts(state, action.turnId, action.toolCallId, tc => {
++        if (tc.status !== ToolCallStatus.Running) {
++          return tc;
++        }
++        return {
++          ...tc,
++          ...(action._meta !== undefined ? { _meta: action._meta } : {}),
++          progress: {
++            elapsedMs: action.elapsedMs,
++            ...(action.message !== undefined ? { message: action.message } : {}),
++          },
++        };
++      });
+ 
+     case ActionType.ChatToolCallAuthRequired:
+       return refreshSummaryStatus(updateToolCallInParts(state, action.turnId, action.toolCallId, tc => {
+diff --git a/types/channels-chat/state.ts b/types/channels-chat/state.ts
+index 8e107a23b..409594ab2 100644
+--- a/types/channels-chat/state.ts
++++ b/types/channels-chat/state.ts
+@@ -1285,6 +1285,21 @@ interface ToolCallPostConfirmationFields {
+   selectedOption?: ConfirmationOption;
+ }
+ 
++/**
++ * A point-in-time report that a running tool call is still working.
++ *
++ * @category Tool Call Types
++ */
++export interface ToolCallProgress {
++  /** Milliseconds the tool call has been executing, per the producer's own clock */
++  elapsedMs: number;
++  /**
++   * What the tool is doing right now, when the host knows. Absent for a bare
++   * liveness report.
++   */
++  message?: StringOrMarkdown;
++}
++
+ /**
+  * Tool is actively executing.
+  *
+@@ -1299,6 +1314,14 @@ export interface ToolCallRunningState extends ToolCallBase, ToolCallParameterFie
+    * output before the tool completes.
+    */
+   content?: ToolResultContent[];
++  /**
++   * Most recent progress reported while the tool has been executing.
++   *
++   * Replaced wholesale by each `chat/toolCallProgress`. Absent until the host
++   * reports any, and not carried out of `running`: a completed call states
++   * its own duration, so stale progress would only contradict it.
++   */
++  progress?: ToolCallProgress;
+ }
+ 
+ /**
+diff --git a/types/common/actions.ts b/types/common/actions.ts
+index 694f526e7..dfa74962a 100644
+--- a/types/common/actions.ts
++++ b/types/common/actions.ts
+@@ -57,6 +57,7 @@ import type {
+   ChatToolCallCompleteAction,
+   ChatToolCallResultConfirmedAction,
+   ChatToolCallContentChangedAction,
++  ChatToolCallProgressAction,
+   ChatToolCallAuthRequiredAction,
+   ChatToolCallAuthResolvedAction,
+   ChatTurnCompleteAction,
+@@ -141,6 +142,7 @@ export const enum ActionType {
+   ChatToolCallComplete = 'chat/toolCallComplete',
+   ChatToolCallResultConfirmed = 'chat/toolCallResultConfirmed',
+   ChatToolCallContentChanged = 'chat/toolCallContentChanged',
++  ChatToolCallProgress = 'chat/toolCallProgress',
+   ChatToolCallAuthRequired = 'chat/toolCallAuthRequired',
+   ChatToolCallAuthResolved = 'chat/toolCallAuthResolved',
+   ChatTurnComplete = 'chat/turnComplete',
+@@ -287,6 +289,7 @@ export type StateAction =
+   | ChatToolCallCompleteAction
+   | ChatToolCallResultConfirmedAction
+   | ChatToolCallContentChangedAction
++  | ChatToolCallProgressAction
+   | ChatToolCallAuthRequiredAction
+   | ChatToolCallAuthResolvedAction
+   | ChatTurnCompleteAction
+diff --git a/types/test-cases/reducers/271-toolcall-progress-updates-running.json b/types/test-cases/reducers/271-toolcall-progress-updates-running.json
+new file mode 100644
+index 000000000..b06720afe
+--- /dev/null
++++ b/types/test-cases/reducers/271-toolcall-progress-updates-running.json
+@@ -0,0 +1,87 @@
++{
++  "description": "toolCallProgress records elapsed time and a message on a running tool call",
++  "reducer": "chat",
++  "initial": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action"
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/toolCallProgress",
++      "turnId": "turn-1",
++      "toolCallId": "tc-1",
++      "elapsedMs": 30000,
++      "message": "Reading src/main.ts"
++    }
++  ],
++  "expected": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action",
++            "progress": {
++              "elapsedMs": 30000,
++              "message": "Reading src/main.ts"
++            }
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+diff --git a/types/test-cases/reducers/272-toolcall-progress-without-message.json b/types/test-cases/reducers/272-toolcall-progress-without-message.json
+new file mode 100644
+index 000000000..06ef2773b
+--- /dev/null
++++ b/types/test-cases/reducers/272-toolcall-progress-without-message.json
+@@ -0,0 +1,85 @@
++{
++  "description": "toolCallProgress with no message records a bare liveness report",
++  "reducer": "chat",
++  "initial": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action"
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/toolCallProgress",
++      "turnId": "turn-1",
++      "toolCallId": "tc-1",
++      "elapsedMs": 30000
++    }
++  ],
++  "expected": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action",
++            "progress": {
++              "elapsedMs": 30000
++            }
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+diff --git a/types/test-cases/reducers/273-toolcall-progress-replaces-previous.json b/types/test-cases/reducers/273-toolcall-progress-replaces-previous.json
+new file mode 100644
+index 000000000..29a959fe0
+--- /dev/null
++++ b/types/test-cases/reducers/273-toolcall-progress-replaces-previous.json
+@@ -0,0 +1,89 @@
++{
++  "description": "toolCallProgress replaces the previous report wholesale rather than merging it",
++  "reducer": "chat",
++  "initial": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action",
++            "progress": {
++              "elapsedMs": 30000,
++              "message": "Reading src/main.ts"
++            }
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/toolCallProgress",
++      "turnId": "turn-1",
++      "toolCallId": "tc-1",
++      "elapsedMs": 60000
++    }
++  ],
++  "expected": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action",
++            "progress": {
++              "elapsedMs": 60000
++            }
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+diff --git a/types/test-cases/reducers/274-toolcall-progress-noop-non-running.json b/types/test-cases/reducers/274-toolcall-progress-noop-non-running.json
+new file mode 100644
+index 000000000..0a9055831
+--- /dev/null
++++ b/types/test-cases/reducers/274-toolcall-progress-noop-non-running.json
+@@ -0,0 +1,87 @@
++{
++  "description": "toolCallProgress is a no-op for a tool call that is not running",
++  "reducer": "chat",
++  "initial": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "completed",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Ran command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action",
++            "success": true,
++            "pastTenseMessage": "Ran command"
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/toolCallProgress",
++      "turnId": "turn-1",
++      "toolCallId": "tc-1",
++      "elapsedMs": 30000,
++      "message": "too late"
++    }
++  ],
++  "expected": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "completed",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Ran command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action",
++            "success": true,
++            "pastTenseMessage": "Ran command"
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+diff --git a/types/test-cases/reducers/275-toolcall-progress-noop-unknown-toolcall.json b/types/test-cases/reducers/275-toolcall-progress-noop-unknown-toolcall.json
+new file mode 100644
+index 000000000..146c8c600
+--- /dev/null
++++ b/types/test-cases/reducers/275-toolcall-progress-noop-unknown-toolcall.json
+@@ -0,0 +1,82 @@
++{
++  "description": "toolCallProgress is a no-op when no tool call matches the id",
++  "reducer": "chat",
++  "initial": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action"
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/toolCallProgress",
++      "turnId": "turn-1",
++      "toolCallId": "tc-missing",
++      "elapsedMs": 30000
++    }
++  ],
++  "expected": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "toolCall",
++          "toolCall": {
++            "status": "running",
++            "toolCallId": "tc-1",
++            "toolName": "bash",
++            "displayName": "Run Command",
++            "intention": null,
++            "invocationMessage": "Running command",
++            "toolInput": {
++              "uri": "file:///tool-inputs/tool-input.json"
++            },
++            "confirmed": "user-action"
++          }
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+diff --git a/types/version/registry.ts b/types/version/registry.ts
+index d68787c60..df88b8f67 100644
+--- a/types/version/registry.ts
++++ b/types/version/registry.ts
+@@ -120,6 +120,7 @@ export const ACTION_INTRODUCED_IN: { readonly [K in StateAction['type']]: string
+   [ActionType.ChatToolCallComplete]: '0.4.0',
+   [ActionType.ChatToolCallResultConfirmed]: '0.4.0',
+   [ActionType.ChatToolCallContentChanged]: '0.4.0',
++  [ActionType.ChatToolCallProgress]: '1.0.0',
+   [ActionType.ChatToolCallAuthRequired]: '0.6.0',
+   [ActionType.ChatToolCallAuthResolved]: '0.6.0',
+   [ActionType.ChatTurnComplete]: '0.4.0',
+
+From 5918544c95fcc95eb80acf9ef1071340a028da05 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 20:57:46 -0400
+Subject: [PATCH 2/2] chat: document the client dispatch rule for tool call
+ progress
+
+The action's own JSDoc requires the server to reject a report whose
+dispatching client does not own the tool call, so the validation table
+should say so rather than leaving the rule only in the type.
+---
+ docs/specification/chat-channel.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/docs/specification/chat-channel.md b/docs/specification/chat-channel.md
+index 647646ac3..0a0d9d2ac 100644
+--- a/docs/specification/chat-channel.md
++++ b/docs/specification/chat-channel.md
+@@ -224,6 +224,7 @@ When the server receives a client-dispatched action on this channel, it MUST val
+ | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+ | Any action referencing a non-existent chat | Channel URI not found                                                                                                      | Server MUST silently ignore the action (no echo)                                                 |
+ | `chat/toolCallConfirmed`                   | Tool call not in `pending-confirmation` state                                                                              | Server MUST reject the action                                                                    |
++| `chat/toolCallProgress`                    | Dispatching client does not match the tool call's client `contributor.clientId`                                | Server SHOULD reject the action                                                                   |
+ | `chat/turnCancelled`                       | No active turn                                                                                                             | Server MUST reject the action                                                                    |
+ | `chat/inputAnswerChanged`                  | No input request with matching `requestId`                                                                                 | Server SHOULD reject the action                                                                  |
+ | `chat/inputAnswerChanged`                  | `answer.state` requires a value but `answer.value` is absent, or `answer.value.kind` is missing the matching payload field | Server SHOULD reject the action                                                                  |

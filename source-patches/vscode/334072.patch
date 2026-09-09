@@ -1,0 +1,586 @@
+From 2b3bee00ba9c45f20d4fb28d99dd1219d425ac61 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 14:04:58 -0400
+Subject: [PATCH 1/2] Keep observing a subagent whose chat outlives its
+ spawning turn
+
+Subagent chat observations were owned by the parent turn's `_observeTurn` store, so
+`onTurnEnded` disposed them along with the child chat subscription. When the parent
+turn completes before the subagent's chat is created, that disposal sends an
+`unsubscribe` while the client's `subscribe` is still in flight; the server's
+post-await liveness check then fails it and the protocol handler reports it as
+`Resource not found`. Nothing re-subscribes afterwards, so the subagent's tool calls
+are never claimed and its turn never closes.
+
+The same ownership breaks background subagents outright: those are designed to
+outlive their parent turn, so their chat must stay observable after it ends.
+
+Subagent observations are now handed off at turn end instead of being torn down. An
+observation whose child chat is still running, or has not been created yet, moves to
+a session-scoped map and is released when the subagent settles, when a live in-turn
+observation supersedes it, or when the chat session is torn down. Observations whose
+subagent already finished are disposed exactly as before. A detached observer stops
+emitting into its parent's now-closed response, but keeps the subscription and the
+tool call claim that let the subagent finish.
+---
+ .../agentHost/agentHostSessionHandler.ts      | 100 ++++++++++++++-
+ .../agentHostChatContribution.test.ts         | 120 ++++++++++++++++++
+ 2 files changed, 215 insertions(+), 5 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 1847355cbf345..69757a291879e 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -277,7 +277,11 @@ function isResumeTurnConfirmationData(value: unknown): value is IResumeTurnConfi
+  */
+ interface ISubagentContext {
+ 	/** Active child-chat observers keyed by their spawning tool call. */
+-	readonly observations: DisposableMap<string>;
++	readonly observations: DisposableMap<string, DisposableStore>;
++	/** Child chat URI per observed tool call, so a still-running observation can be detached at turn end. */
++	readonly childChats: Map<string, string>;
++	/** Set once the parent turn is over: its response is closed, so detached observers must stop emitting into it. */
++	turnEnded: boolean;
+ }
+ 
+ interface IOutputTerminalAttachment {
+@@ -1083,6 +1087,14 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 	private readonly _workingDirectoryRegistrations = this._register(new DisposableMap<string>());
+ 	private readonly _shellInitRegistrations = this._register(new DisposableMap<string>());
+ 
++	/**
++	 * Subagent observers that outlived the turn that spawned them, keyed by {@link _subagentObservationKey}.
++	 * Background subagents, and any whose chat is created after their parent turn completes, live only here.
++	 */
++	private readonly _detachedSubagentObservations = this._register(new DisposableMap<string, DisposableStore>());
++	/** Set while {@link _detachedSubagentObservations} is being torn down, so nested turns do not detach back into it. */
++	private _detachedSubagentObservationsSuspended = false;
++
+ 	/**
+ 	 * Active default-chat subscriptions, keyed by backend session URI string.
+ 	 * Multi-chat is not yet surfaced: every session is served by a single
+@@ -1626,6 +1638,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 					if (this._activeSessions.get(sessionResource) !== session) {
+ 						return;
+ 					}
++					// Before the entry is dropped, so `_hasOtherSessionHold` still pins the shared session subscription.
++					this._disposeDetachedSubagentObservations(resolvedSession.toString());
+ 					this._activeSessions.delete(sessionResource);
+ 					this._disposeActiveClientEntry(sessionResource);
+ 					this._pendingMessageSubscriptions.deleteAndDispose(sessionResource);
+@@ -3317,8 +3331,12 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		// Subagent observation context: dedups subagent tool calls so each is
+ 		// observed once.
+ 		const subagentContext: ISubagentContext = {
+-			observations: store.add(new DisposableMap()),
++			observations: new DisposableMap(),
++			childChats: new Map(),
++			turnEnded: false,
+ 		};
++		// Not owned by `store`: a subagent still running at turn end is detached rather than torn down.
++		store.add(toDisposable(() => this._detachLiveSubagentObservations(sessionKey, subagentContext)));
+ 
+ 		// Per response part. Markdown / reasoning / tool calls each get a
+ 		// dedicated setup keyed by their stable id. Per-key closures replace
+@@ -4200,8 +4218,13 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		if (subagentData?.kind !== 'subagent') {
+ 			return;
+ 		}
++		const childChatUri = subagentData.chatResource
++			|| buildSubagentChatUri(opts.backendSession.toString(), toolCallId);
++		// A live in-turn observation supersedes the detached one left behind by an earlier turn.
++		this._detachedSubagentObservations.deleteAndDispose(this._subagentObservationKey(opts.backendSession.toString(), childChatUri));
+ 		const observationStore = new DisposableStore();
+ 		subagentContext.observations.set(toolCallId, observationStore);
++		subagentContext.childChats.set(toolCallId, childChatUri);
+ 		subagentData.isActive = true;
+ 		invocation.notifyToolSpecificDataChanged();
+ 
+@@ -4224,9 +4247,76 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		}));
+ 
+ 		const rootInvocationId = opts.subAgentInvocationId ?? toolCallId;
+-		const childChatUri = subagentData.chatResource
+-			|| buildSubagentChatUri(opts.backendSession.toString(), toolCallId);
+-		this._observeSubagentSession(opts.sessionResource, opts.backendSession, toolCallId, childChatUri, rootInvocationId, invocation, opts.sink, observationStore, subagentContext, perInvocationCredits, perInvocationModel);
++		const emitProgress = (parts: IChatProgress[]) => {
++			if (!subagentContext.turnEnded) {
++				opts.sink(parts);
++			}
++		};
++		this._observeSubagentSession(opts.sessionResource, opts.backendSession, toolCallId, childChatUri, rootInvocationId, invocation, emitProgress, observationStore, subagentContext, perInvocationCredits, perInvocationModel);
++	}
++
++	private _subagentObservationKey(sessionUri: string, childChatUri: string): string {
++		return `${sessionUri}\0${childChatUri}`;
++	}
++
++	/** Whether a subagent's child chat has run to completion, so its observation has nothing left to watch. */
++	private _isSubagentChatSettled(sessionUri: string, childChatUri: string): boolean {
++		const state = this._getSessionState(sessionUri, childChatUri);
++		return !!state && !state.activeTurn && state.turns.length > 0;
++	}
++
++	/**
++	 * Turn-end handoff for subagent observations. A subagent that is still running, or whose chat has not
++	 * been created yet, keeps its observer and child chat subscription; settled ones are disposed.
++	 */
++	private _detachLiveSubagentObservations(sessionUri: string, subagentContext: ISubagentContext): void {
++		subagentContext.turnEnded = true;
++		// A nested turn unwinding inside a detached observation must not detach back into the map being torn down.
++		if (!this._store.isDisposed && !this._detachedSubagentObservationsSuspended) {
++			for (const toolCallId of [...subagentContext.observations.keys()]) {
++				const childChatUri = subagentContext.childChats.get(toolCallId);
++				if (!childChatUri || this._isSubagentChatSettled(sessionUri, childChatUri)) {
++					continue;
++				}
++				const observation = subagentContext.observations.deleteAndLeak(toolCallId);
++				if (observation) {
++					this._detachSubagentObservation(sessionUri, childChatUri, observation);
++				}
++			}
++		}
++		subagentContext.observations.dispose();
++	}
++
++	/** Keeps `observation` alive past its spawning turn until the subagent's chat settles. */
++	private _detachSubagentObservation(sessionUri: string, childChatUri: string, observation: DisposableStore): void {
++		const key = this._subagentObservationKey(sessionUri, childChatUri);
++		this._detachedSubagentObservations.set(key, observation);
++		// Read the ref the observation already holds rather than acquiring one, which can throw mid-teardown.
++		const childChatSub = this._additionalChatSubscriptions.get(childChatUri)?.object;
++		if (!childChatSub) {
++			return;
++		}
++		observation.add(childChatSub.onDidChange(() => {
++			if (this._detachedSubagentObservations.get(key) !== observation || !this._isSubagentChatSettled(sessionUri, childChatUri)) {
++				return;
++			}
++			this._detachedSubagentObservations.deleteAndLeak(key)?.dispose();
++		}));
++	}
++
++	/** Drops the detached subagent observations belonging to a backend session that is being torn down. */
++	private _disposeDetachedSubagentObservations(sessionUri: string): void {
++		const prefix = `${sessionUri}\0`;
++		this._detachedSubagentObservationsSuspended = true;
++		try {
++			for (const key of [...this._detachedSubagentObservations.keys()]) {
++				if (key.startsWith(prefix)) {
++					this._detachedSubagentObservations.deleteAndDispose(key);
++				}
++			}
++		} finally {
++			this._detachedSubagentObservationsSuspended = false;
++		}
+ 	}
+ 
+ 	/**
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+index faa690690dd41..7427b642ce6ae 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+@@ -13398,6 +13398,126 @@ suite('AgentHostChatContribution', () => {
+ 			await turnPromise;
+ 		}));
+ 
++		test('a subagent chat created after the parent turn completed is still observed', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables);
++			const { turnPromise, session, turnId, fire } = await startTurn(sessionHandler, agentHostService, chatAgentService, disposables);
++			const parentSession = parseDefaultChatUri(session);
++			assert.ok(parentSession);
++			const toolCallId = 'tc-late-task';
++			const childChatUri = buildSubagentChatUri(parentSession, toolCallId);
++
++			// The measured ordering: the whole parent turn settles before the subagent's chat exists.
++			fire({
++				type: 'chat/toolCallStart', session, turnId,
++				toolCallId, toolName: 'task', displayName: 'Delegate Task',
++				_meta: { toolKind: 'subagent', subagentChatUri: childChatUri },
++			} as ChatAction);
++			fire({
++				type: 'chat/toolCallReady', session, turnId,
++				toolCallId, invocationMessage: 'Delegating task',
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			} as ChatAction);
++			fire({
++				type: 'chat/toolCallComplete', session, turnId, toolCallId,
++				result: { success: true, pastTenseMessage: 'Delegated task' },
++			} as ChatAction);
++			fire({ type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', session, turnId } as ChatAction);
++			await turnPromise;
++			await timeout(0);
++
++			assert.strictEqual(agentHostService.hasLiveSubscription(childChatUri), true, 'the not-yet-created subagent chat must stay subscribed past its parent turn');
++		}));
++
++		test('a background subagent stays observed after the parent turn ends and is released when it finishes', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables);
++			const { turnPromise, collected, session, turnId, fire } = await startTurn(sessionHandler, agentHostService, chatAgentService, disposables);
++			const parentSession = parseDefaultChatUri(session);
++			assert.ok(parentSession);
++			const toolCallId = 'tc-background-task';
++			const childChatUri = buildSubagentChatUri(parentSession, toolCallId);
++			agentHostService.sessionStates.set(childChatUri, makeChildState(childChatUri, 'tc-child-bg'));
++
++			fire({
++				type: 'chat/toolCallStart', session, turnId,
++				toolCallId, toolName: 'task', displayName: 'Delegate Task',
++				_meta: { toolKind: 'subagent', subagentChatUri: childChatUri },
++			} as ChatAction);
++			fire({
++				type: 'chat/toolCallReady', session, turnId,
++				toolCallId, invocationMessage: 'Delegating task',
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			} as ChatAction);
++			// A background subagent's tool call returns while the subagent keeps running.
++			fire({
++				type: 'chat/toolCallComplete', session, turnId, toolCallId,
++				result: { success: true, pastTenseMessage: 'Delegated task' },
++			} as ChatAction);
++			fire({ type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', session, turnId } as ChatAction);
++			await turnPromise;
++			await timeout(50);
++
++			const parent = collected.flat()
++				.filter((p): p is IChatToolInvocation => p.kind === 'toolInvocation')
++				.find(t => t.toolCallId === toolCallId);
++			assert.ok(parent, 'parent task tool invocation should be emitted');
++			assert.deepStrictEqual({
++				subscribed: agentHostService.hasLiveSubscription(childChatUri),
++				isActive: (parent!.toolSpecificData as IChatSubagentToolInvocationData).isActive,
++			}, { subscribed: true, isActive: true }, 'a running background subagent must survive its parent turn');
++
++			agentHostService.fireAction({
++				channel: childChatUri,
++				action: { type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', turnId: 'child-turn-1' } as ChatAction,
++				serverSeq: 2001,
++				origin: undefined,
++			});
++			await timeout(50);
++
++			assert.deepStrictEqual({
++				subscribed: agentHostService.hasLiveSubscription(childChatUri),
++				isActive: (parent!.toolSpecificData as IChatSubagentToolInvocationData).isActive,
++			}, { subscribed: false, isActive: false }, 'the detached observer must react to the subagent finishing and then release it');
++		}));
++
++		test('a subagent that finished during its parent turn is released when that turn ends', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables);
++			const { turnPromise, session, turnId, fire } = await startTurn(sessionHandler, agentHostService, chatAgentService, disposables);
++			const parentSession = parseDefaultChatUri(session);
++			assert.ok(parentSession);
++			const toolCallId = 'tc-foreground-task';
++			const childChatUri = buildSubagentChatUri(parentSession, toolCallId);
++			agentHostService.sessionStates.set(childChatUri, makeChildState(childChatUri, 'tc-child-fg'));
++
++			fire({
++				type: 'chat/toolCallStart', session, turnId,
++				toolCallId, toolName: 'task', displayName: 'Delegate Task',
++				_meta: { toolKind: 'subagent', subagentChatUri: childChatUri },
++			} as ChatAction);
++			fire({
++				type: 'chat/toolCallReady', session, turnId,
++				toolCallId, invocationMessage: 'Delegating task',
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			} as ChatAction);
++			await timeout(50);
++			assert.strictEqual(agentHostService.hasLiveSubscription(childChatUri), true);
++
++			agentHostService.fireAction({
++				channel: childChatUri,
++				action: { type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', turnId: 'child-turn-1' } as ChatAction,
++				serverSeq: 3001,
++				origin: undefined,
++			});
++			fire({
++				type: 'chat/toolCallComplete', session, turnId, toolCallId,
++				result: { success: true, pastTenseMessage: 'Delegated task' },
++			} as ChatAction);
++			fire({ type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', session, turnId } as ChatAction);
++			await turnPromise;
++			await timeout(50);
++
++			assert.strictEqual(agentHostService.hasLiveSubscription(childChatUri), false, 'a settled subagent must not be kept alive past its parent turn');
++		}));
++
+ 		test('inner subagent tool calls fired AFTER parent observation are also grouped', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+ 			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables);
+ 
+
+From b4245e55c7f5d483a7a682968abec028883ea934 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 14:30:23 -0400
+Subject: [PATCH 2/2] Keep detached subagent observers until the last chat of
+ the session closes
+
+Detached subagent observers are shared by every chat of a backend session, but the
+per-chat teardown disposed all of them. A session can have the default chat and one
+or more peer chats open at once, so closing an unrelated peer chat tore down a
+background observer owned by the still-open default chat, leaving the subagent's
+later tool requests unclaimed again.
+
+They now follow the same rule as the session-level input-needed watcher they feed:
+release only once no sibling chat of that backend session is still active or
+hydrating, tested through `_hasOtherSessionHold`. Scoping them per chat instead
+would strand the subagent whenever its own chat closed, even though the watcher
+that executes its tools outlives that chat.
+
+The late-subagent test now exercises the path it names. It emits the child turn and
+a client-contributed tool call after the parent turn has completed, and asserts the
+detached observer processes them and claims the tool, rather than only asserting a
+subscription reference still exists. The new peer-chat test asserts the whole path:
+with both chats open, closing the peer must leave the subagent's client tool begun,
+invoked once, completed, and attributed to the default chat that claimed it.
+---
+ .../agentHost/agentHostSessionHandler.ts      |  11 +-
+ .../agentHostChatContribution.test.ts         |  61 ++++++++-
+ .../agentHostClientTools.test.ts              | 119 ++++++++++++++++++
+ 3 files changed, 186 insertions(+), 5 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 69757a291879e..6e47154d249ea 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -1638,8 +1638,6 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 					if (this._activeSessions.get(sessionResource) !== session) {
+ 						return;
+ 					}
+-					// Before the entry is dropped, so `_hasOtherSessionHold` still pins the shared session subscription.
+-					this._disposeDetachedSubagentObservations(resolvedSession.toString());
+ 					this._activeSessions.delete(sessionResource);
+ 					this._disposeActiveClientEntry(sessionResource);
+ 					this._pendingMessageSubscriptions.deleteAndDispose(sessionResource);
+@@ -1647,6 +1645,10 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 					this._serverTurnWatchers.deleteAndDispose(sessionResource);
+ 					this._mcpAuthWatchers.deleteAndDispose(sessionResource);
+ 					this._releaseSessionInputNeeded(sessionResource);
++					// Shared by every chat of the backend session, exactly like the input-needed watcher above.
++					if (!this._hasOtherSessionHold(resolvedSession.toString())) {
++						this._disposeDetachedSubagentObservations(resolvedSession.toString());
++					}
+ 					this._pendingHistoryTurns.delete(sessionResource);
+ 					this._surfacedMcpAuthServers.delete(sessionResource);
+ 					const chatURI = this._chatURIsBySessionResource.get(sessionResource);
+@@ -4304,7 +4306,10 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 		}));
+ 	}
+ 
+-	/** Drops the detached subagent observations belonging to a backend session that is being torn down. */
++	/**
++	 * Drops the detached subagent observations for a backend session whose last chat has closed. They are
++	 * shared by every chat of that session, so an earlier sibling closing must leave them running.
++	 */
+ 	private _disposeDetachedSubagentObservations(sessionUri: string): void {
+ 		const prefix = `${sessionUri}\0`;
+ 		this._detachedSubagentObservationsSuspended = true;
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+index 7427b642ce6ae..321860b969798 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+@@ -13399,7 +13399,16 @@ suite('AgentHostChatContribution', () => {
+ 		}));
+ 
+ 		test('a subagent chat created after the parent turn completed is still observed', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+-			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables);
++			const begunToolCalls: { toolCallId: string; subagentInvocationId: string | undefined }[] = [];
++			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables, {
++				languageModelToolsServiceOverride: {
++					getToolByName: () => ({ id: 'vscode_readFile', source: ToolDataSource.Internal, displayName: 'Read File', modelDescription: 'Reads a file' }),
++					beginToolCall: options => {
++						begunToolCalls.push({ toolCallId: options.toolCallId, subagentInvocationId: options.subagentInvocationId });
++						return undefined;
++					},
++				},
++			});
+ 			const { turnPromise, session, turnId, fire } = await startTurn(sessionHandler, agentHostService, chatAgentService, disposables);
+ 			const parentSession = parseDefaultChatUri(session);
+ 			assert.ok(parentSession);
+@@ -13424,8 +13433,56 @@ suite('AgentHostChatContribution', () => {
+ 			fire({ type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', session, turnId } as ChatAction);
+ 			await turnPromise;
+ 			await timeout(0);
+-
+ 			assert.strictEqual(agentHostService.hasLiveSubscription(childChatUri), true, 'the not-yet-created subagent chat must stay subscribed past its parent turn');
++
++			// The subagent only now starts, and runs a client tool the detached observer has to claim.
++			agentHostService.fireAction({
++				channel: childChatUri,
++				action: {
++					type: 'chat/turnStarted', turnId: 'late-child-turn',
++					startedAt: '2025-01-01T00:00:00.000Z',
++					message: { text: 'do work', origin: { kind: MessageKind.User } },
++				} as ChatAction,
++				serverSeq: 4001,
++				origin: undefined,
++			});
++			agentHostService.fireAction({
++				channel: childChatUri,
++				action: {
++					type: 'chat/toolCallStart', turnId: 'late-child-turn',
++					toolCallId: 'tc-late-child', toolName: 'read_file', displayName: 'Read File',
++					contributor: { kind: ToolCallContributorKind.Client, clientId: agentHostService.clientId },
++				} as ChatAction,
++				serverSeq: 4002,
++				origin: undefined,
++			});
++			agentHostService.fireAction({
++				channel: childChatUri,
++				action: {
++					type: 'chat/toolCallReady', turnId: 'late-child-turn',
++					toolCallId: 'tc-late-child', invocationMessage: 'Reading file',
++					toolInput: '{}', confirmed: ToolCallConfirmationReason.NotNeeded,
++				} as ChatAction,
++				serverSeq: 4003,
++				origin: undefined,
++			});
++			await timeout(50);
++
++			assert.deepStrictEqual(
++				begunToolCalls.filter(call => call.toolCallId === 'tc-late-child'),
++				[{ toolCallId: 'tc-late-child', subagentInvocationId: toolCallId }],
++				'the detached observer must process the late child turn and claim its client tool',
++			);
++
++			agentHostService.fireAction({
++				channel: childChatUri,
++				action: { type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', turnId: 'late-child-turn' } as ChatAction,
++				serverSeq: 4004,
++				origin: undefined,
++			});
++			await timeout(50);
++
++			assert.strictEqual(agentHostService.hasLiveSubscription(childChatUri), false, 'the subagent chat must be released once the subagent finishes');
+ 		}));
+ 
+ 		test('a background subagent stays observed after the parent turn ends and is released when it finishes', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts
+index 5705113755e0b..b9be8a502ced1 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostClientTools.test.ts
+@@ -2795,6 +2795,125 @@ suite('AgentHostClientTools', () => {
+ 			);
+ 		}));
+ 
++		test('closing a peer chat leaves the default chat\'s background subagent observer running', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++			// Detached observers are shared per backend session, so closing a peer must not strand one.
++			const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testSubagentTool, testRunTaskTool]);
++			const sessionResource = URI.parse('agent-host-copilot:/session-1');
++			const peerResource = URI.from({ scheme: 'agent-host-copilot', path: '/session-1', fragment: 'peer-1' });
++			const backendSession = AgentSession.uri('copilot', 'session-1').toString();
++			const parentChat = URI.parse(buildDefaultChatUri(backendSession));
++			const peerChat = buildChatUri(backendSession, 'peer-1');
++			const parentToolCallId = 'client-task-1';
++			const subagentChat = buildSubagentChatUri(backendSession, parentToolCallId);
++			const summary: SessionSummary = {
++				resource: backendSession,
++				provider: 'copilot',
++				title: 'Test',
++				status: SessionStatus.Idle,
++				createdAt: '2025-01-01T00:00:00.000Z',
++				modifiedAt: '2025-01-01T00:00:00.000Z',
++			};
++
++			connection.applySessionAction(URI.parse(backendSession), {
++				type: ActionType.SessionChatAdded,
++				summary: createDefaultChatSummary(summary, peerChat),
++			} as SessionAction);
++			connection.applySessionAction(parentChat, {
++				type: ActionType.ChatTurnStarted,
++				turnId: 'turn-1',
++				startedAt: '2025-01-01T00:00:00.000Z',
++				message: { text: 'delegate work', origin: { kind: MessageKind.User } },
++			});
++			connection.applySessionAction(parentChat, {
++				type: ActionType.ChatToolCallStart,
++				turnId: 'turn-1',
++				toolCallId: parentToolCallId,
++				toolName: 'task',
++				displayName: 'Delegated Task',
++				contributor: { kind: ToolCallContributorKind.Client, clientId: connection.clientId },
++				_meta: { toolKind: 'subagent', subagentChatUri: subagentChat },
++			});
++
++			await handler.provideChatSessionContent(sessionResource, CancellationToken.None);
++			const peerSession = await handler.provideChatSessionContent(peerResource, CancellationToken.None);
++			await timeout(0);
++
++			connection.applySessionAction(parentChat, {
++				type: ActionType.ChatToolCallReady,
++				turnId: 'turn-1',
++				toolCallId: parentToolCallId,
++				invocationMessage: 'Delegating task',
++				toolInput: '{}',
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			});
++			// A background subagent: its turn is running when the parent tool call and turn both finish.
++			connection.applySessionAction(URI.parse(subagentChat), {
++				type: ActionType.ChatTurnStarted,
++				turnId: 'sub-turn-1',
++				startedAt: '2025-01-01T00:00:00.000Z',
++				message: { text: '', origin: { kind: MessageKind.User } },
++			});
++			connection.applySessionAction(parentChat, {
++				type: ActionType.ChatToolCallComplete,
++				turnId: 'turn-1',
++				toolCallId: parentToolCallId,
++				result: { success: true, pastTenseMessage: 'Delegated task' },
++			});
++			connection.applySessionAction(parentChat, {
++				type: ActionType.ChatTurnComplete,
++				turnId: 'turn-1',
++				duration: 1,
++			});
++			await timeout(0);
++
++			peerSession.dispose();
++			await timeout(0);
++
++			// Only now does the still-running subagent ask for a client tool.
++			connection.applySessionAction(URI.parse(subagentChat), {
++				type: ActionType.ChatToolCallStart,
++				turnId: 'sub-turn-1',
++				toolCallId: 'runTask-call-1',
++				toolName: 'runTask',
++				displayName: 'Run Task',
++				contributor: { kind: ToolCallContributorKind.Client, clientId: connection.clientId },
++			});
++			connection.applySessionAction(URI.parse(subagentChat), {
++				type: ActionType.ChatToolCallReady,
++				turnId: 'sub-turn-1',
++				toolCallId: 'runTask-call-1',
++				invocationMessage: 'Run Task',
++				toolInput: '{}',
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			});
++			await timeout(0);
++			applyRunningClientExecution(connection, subagentChat, 'sub-turn-1', {
++				toolCallId: 'runTask-call-1',
++				toolName: 'runTask',
++				displayName: 'Run Task',
++				invocationMessage: 'Run Task',
++				toolInput: '{}',
++			});
++			await timeout(0);
++
++			assert.deepStrictEqual({
++				begun: toolsService.begunToolCalls.filter(invocation => invocation.toolCallId === 'runTask-call-1').length,
++				invoked: toolsService.invokedToolCalls.filter(invocation => invocation.chatStreamToolCallId === 'runTask-call-1').length,
++				claimedBy: toolsService.invokedToolCalls
++					.filter(invocation => invocation.chatStreamToolCallId === 'runTask-call-1')
++					.map(invocation => invocation.context?.sessionResource.toString()),
++				completed: connection.dispatchedActions.filter(entry =>
++					entry.channel === subagentChat
++					&& entry.action.type === ActionType.ChatToolCallComplete
++					&& entry.action.toolCallId === 'runTask-call-1').length,
++			}, {
++				begun: 1,
++				invoked: 1,
++				claimedBy: [sessionResource.toString()],
++				completed: 1,
++			});
++		}));
++
+ 		test('denies an unclaimed confirmable client tool after the grace window without executing it', () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+ 			const { handler, connection, toolsService } = createHandlerWithMocks(disposables, [testConfirmTool]);
+ 			const sessionResource = URI.parse('agent-host-copilot:/session-1');

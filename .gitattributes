@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.patch -text -whitespace
+archive/patcher-snapshots/* -text -whitespace

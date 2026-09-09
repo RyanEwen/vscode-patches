@@ -1,0 +1,8 @@
+backup*/
+**/backup*/
+*.vscodefix-orig
+*.prepatch
+*.tmp
+node_modules/
+.env*
+*.log

@@ -1,0 +1,476 @@
+From 9152d501906491c311d418c73a9049e298e6e1e7 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 16:19:02 -0400
+Subject: [PATCH 1/4] Buffer a client tool result that arrives before the SDK
+ asks for it
+
+The workbench starts a client tool from the streamed tool call and can
+finish it before the SDK has invoked that tool and registered its
+handler. `respond` drops a result that nothing is parked on, so the
+handler registers a moment later and waits forever for a result that no
+longer exists. The turn never completes and nothing is reported to the
+user or the model.
+
+Buffer instead, which is what the Copilot agent already does on the same
+path. `PendingRequestRegistry.register` and `registerAndFire` both
+collect an early result, so the late handler resolves immediately rather
+than re-running the tool.
+
+Observed in a dev container, where the client tool round trip crosses the
+websocket transport and loses the race far more often than a local
+window. Auto-approved tool calls always lost it, since nothing delays the
+workbench; approving in chat usually won it, because the wait gave the
+SDK time to register.
+---
+ .../node/claude/claudeAgentSession.ts         | 12 +++++++++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 23 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index ea0c9ec0389da..f9667a62ceafa 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -1158,10 +1158,20 @@ export class ClaudeAgentSession extends Disposable {
+ 	 * Unknown ids are a benign no-op — `agentSideEffects.ts` forwards every
+ 	 * `ChatToolCallComplete` envelope, so SDK-owned tool completions land
+ 	 * here too and must NOT throw.
++	 *
++	 * Buffers instead of dropping when nothing is parked yet: the workbench
++	 * starts a client tool from the streamed tool call and can finish it before
++	 * the SDK has invoked that tool and registered its handler. Discarding the
++	 * result there strands the turn, because the handler registers moments
++	 * later and then waits for a result that no longer exists.
+ 	 */
+ 	completeClientToolCall(toolCallId: string, result: ToolCallResult): boolean {
+ 		const converted = convertToolCallResult(result, toolCallId);
+-		return this._pendingClientToolCalls.respond(toolCallId, converted);
++		const settled = this._pendingClientToolCalls.respond(toolCallId, converted);
++		if (!settled) {
++			this._pendingClientToolCalls.respondOrBuffer(toolCallId, converted);
++		}
++		return settled;
+ 	}
+ 
+ 	/**
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index ad2394f87ae05..bdc6ddbdb8f83 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -5649,6 +5649,29 @@ suite('ClaudeAgent', () => {
+ 		assert.strictEqual(settled, false, 'no parked handler in this test path; unknown id is silent');
+ 	});
+ 
++	test('a result delivered before the SDK registers is buffered, not dropped', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		getOrCreateActiveClient(agent, defaultChatUri(created.session), 'c1').tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
++		sdk.nextQueryMessages = [makeSystemInitMessage(sessionId), makeResultSuccess(sessionId)];
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'go', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++		const session = agent.getSessionForTesting(created.session)!;
++
++		// The workbench starts a client tool from the streamed tool call and can
++		// finish it before the SDK invokes that tool, so the result arrives with
++		// nothing parked. Dropping it strands the turn: the handler registers a
++		// moment later and waits for a result that no longer exists.
++		const settled = session.completeClientToolCall('tu_early', { success: true, pastTenseMessage: 'ok', content: [{ type: ToolResultContentType.Text, text: 'hello' }] });
++		const delivered = await session.pendingClientToolCalls.register('tu_early');
++
++		assert.deepStrictEqual({ settled, delivered: delivered.content }, {
++			settled: false,
++			delivered: [{ type: 'text', text: 'hello' }],
++		});
++	});
++
+ 	test('onClientToolCallComplete walks subagent URIs to the root session', () => {
+ 		const { agent } = createTestContext(disposables);
+ 		const root = URI.parse('claude:/root-1');
+
+From 10382e737a7a38149112db724f9c79b8ee8fbac1 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 16:47:38 -0400
+Subject: [PATCH 2/4] Address review: bound the buffer and condense comments
+
+Buffering every unmatched completion retained one result per SDK-owned
+tool call until the registry was cleared, and results can be large.
+Bound `_earlyResults` and evict the oldest instead.
+
+Condense the method JSDoc and the test comment to the repository's
+limits.
+---
+ .../agentHost/common/pendingRequestRegistry.ts   | 16 ++++++++++++++--
+ .../agentHost/node/claude/claudeAgentSession.ts  | 10 +++-------
+ .../test/common/pendingRequestRegistry.test.ts   | 13 +++++++++++++
+ .../agentHost/test/node/claudeAgent.test.ts      |  5 +----
+ 4 files changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+index d90d8d2525df0..7db588ae2a4fb 100644
+--- a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
++++ b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+@@ -30,6 +30,9 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	 */
+ 	private readonly _earlyResults = new Map<string, TResult>();
+ 
++	/** Upper bound on {@link _earlyResults}, so completions that never register cannot accumulate. */
++	private static readonly _maxBufferedResults = 16;
++
+ 	/** Atomically park a deferred and optional metadata, then invoke `fire` to prevent synchronous responses racing registration. */
+ 	registerAndFire(key: string, fire: () => void, ...metadata: MetadataArgument<TMeta>): Promise<TResult> {
+ 		if (this._earlyResults.has(key)) {
+@@ -118,9 +121,18 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	 * completion race).
+ 	 */
+ 	respondOrBuffer(key: string, value: TResult): void {
+-		if (!this.respond(key, value)) {
+-			this._earlyResults.set(key, value);
++		if (this.respond(key, value)) {
++			return;
++		}
++		// Callers forward completions for keys that never register, so evict the
++		// oldest rather than retaining every one until the registry is cleared.
++		if (this._earlyResults.size >= PendingRequestRegistry._maxBufferedResults) {
++			const oldest = this._earlyResults.keys().next().value;
++			if (oldest !== undefined) {
++				this._earlyResults.delete(oldest);
++			}
+ 		}
++		this._earlyResults.set(key, value);
+ 	}
+ 
+ 	/** Whether a result arrived before a request registered under `key`. */
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index f9667a62ceafa..795487e9c6ef8 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -1157,13 +1157,9 @@ export class ClaudeAgentSession extends Disposable {
+ 	 * result. Returns `true` if a matching deferred was found and settled.
+ 	 * Unknown ids are a benign no-op — `agentSideEffects.ts` forwards every
+ 	 * `ChatToolCallComplete` envelope, so SDK-owned tool completions land
+-	 * here too and must NOT throw.
+-	 *
+-	 * Buffers instead of dropping when nothing is parked yet: the workbench
+-	 * starts a client tool from the streamed tool call and can finish it before
+-	 * the SDK has invoked that tool and registered its handler. Discarding the
+-	 * result there strands the turn, because the handler registers moments
+-	 * later and then waits for a result that no longer exists.
++	 * here too and must NOT throw. Buffers when nothing is parked, since the
++	 * workbench can finish the tool before the SDK registers the handler that
++	 * awaits the result.
+ 	 */
+ 	completeClientToolCall(toolCallId: string, result: ToolCallResult): boolean {
+ 		const converted = convertToolCallResult(result, toolCallId);
+diff --git a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+index 122e79dda6d1a..ba0dad24043f7 100644
+--- a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+@@ -143,6 +143,19 @@ suite('PendingRequestRegistry', () => {
+ 		assert.strictEqual(await pending, 'second');
+ 	});
+ 
++	test('respondOrBuffer evicts the oldest buffered result once the bound is reached', async () => {
++		const registry = new PendingRequestRegistry<string>();
++		// Callers forward completions for keys that never register.
++		for (let i = 0; i < 20; i++) {
++			registry.respondOrBuffer(`k${i}`, `v${i}`);
++		}
++
++		assert.deepStrictEqual({ evicted: registry.hasBufferedResult('k0'), retained: registry.hasBufferedResult('k19') }, {
++			evicted: false,
++			retained: true,
++		});
++	});
++
+ 	test('respondOrBuffer behaves like respond when a deferred is already parked', async () => {
+ 		const registry = new PendingRequestRegistry<string>();
+ 		const promise = registry.register('k');
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index bdc6ddbdb8f83..30372de84a633 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -5659,10 +5659,7 @@ suite('ClaudeAgent', () => {
+ 		await agent.chats.sendMessage(defaultChatUri(created.session), 'go', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
+ 		const session = agent.getSessionForTesting(created.session)!;
+ 
+-		// The workbench starts a client tool from the streamed tool call and can
+-		// finish it before the SDK invokes that tool, so the result arrives with
+-		// nothing parked. Dropping it strands the turn: the handler registers a
+-		// moment later and waits for a result that no longer exists.
++		// The result can arrive before the SDK registers the handler awaiting it.
+ 		const settled = session.completeClientToolCall('tu_early', { success: true, pastTenseMessage: 'ok', content: [{ type: ToolResultContentType.Text, text: 'hello' }] });
+ 		const delivered = await session.pendingClientToolCalls.register('tu_early');
+ 
+
+From 90b21e40de70bb30bdd9287309c4ce86f3cd06aa Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 14 Aug 2026 15:12:06 -0400
+Subject: [PATCH 3/4] Address review: forward only client tool completions,
+ drop the buffer bound
+
+The cap was covering for indiscriminate forwarding: every
+ChatToolCallComplete was handed to the provider, including SDK-owned
+calls that never register a handler, so their results sat buffered for
+the life of the session. Skip a completion whose tool call is not
+client-contributed, which leaves the buffer bounded by the client tool
+calls actually in flight, and remove the arbitrary limit.
+
+respondOrBuffer now reports whether it settled, so completeClientToolCall
+is a single call rather than a respond guard followed by the same check.
+---
+ .../common/pendingRequestRegistry.ts          | 25 ++++---------
+ .../agentHost/node/agentSideEffects.ts        | 14 ++++++--
+ .../node/claude/claudeAgentSession.ts         | 17 +++------
+ .../common/pendingRequestRegistry.test.ts     | 27 +++++++-------
+ .../test/node/agentSideEffects.test.ts        | 35 +++++++++++++++++++
+ 5 files changed, 68 insertions(+), 50 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+index 7db588ae2a4fb..19b9758c6cb91 100644
+--- a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
++++ b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+@@ -30,9 +30,6 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	 */
+ 	private readonly _earlyResults = new Map<string, TResult>();
+ 
+-	/** Upper bound on {@link _earlyResults}, so completions that never register cannot accumulate. */
+-	private static readonly _maxBufferedResults = 16;
+-
+ 	/** Atomically park a deferred and optional metadata, then invoke `fire` to prevent synchronous responses racing registration. */
+ 	registerAndFire(key: string, fire: () => void, ...metadata: MetadataArgument<TMeta>): Promise<TResult> {
+ 		if (this._earlyResults.has(key)) {
+@@ -113,26 +110,16 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	}
+ 
+ 	/**
+-	 * Like {@link respond}, but if no deferred is parked under `key`, buffer
+-	 * the value so a subsequent {@link register} / {@link registerAndFire}
+-	 * for the same key resolves immediately. Use when the completion may
+-	 * legitimately arrive before the awaiting handler registers (the
+-	 * Copilot client-tool round-trip, whose SDK handler and the workbench
+-	 * completion race).
++	 * Like {@link respond}, but buffers the value when nothing is parked under
++	 * `key` so a later {@link register} resolves immediately. Returns whether a
++	 * parked deferred was settled.
+ 	 */
+-	respondOrBuffer(key: string, value: TResult): void {
++	respondOrBuffer(key: string, value: TResult): boolean {
+ 		if (this.respond(key, value)) {
+-			return;
+-		}
+-		// Callers forward completions for keys that never register, so evict the
+-		// oldest rather than retaining every one until the registry is cleared.
+-		if (this._earlyResults.size >= PendingRequestRegistry._maxBufferedResults) {
+-			const oldest = this._earlyResults.keys().next().value;
+-			if (oldest !== undefined) {
+-				this._earlyResults.delete(oldest);
+-			}
++			return true;
+ 		}
+ 		this._earlyResults.set(key, value);
++		return false;
+ 	}
+ 
+ 	/** Whether a result arrived before a request registered under `key`. */
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index 5cc016da58c5b..228c0eab57ea4 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -323,7 +323,7 @@ export class AgentSideEffects extends Disposable {
+ 					return; // Not a chat channel; ignore (already logged elsewhere).
+ 				}
+ 				const sessionChannel = parseRequiredSessionUriFromChatUri(envelope.channel);
+-				this._notifyClientToolCallComplete(sessionChannel, envelope.channel, action.toolCallId, action.result, 'server-envelope');
++				this._notifyClientToolCallComplete(sessionChannel, envelope.channel, action.turnId, action.toolCallId, action.result, 'server-envelope');
+ 			}
+ 			if (envelope.action.type === ActionType.ChatDraftChanged) {
+ 				this._persistChatDraft(envelope.channel, envelope.action.draft);
+@@ -1340,7 +1340,15 @@ export class AgentSideEffects extends Disposable {
+ 	 * via `resolveSubagentChatParent(context)` instead of walking host state.
+ 	 * The two differ only when the addressed chat is a subagent.
+ 	 */
+-	private _notifyClientToolCallComplete(sessionChannel: ProtocolURI, chatChannel: ProtocolURI, toolCallId: string, result: ToolCallResult, source: 'client-dispatch' | 'server-envelope'): void {
++	private _notifyClientToolCallComplete(sessionChannel: ProtocolURI, chatChannel: ProtocolURI, turnId: string, toolCallId: string, result: ToolCallResult, source: 'client-dispatch' | 'server-envelope'): void {
++		// Only a client-contributed call has a parked handler awaiting it, and
++		// SDK-owned calls carry no contributor at all. Forwarding one leaves its
++		// result buffered in the provider for the life of the session. An
++		// unknown call is still forwarded, since it cannot be ruled out.
++		const toolCall = this._findToolCall(chatChannel, turnId, toolCallId);
++		if (toolCall && toolCall.contributor?.kind !== ToolCallContributorKind.Client) {
++			return;
++		}
+ 		const completionChat = this._toolCallCompletionChat(chatChannel);
+ 		const agent = this._options.getAgent(sessionChannel);
+ 		if (!agent) {
+@@ -1700,7 +1708,7 @@ export class AgentSideEffects extends Disposable {
+ 				if (!chatChannel) {
+ 					break; // Not a chat channel; ignore.
+ 				}
+-				this._notifyClientToolCallComplete(sessionChannel, chatChannel, action.toolCallId, action.result, 'client-dispatch');
++				this._notifyClientToolCallComplete(sessionChannel, chatChannel, action.turnId, action.toolCallId, action.result, 'client-dispatch');
+ 				break;
+ 			}
+ 		}
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 795487e9c6ef8..0a96034addd33 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -1153,21 +1153,12 @@ export class ClaudeAgentSession extends Disposable {
+ 	}
+ 
+ 	/**
+-	 * Resolve a parked client-tool MCP handler with the workbench-supplied
+-	 * result. Returns `true` if a matching deferred was found and settled.
+-	 * Unknown ids are a benign no-op — `agentSideEffects.ts` forwards every
+-	 * `ChatToolCallComplete` envelope, so SDK-owned tool completions land
+-	 * here too and must NOT throw. Buffers when nothing is parked, since the
+-	 * workbench can finish the tool before the SDK registers the handler that
+-	 * awaits the result.
++	 * Resolves a parked client-tool MCP handler with the workbench result, or
++	 * buffers it when the workbench finished before the SDK registered the
++	 * handler. Returns whether a parked deferred was settled.
+ 	 */
+ 	completeClientToolCall(toolCallId: string, result: ToolCallResult): boolean {
+-		const converted = convertToolCallResult(result, toolCallId);
+-		const settled = this._pendingClientToolCalls.respond(toolCallId, converted);
+-		if (!settled) {
+-			this._pendingClientToolCalls.respondOrBuffer(toolCallId, converted);
+-		}
+-		return settled;
++		return this._pendingClientToolCalls.respondOrBuffer(toolCallId, convertToolCallResult(result, toolCallId));
+ 	}
+ 
+ 	/**
+diff --git a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+index ba0dad24043f7..f493d1850cf63 100644
+--- a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+@@ -143,26 +143,23 @@ suite('PendingRequestRegistry', () => {
+ 		assert.strictEqual(await pending, 'second');
+ 	});
+ 
+-	test('respondOrBuffer evicts the oldest buffered result once the bound is reached', async () => {
++	test('respondOrBuffer reports whether it settled a parked deferred or buffered', async () => {
+ 		const registry = new PendingRequestRegistry<string>();
+-		// Callers forward completions for keys that never register.
+-		for (let i = 0; i < 20; i++) {
+-			registry.respondOrBuffer(`k${i}`, `v${i}`);
+-		}
+-
+-		assert.deepStrictEqual({ evicted: registry.hasBufferedResult('k0'), retained: registry.hasBufferedResult('k19') }, {
+-			evicted: false,
++		const promise = registry.register('parked');
++
++		assert.deepStrictEqual({
++			settled: registry.respondOrBuffer('parked', 'value'),
++			buffered: registry.respondOrBuffer('unparked', 'later'),
++			retained: registry.hasBufferedResult('unparked'),
++			delivered: await promise,
++		}, {
++			settled: true,
++			buffered: false,
+ 			retained: true,
++			delivered: 'value',
+ 		});
+ 	});
+ 
+-	test('respondOrBuffer behaves like respond when a deferred is already parked', async () => {
+-		const registry = new PendingRequestRegistry<string>();
+-		const promise = registry.register('k');
+-		registry.respondOrBuffer('k', 'value');
+-		assert.strictEqual(await promise, 'value');
+-	});
+-
+ 	test('hasBufferedResult reports only unconsumed early results', async () => {
+ 		const registry = new PendingRequestRegistry<string>();
+ 		assert.strictEqual(registry.hasBufferedResult('k'), false);
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index 913f447af15d5..c4a52f00fc1a1 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -3278,6 +3278,41 @@ suite('AgentSideEffects', () => {
+ 		});
+ 	});
+ 
++	suite('client tool completion forwarding', () => {
++
++		test('forwards a client-contributed completion but not an SDK-owned one', async () => {
++			setupSession();
++			startTurn('turn-1');
++			disposables.add(sideEffects.registerProgressListener(agent));
++
++			for (const [toolCallId, contributor] of [
++				['tc-client', { kind: ToolCallContributorKind.Client, clientId: 'test-client' }],
++				['tc-sdk', undefined],
++			] as const) {
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallStart, turnId: 'turn-1',
++						toolCallId, toolName: 'runTask', displayName: 'Run Task',
++						...(contributor ? { contributor } : {}),
++					},
++				});
++				agent.fireProgress({
++					kind: 'action', resource: URI.parse(defaultChatUri),
++					action: {
++						type: ActionType.ChatToolCallComplete, turnId: 'turn-1', toolCallId,
++						result: { success: true, pastTenseMessage: 'ran', content: [] },
++					},
++				});
++			}
++			await timeout(0);
++
++			// Only a client tool has a parked handler; an SDK-owned result would
++			// sit buffered in the provider for the life of the session.
++			assert.deepStrictEqual(agent.clientToolCallCompleteCalls.map(call => call.toolCallId), ['tc-client']);
++		});
++	});
++
+ 	// ---- tool_ready progress dispatch -----------------------------------
+ 
+ 	suite('tool_ready dispatches progress actions to advance tool call state', () => {
+
+From 1e1850635dec095d05f27111562b817e7d5ab52d Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:59:03 -0400
+Subject: [PATCH 4/4] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ src/vs/platform/agentHost/node/agentSideEffects.ts           | 5 +----
+ src/vs/platform/agentHost/test/node/agentSideEffects.test.ts | 3 +--
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index 228c0eab57ea4..0c45889e8aff0 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -1341,10 +1341,7 @@ export class AgentSideEffects extends Disposable {
+ 	 * The two differ only when the addressed chat is a subagent.
+ 	 */
+ 	private _notifyClientToolCallComplete(sessionChannel: ProtocolURI, chatChannel: ProtocolURI, turnId: string, toolCallId: string, result: ToolCallResult, source: 'client-dispatch' | 'server-envelope'): void {
+-		// Only a client-contributed call has a parked handler awaiting it, and
+-		// SDK-owned calls carry no contributor at all. Forwarding one leaves its
+-		// result buffered in the provider for the life of the session. An
+-		// unknown call is still forwarded, since it cannot be ruled out.
++		// Only a client-contributed call has a parked handler; an unknown one is still forwarded.
+ 		const toolCall = this._findToolCall(chatChannel, turnId, toolCallId);
+ 		if (toolCall && toolCall.contributor?.kind !== ToolCallContributorKind.Client) {
+ 			return;
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index c4a52f00fc1a1..8ef19bfd5a5b9 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -3307,8 +3307,7 @@ suite('AgentSideEffects', () => {
+ 			}
+ 			await timeout(0);
+ 
+-			// Only a client tool has a parked handler; an SDK-owned result would
+-			// sit buffered in the provider for the life of the session.
++			// An SDK-owned result would sit buffered in the provider for the session.
+ 			assert.deepStrictEqual(agent.clientToolCallCompleteCalls.map(call => call.toolCallId), ['tc-client']);
+ 		});
+ 	});

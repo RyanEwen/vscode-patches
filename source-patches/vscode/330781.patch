@@ -1,0 +1,337 @@
+From 4acec061b86817839ee857a8db3919a376c7db78 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 22:17:53 -0400
+Subject: [PATCH] Agent host: keep a Claude steering message on screen
+
+Steering folds into the running turn instead of starting a new one, so
+removing the pending bubble on SDK ack left the message with no
+representation anywhere: the model visibly changes course, and nothing
+in the transcript says why.
+
+Remember the text and turn when the steer is enqueued, and write it into
+that turn as a quoted markdown part at the moment the bubble is removed.
+The turn itself is untouched, so CONTEXT.M10 (steering folds into the
+in-progress Turn) still holds.
+---
+ .../common/meta/agentMarkdownOriginMeta.ts    | 23 +++++++
+ .../common/state/chatAttachmentContext.ts     | 29 +++++++--
+ .../state/protocol/channels-chat/state.ts     | 10 +++
+ .../node/claude/claudeAgentSession.ts         |  2 +-
+ .../node/claude/claudeSdkPipeline.ts          | 61 ++++++++++++++++---
+ .../state/chatAttachmentContext.test.ts       | 19 ++++++
+ .../agentHost/test/node/claudeAgent.test.ts   | 28 +++++++++
+ 7 files changed, 156 insertions(+), 16 deletions(-)
+ create mode 100644 src/vs/platform/agentHost/common/meta/agentMarkdownOriginMeta.ts
+
+diff --git a/src/vs/platform/agentHost/common/meta/agentMarkdownOriginMeta.ts b/src/vs/platform/agentHost/common/meta/agentMarkdownOriginMeta.ts
+new file mode 100644
+index 0000000000000..2bc918c2b97bc
+--- /dev/null
++++ b/src/vs/platform/agentHost/common/meta/agentMarkdownOriginMeta.ts
+@@ -0,0 +1,23 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++export const enum AgentMarkdownOrigin {
++	/** The user steered mid-turn and the message was folded into that turn. */
++	UserSteering = 'userSteering',
++}
++
++interface IHasMarkdownOriginMeta {
++	readonly _meta?: Record<string, unknown>;
++}
++
++/** Reads the authoring origin of a markdown response part, if the host declared one. */
++export function readAgentMarkdownOrigin(source: IHasMarkdownOriginMeta): AgentMarkdownOrigin | undefined {
++	return source._meta?.['origin'] === AgentMarkdownOrigin.UserSteering ? AgentMarkdownOrigin.UserSteering : undefined;
++}
++
++/** Serializes a markdown authoring origin for the open protocol bag. */
++export function toAgentMarkdownOriginMeta(origin: AgentMarkdownOrigin): Record<string, unknown> {
++	return { origin };
++}
+diff --git a/src/vs/platform/agentHost/common/state/chatAttachmentContext.ts b/src/vs/platform/agentHost/common/state/chatAttachmentContext.ts
+index ebcb584b5cab4..8a9933cc3b043 100644
+--- a/src/vs/platform/agentHost/common/state/chatAttachmentContext.ts
++++ b/src/vs/platform/agentHost/common/state/chatAttachmentContext.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { MessageAttachmentKind, ResponsePartKind, type MessageChatAttachment, type SimpleMessageAttachment, type Turn } from './protocol/state.js';
++import { AgentMarkdownOrigin, readAgentMarkdownOrigin } from '../meta/agentMarkdownOriginMeta.js';
+ import { SessionServerToolName } from '../serverToolNames.js';
+ 
+ /**
+@@ -48,13 +49,29 @@ export function formatChatTranscript(turns: readonly Turn[]): string {
+ 		if (userText) {
+ 			blocks.push(`User: ${userText}`);
+ 		}
+-		const assistantText = turn.responseParts
+-			.map(part => (part.kind === ResponsePartKind.Markdown ? part.content : ''))
+-			.join('')
+-			.trim();
+-		if (assistantText) {
+-			blocks.push(`Assistant: ${assistantText}`);
++		// A steer folds into the turn it interrupted, so a markdown part can be
++		// the user's: flush the assistant run before it to keep both roles right.
++		let assistantText = '';
++		const flushAssistant = () => {
++			if (assistantText.trim()) {
++				blocks.push(`Assistant: ${assistantText.trim()}`);
++			}
++			assistantText = '';
++		};
++		for (const part of turn.responseParts) {
++			if (part.kind !== ResponsePartKind.Markdown) {
++				continue;
++			}
++			if (readAgentMarkdownOrigin(part) === AgentMarkdownOrigin.UserSteering) {
++				flushAssistant();
++				if (part.content.trim()) {
++					blocks.push(`User: ${part.content.trim()}`);
++				}
++				continue;
++			}
++			assistantText += part.content;
+ 		}
++		flushAssistant();
+ 	}
+ 	return blocks.join('\n\n');
+ }
+diff --git a/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts b/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts
+index 10f96f94a07a8..5ed5ed3e431a0 100644
+--- a/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts
++++ b/src/vs/platform/agentHost/common/state/protocol/channels-chat/state.ts
+@@ -879,6 +879,16 @@ export interface MarkdownResponsePart {
+ 	id: string;
+ 	/** Markdown content */
+ 	content: string;
++	/**
++	 * Additional provider-specific metadata for this part.
++	 *
++	 * Markdown is the assistant's voice by default. A host MAY declare a
++	 * different authoring origin here, so clients that attribute transcript
++	 * content (styling, export, transcript formatting for a model) do not
++	 * report it as the assistant's. Clients MUST render coherently from
++	 * `content` alone when `_meta` is absent or unrecognized.
++	 */
++	_meta?: Record<string, unknown>;
+ }
+ 
+ /**
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index ea0c9ec0389da..8b37072d9c742 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -1046,7 +1046,7 @@ export class ClaudeAgentSession extends Disposable {
+ 			// boundary is the convention for both code paths.
+ 			uuid: steeringMessage.id as `${string}-${string}-${string}-${string}-${string}`,
+ 		};
+-		pipeline.injectSteering(sdkMessage, steeringMessage.id);
++		pipeline.injectSteering(sdkMessage, steeringMessage.id, steeringMessage.message.text);
+ 	}
+ 
+ 	/** Live permission-mode change. Forwards to the pipeline; the pipeline remembers it for re-application after a rebind. */
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+index 6ed4794e0362f..fb0cc0596fbee 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkPipeline.ts
+@@ -15,6 +15,8 @@ import { ClaudeRuntimeEffortLevel } from '../../common/claudeModelConfig.js';
+ import { AgentSignal } from '../../common/agent.js';
+ import { ISessionDatabase } from '../../common/sessionDataService.js';
+ import { ActionType } from '../../common/state/sessionActions.js';
++import { AgentMarkdownOrigin, toAgentMarkdownOriginMeta } from '../../common/meta/agentMarkdownOriginMeta.js';
++import { ResponsePartKind } from '../../common/state/protocol/channels-chat/state.js';
+ import { DeferredPromise } from '../../../../base/common/async.js';
+ import { ClaudePromptQueue, IPendingSdkMessage } from './claudePromptQueue.js';
+ import { ClaudeSdkMessageRouter } from './claudeSdkMessageRouter.js';
+@@ -226,6 +228,9 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	/** Set when the consumer loop ends in error (cancellation OR crash). Read by {@link send} to trigger rebind. */
+ 	private _needsRebind = false;
+ 
++	/** Text and turn of steering messages handed to the SDK but not yet echoed to the transcript. */
++	private readonly _steeringInFlight = new Map<string, { readonly text: string; readonly turnId: string }>();
++
+ 	/** Tracks whether the consumer loop is currently draining {@link _query}. */
+ 	private _consumerLoopRunning = false;
+ 
+@@ -264,11 +269,32 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			ClaudePromptQueue,
+ 			sessionId,
+ 			() => this._abortController.signal,
+-			(pendingId: string) => this._onDidProduceSignal.fire({
+-				kind: 'steering_consumed',
+-				chat: this.chatChannelUri,
+-				id: pendingId,
+-			}),
++			(pendingId: string) => {
++				// CONTEXT.md M10 keeps the steered turn, so the message goes into it.
++				const steering = this._steeringInFlight.get(pendingId);
++				this._steeringInFlight.delete(pendingId);
++				if (steering && steering.text) {
++					this._onDidProduceSignal.fire({
++						kind: 'action',
++						resource: this.chatChannelUri,
++						action: {
++							type: ActionType.ChatResponsePart,
++							turnId: steering.turnId,
++							part: {
++								kind: ResponsePartKind.Markdown,
++								id: `${steering.turnId}#steering-${pendingId}`,
++								content: formatSteeringMarkdown(steering.text),
++								_meta: toAgentMarkdownOriginMeta(AgentMarkdownOrigin.UserSteering),
++							},
++						},
++					});
++				}
++				this._onDidProduceSignal.fire({
++					kind: 'steering_consumed',
++					chat: this.chatChannelUri,
++					id: pendingId,
++				});
++			},
+ 		));
+ 		this._router = this._register(instantiationService.createInstance(
+ 			ClaudeSdkMessageRouter, chatChannelUri, resource, dbRef, subagents, clientToolOwner,
+@@ -457,7 +483,17 @@ export class ClaudeSdkPipeline extends Disposable {
+ 	 * exists to inherit a `turnId` from (CONTEXT.md M10: steering folds
+ 	 * into the in-progress protocol Turn).
+ 	 */
+-	injectSteering(prompt: SDKUserMessage, pendingMessageId: string): void {
++	/**
++	 * Fails every queued entry. Steering bookkeeping is dropped with them: a
++	 * rebind reuses this pipeline, so an entry the SDK never took would
++	 * otherwise be retained for the life of the session.
++	 */
++	private _failQueue(error: Error): void {
++		this._queue.failAll(error);
++		this._steeringInFlight.clear();
++	}
++
++	injectSteering(prompt: SDKUserMessage, pendingMessageId: string, displayText: string): void {
+ 		if (this._abortController.signal.aborted) {
+ 			this._logService.warn(`[Claude:${this.sessionId}] injectSteering: dropped (controller aborted) id=${pendingMessageId}`);
+ 			return;
+@@ -472,6 +508,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		// promise is the original entry's deferred); attach a no-op catch
+ 		// so a `failAll` rejection on abort/crash doesn't surface as an
+ 		// unhandled rejection.
++		this._steeringInFlight.set(pendingMessageId, { text: displayText.trim(), turnId: parent.turnId });
+ 		this._queue.push({
+ 			sdkMessage: prompt,
+ 			sdkUuid,
+@@ -499,7 +536,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			return;
+ 		}
+ 		this._abortController.abort();
+-		this._queue.failAll(new CancellationError());
++		this._failQueue(new CancellationError());
+ 		// Mark unhealthy but keep the `_query` handle: the next `send` rebinds,
+ 		// and `shutdownAndWait` still needs it to await the subprocess exit.
+ 		this._needsRebind = true;
+@@ -619,7 +656,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] rebind-aborted: warm dispose failed: ${err}`));
+ 			void Promise.resolve(oldWarm[Symbol.asyncDispose]()).catch((err: unknown) =>
+ 				this._logService.warn(`[ClaudeSdkPipeline:${this.sessionId}] previous WarmQuery dispose failed during aborted rebind: ${err}`));
+-			this._queue.failAll(new CancellationError());
++			this._failQueue(new CancellationError());
+ 			this._needsRebind = true;
+ 			throw new CancellationError();
+ 		}
+@@ -722,7 +759,7 @@ export class ClaudeSdkPipeline extends Disposable {
+ 			// not clobber the fresh one. Mark unhealthy (keep the handle for
+ 			// teardown); the next `send` rebinds.
+ 			if (this._query === query) {
+-				this._queue.failAll(fatal);
++				this._failQueue(fatal);
+ 				this._needsRebind = true;
+ 			}
+ 			if (!isCancellationError(fatal)) {
+@@ -731,3 +768,9 @@ export class ClaudeSdkPipeline extends Disposable {
+ 		}
+ 	}
+ }
++
++/** Render a steering message as an attributed block so it reads as the user's, not the model's. */
++function formatSteeringMarkdown(text: string): string {
++	const quoted = text.split('\n').map(line => `> ${line}`).join('\n');
++	return `\n\n${quoted}\n\n`;
++}
+diff --git a/src/vs/platform/agentHost/test/common/state/chatAttachmentContext.test.ts b/src/vs/platform/agentHost/test/common/state/chatAttachmentContext.test.ts
+index b6dfa8dddcca9..37bc80f79b271 100644
+--- a/src/vs/platform/agentHost/test/common/state/chatAttachmentContext.test.ts
++++ b/src/vs/platform/agentHost/test/common/state/chatAttachmentContext.test.ts
+@@ -8,6 +8,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
+ import { boundChatTranscriptTurns, formatChatTranscript, MAX_CHAT_ATTACHMENT_EXCERPT_CHARS, resolveChatAttachment } from '../../../common/state/chatAttachmentContext.js';
+ import { MessageAttachmentKind, MessageKind, ResponsePartKind, TurnState, type Turn } from '../../../common/state/sessionState.js';
+ import { type MessageChatAttachment } from '../../../common/state/protocol/state.js';
++import { AgentMarkdownOrigin, toAgentMarkdownOriginMeta } from '../../../common/meta/agentMarkdownOriginMeta.js';
+ 
+ /** Build a completed turn with a user message and a single assistant markdown reply. */
+ function turn(id: string, userText: string, assistantText: string, extraAttachments?: Turn['message']['attachments']): Turn {
+@@ -50,6 +51,24 @@ suite('chatAttachmentContext', () => {
+ 		assert.strictEqual(text, 'User: hi\n\nAssistant: hello\n\nUser: more\n\nAssistant: sure');
+ 	});
+ 
++	test('formatChatTranscript attributes a folded steering message to the user', () => {
++		const steered: Turn = {
++			id: 't1',
++			message: { text: 'start the checks', origin: { kind: MessageKind.User } },
++			responseParts: [
++				{ kind: ResponsePartKind.Markdown, id: 't1-a', content: 'running the first one' },
++				{ kind: ResponsePartKind.Markdown, id: 't1-steer', content: 'change of plan', _meta: toAgentMarkdownOriginMeta(AgentMarkdownOrigin.UserSteering) },
++				{ kind: ResponsePartKind.Markdown, id: 't1-b', content: 'stopping, then' },
++			],
++			usage: undefined,
++			state: TurnState.Complete,
++		};
++		assert.strictEqual(
++			formatChatTranscript([steered]),
++			'User: start the checks\n\nAssistant: running the first one\n\nUser: change of plan\n\nAssistant: stopping, then',
++		);
++	});
++
+ 	test('resolveChatAttachment points at the referenced chat and inlines a short transcript whole', () => {
+ 		const turns = [turn('t1', 'first', 'reply one'), turn('t2', 'second', 'reply two'), turn('t3', 'later', 'reply three')];
+ 		const attachment: MessageChatAttachment = { type: MessageAttachmentKind.Chat, resource: 'ahp-chat://c/src', endTurn: 't2', label: 'Conversation so far' };
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index ad2394f87ae05..3b59f133e6a84 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -7435,6 +7435,34 @@ suite('ClaudeAgent (Phase 9 — runtime mutation surface)', () => {
+ 		advance.complete();
+ 	});
+ 
++	test('a consumed steering message is added to the steered turn so it stays on screen', async () => {
++		const { ctx, sessionUri, advance } = await materialize();
++		const sid = AgentSession.id(sessionUri);
++
++		const signals: AgentSignal[] = [];
++		disposables.add(ctx.agent.onDidChatProgress(s => signals.push(s)));
++
++		const longSend = ctx.agent.chats.sendMessage(defaultChatUri(sessionUri), 'long task', undefined, undefined, 'turn-2', undefined, undefined, chatContext(defaultChatUri(sessionUri)));
++		await tick();
++		ctx.agent.setPendingMessages!(defaultChatUri(sessionUri), { id: 'pending-10', message: { text: 'change of plan', origin: { kind: MessageKind.User } } }, []);
++		await tick();
++		await tick();
++
++		// CONTEXT.md M10: the steered turn keeps running, so the message goes into it.
++		const parts = signals
++			.filter(s => s.kind === 'action' && (s as { action: { type: string } }).action.type === ActionType.ChatResponsePart)
++			.map(s => (s as { action: { turnId: string; part: { kind: string; content: string } } }).action)
++			.filter(a => a.part.content.includes('change of plan'));
++
++		assert.deepStrictEqual(parts.map(a => ({ turnId: a.turnId, kind: a.part.kind, content: a.part.content.trim() })), [
++			{ turnId: 'turn-2', kind: ResponsePartKind.Markdown, content: '> change of plan' },
++		]);
++
++		ctx.sdk.nextQueryMessages.push(makeResultSuccess(sid));
++		advance.complete();
++		await longSend;
++	});
++
+ 	test('steering_consumed fires when the iterable hands the steering message to the SDK', async () => {
+ 		const { ctx, sessionUri, advance } = await materialize();
+ 		const sid = AgentSession.id(sessionUri);

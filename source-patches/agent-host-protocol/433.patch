@@ -1,0 +1,404 @@
+From ad3685697cc34842d590e82f2242cb2f30bd2452 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 11:05:51 -0400
+Subject: [PATCH 1/2] chat: make the turnStarted reducer case idempotent
+
+A client that applies chat/turnStarted optimistically and replays it over
+confirmed state (the write-ahead reconciliation model) had its streamed
+content wiped on every replay, because the reducer rebuilt activeTurn with
+an empty responseParts array regardless of what the state already held.
+
+ChatTurnStarted now returns the state unchanged when its turnId is already
+the active turn, or already appears in the completed turns, so a replayed
+start never resets a turn in progress and never resurrects a finished turn
+as an empty active one. Restarting a finished turn remains the job of
+chat/turnResume.
+
+Fixtures cover both no-op branches. The Go, Kotlin, Swift, and .NET reducers
+still need the matching guard before the new fixtures pass there.
+---
+ .../20260902-idempotent-chat-turnstarted.json |  4 ++
+ docs/guide/state-model.md                     |  2 +
+ types/channels-chat/reducer.ts                |  5 ++
+ ...-turnstarted-for-active-turn-is-no-op.json | 67 ++++++++++++++++++
+ ...rnstarted-for-completed-turn-is-no-op.json | 69 +++++++++++++++++++
+ 5 files changed, 147 insertions(+)
+ create mode 100644 docs/.changes/20260902-idempotent-chat-turnstarted.json
+ create mode 100644 types/test-cases/reducers/272-chat-turnstarted-for-active-turn-is-no-op.json
+ create mode 100644 types/test-cases/reducers/273-chat-turnstarted-for-completed-turn-is-no-op.json
+
+diff --git a/docs/.changes/20260902-idempotent-chat-turnstarted.json b/docs/.changes/20260902-idempotent-chat-turnstarted.json
+new file mode 100644
+index 000000000..78c35c6f2
+--- /dev/null
++++ b/docs/.changes/20260902-idempotent-chat-turnstarted.json
+@@ -0,0 +1,4 @@
++{
++  "type": "fixed",
++  "message": "`chat/turnStarted` is a no-op when its `turnId` is already the active turn or an already-completed turn, so a replayed start no longer resets a streaming turn."
++}
+diff --git a/docs/guide/state-model.md b/docs/guide/state-model.md
+index 45a787268..f588ee4ba 100644
+--- a/docs/guide/state-model.md
++++ b/docs/guide/state-model.md
+@@ -207,6 +207,8 @@ ActiveTurn {
+ }
+ ```
+ 
++A `chat/turnStarted` whose `turnId` is already the active turn, or names a turn that has already completed, is a no-op. A client that replays its own optimistic turn start over confirmed state therefore never resets a turn in progress.
++
+ ### User Messages
+ 
+ ```typescript
+diff --git a/types/channels-chat/reducer.ts b/types/channels-chat/reducer.ts
+index 41242700b..f8a27a79b 100644
+--- a/types/channels-chat/reducer.ts
++++ b/types/channels-chat/reducer.ts
+@@ -356,6 +356,11 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+     // ── Turn Lifecycle ────────────────────────────────────────────────────
+ 
+     case ActionType.ChatTurnStarted: {
++      const alreadyStarted = state.activeTurn?.id === action.turnId
++        || state.turns.some(turn => turn.id === action.turnId);
++      if (alreadyStarted) {
++        return state;
++      }
+       let next: ChatState = {
+         ...state,
+         activeTurn: {
+diff --git a/types/test-cases/reducers/272-chat-turnstarted-for-active-turn-is-no-op.json b/types/test-cases/reducers/272-chat-turnstarted-for-active-turn-is-no-op.json
+new file mode 100644
+index 000000000..2685468bc
+--- /dev/null
++++ b/types/test-cases/reducers/272-chat-turnstarted-for-active-turn-is-no-op.json
+@@ -0,0 +1,67 @@
++{
++  "description": "chat/turnStarted for the active turn is a no-op",
++  "reducer": "chat",
++  "initial": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "markdown",
++          "id": "md-1",
++          "content": "Hello world"
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/turnStarted",
++      "turnId": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      }
++    }
++  ],
++  "expected": {
++    "turns": [],
++    "activeTurn": {
++      "id": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      },
++      "responseParts": [
++        {
++          "kind": "markdown",
++          "id": "md-1",
++          "content": "Hello world"
++        }
++      ],
++      "usage": null
++    },
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 8,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+diff --git a/types/test-cases/reducers/273-chat-turnstarted-for-completed-turn-is-no-op.json b/types/test-cases/reducers/273-chat-turnstarted-for-completed-turn-is-no-op.json
+new file mode 100644
+index 000000000..964fe5dd1
+--- /dev/null
++++ b/types/test-cases/reducers/273-chat-turnstarted-for-completed-turn-is-no-op.json
+@@ -0,0 +1,69 @@
++{
++  "description": "chat/turnStarted for a completed turn is a no-op",
++  "reducer": "chat",
++  "initial": {
++    "turns": [
++      {
++        "id": "turn-1",
++        "message": {
++          "text": "Hello",
++          "origin": {
++            "kind": "user"
++          }
++        },
++        "responseParts": [
++          {
++            "kind": "markdown",
++            "id": "md-1",
++            "content": "Hello world"
++          }
++        ],
++        "usage": null,
++        "state": "complete"
++      }
++    ],
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 1,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  },
++  "actions": [
++    {
++      "type": "chat/turnStarted",
++      "turnId": "turn-1",
++      "startedAt": "1970-01-01T00:00:01.000Z",
++      "message": {
++        "text": "Hello",
++        "origin": {
++          "kind": "user"
++        }
++      }
++    }
++  ],
++  "expected": {
++    "turns": [
++      {
++        "id": "turn-1",
++        "message": {
++          "text": "Hello",
++          "origin": {
++            "kind": "user"
++          }
++        },
++        "responseParts": [
++          {
++            "kind": "markdown",
++            "id": "md-1",
++            "content": "Hello world"
++          }
++        ],
++        "usage": null,
++        "state": "complete"
++      }
++    ],
++    "resource": "copilot:/test-session",
++    "title": "Test Session",
++    "status": 1,
++    "modifiedAt": "1970-01-01T00:00:02.000Z"
++  }
++}
+
+From e800f25242d5fbb0ea9179651b1124614c9d0615 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:40:24 -0400
+Subject: [PATCH 2/2] reducers: mirror the idempotent turnStarted guard in
+ every client
+
+The Go, Rust, Swift, Kotlin and .NET chat reducers now return the state
+unchanged when chat/turnStarted names the active turn or a turn already in
+the completed list, matching the TypeScript reducer. The in-place reducers
+report ReduceOutcome NoOp for that branch, which is what they already use
+for an action that is recognised but changes nothing.
+
+The same one-line comment now sits above the guard in all six reducers,
+including the TypeScript one, so the reason for the early exit travels
+with each port.
+
+Kotlin passed CI without the guard only because Gradle served the test
+task from its build cache: the fixture directory reaches the tests as a
+system property path rather than a declared task input, so the two new
+fixtures never invalidated the cached result. Touching Reducers.kt makes
+the test task run again.
+
+Verified locally with the .NET fixture suite (274 of 274 pass, including
+fixtures 272 and 273), dotnet format whitespace, eslint on the TypeScript
+reducer, and the TypeScript reducer fixture tests. The Go, Rust, Swift and
+Kotlin toolchains are not installed here, so those rely on CI.
+---
+ .../dotnet/src/AgentHostProtocol/Reducers.cs  |  7 +++
+ clients/go/ahp/reducers.go                    |  9 +++
+ .../microsoft/agenthostprotocol/Reducers.kt   | 55 +++++++++++--------
+ clients/rust/crates/ahp/src/reducers.rs       |  6 ++
+ .../Sources/AgentHostProtocol/Reducers.swift  |  6 ++
+ types/channels-chat/reducer.ts                |  1 +
+ 6 files changed, 60 insertions(+), 24 deletions(-)
+
+diff --git a/clients/dotnet/src/AgentHostProtocol/Reducers.cs b/clients/dotnet/src/AgentHostProtocol/Reducers.cs
+index f132f9d83..3d319222c 100644
+--- a/clients/dotnet/src/AgentHostProtocol/Reducers.cs
++++ b/clients/dotnet/src/AgentHostProtocol/Reducers.cs
+@@ -1093,6 +1093,13 @@ private static ReduceOutcome WithChatRefresh(ChatState state, ReduceOutcome outc
+ 
+     private static ReduceOutcome ApplyChatTurnStarted(ChatState state, ChatTurnStartedAction a)
+     {
++        // A replayed start must not reset the turn in progress or resurrect a finished one.
++        if ((state.ActiveTurn is not null && state.ActiveTurn.Id == a.TurnId)
++            || state.Turns.Exists(t => t.Id == a.TurnId))
++        {
++            return ReduceOutcome.NoOp;
++        }
++
+         state.ActiveTurn = new ActiveTurn
+         {
+             Id = a.TurnId,
+diff --git a/clients/go/ahp/reducers.go b/clients/go/ahp/reducers.go
+index 6da0af869..c6ad89d63 100644
+--- a/clients/go/ahp/reducers.go
++++ b/clients/go/ahp/reducers.go
+@@ -1058,6 +1058,15 @@ func ApplyActionToSession(state *ahptypes.SessionState, action ahptypes.StateAct
+ }
+ 
+ func applyTurnStarted(state *ahptypes.ChatState, a *ahptypes.ChatTurnStartedAction) ReduceOutcome {
++	// A replayed start must not reset the turn in progress or resurrect a finished one.
++	if state.ActiveTurn != nil && state.ActiveTurn.Id == a.TurnId {
++		return ReduceOutcomeNoOp
++	}
++	for _, turn := range state.Turns {
++		if turn.Id == a.TurnId {
++			return ReduceOutcomeNoOp
++		}
++	}
+ 	state.ActiveTurn = &ahptypes.ActiveTurn{
+ 		Id:            a.TurnId,
+ 		StartedAt:     a.StartedAt,
+diff --git a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt
+index 87c7493fa..1fd473541 100644
+--- a/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt
++++ b/clients/kotlin/src/main/kotlin/com/microsoft/agenthostprotocol/Reducers.kt
+@@ -867,32 +867,39 @@ public fun chatReducer(state: ChatState, action: StateAction): ChatState = when
+ 
+     is StateActionChatTurnStarted -> {
+         val a = action.value
+-        val withTurn = state.copy(
+-            activeTurn = ActiveTurn(
+-                id = a.turnId,
+-                startedAt = a.startedAt,
+-                message = a.message,
+-                responseParts = emptyList(),
+-                usage = null,
+-            ),
+-        )
+-        val withStatus = withTurn.copy(
+-            status = withStatusFlag(chatSummaryStatus(withTurn), SessionStatus.IS_READ, false),
+-            modifiedAt = a.startedAt,
+-        )
+-        if (a.queuedMessageId == null) {
+-            withStatus
++        // A replayed start must not reset the turn in progress or resurrect a finished one.
++        val alreadyStarted = state.activeTurn?.id == a.turnId ||
++            state.turns.any { it.id == a.turnId }
++        if (alreadyStarted) {
++            state
+         } else {
+-            var next = withStatus
+-            if (next.steeringMessage?.id == a.queuedMessageId) {
+-                next = next.copy(steeringMessage = null)
+-            }
+-            val queued = next.queuedMessages
+-            if (queued != null) {
+-                val filtered = queued.filter { it.id != a.queuedMessageId }
+-                next = next.copy(queuedMessages = filtered.ifEmpty { null })
++            val withTurn = state.copy(
++                activeTurn = ActiveTurn(
++                    id = a.turnId,
++                    startedAt = a.startedAt,
++                    message = a.message,
++                    responseParts = emptyList(),
++                    usage = null,
++                ),
++            )
++            val withStatus = withTurn.copy(
++                status = withStatusFlag(chatSummaryStatus(withTurn), SessionStatus.IS_READ, false),
++                modifiedAt = a.startedAt,
++            )
++            if (a.queuedMessageId == null) {
++                withStatus
++            } else {
++                var next = withStatus
++                if (next.steeringMessage?.id == a.queuedMessageId) {
++                    next = next.copy(steeringMessage = null)
++                }
++                val queued = next.queuedMessages
++                if (queued != null) {
++                    val filtered = queued.filter { it.id != a.queuedMessageId }
++                    next = next.copy(queuedMessages = filtered.ifEmpty { null })
++                }
++                next
+             }
+-            next
+         }
+     }
+ 
+diff --git a/clients/rust/crates/ahp/src/reducers.rs b/clients/rust/crates/ahp/src/reducers.rs
+index 95b02ff4d..aad5e2f3c 100644
+--- a/clients/rust/crates/ahp/src/reducers.rs
++++ b/clients/rust/crates/ahp/src/reducers.rs
+@@ -1325,6 +1325,12 @@ pub fn apply_action_to_chat(state: &mut ChatState, action: &StateAction) -> Redu
+ }
+ 
+ fn apply_turn_started(state: &mut ChatState, a: &ChatTurnStartedAction) -> ReduceOutcome {
++    // A replayed start must not reset the turn in progress or resurrect a finished one.
++    let already_started = state.active_turn.as_ref().is_some_and(|t| t.id == a.turn_id)
++        || state.turns.iter().any(|t| t.id == a.turn_id);
++    if already_started {
++        return ReduceOutcome::NoOp;
++    }
+     state.active_turn = Some(ActiveTurn {
+         id: a.turn_id.clone(),
+         started_at: a.started_at.clone(),
+diff --git a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift
+index 0d5585cfa..4a21a4ec1 100644
+--- a/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift
++++ b/clients/swift/AgentHostProtocol/Sources/AgentHostProtocol/Reducers.swift
+@@ -127,6 +127,12 @@ public func chatReducer(state: ChatState, action: StateAction) -> ChatState {
+     // ── Turn Lifecycle ────────────────────────────────────────────────────
+ 
+     case .chatTurnStarted(let a):
++        // A replayed start must not reset the turn in progress or resurrect a finished one.
++        let alreadyStarted = state.activeTurn?.id == a.turnId
++            || state.turns.contains { $0.id == a.turnId }
++        if alreadyStarted {
++            return state
++        }
+         var next = state
+         next.modifiedAt = a.startedAt
+         next.activeTurn = ActiveTurn(
+diff --git a/types/channels-chat/reducer.ts b/types/channels-chat/reducer.ts
+index f8a27a79b..12a2af4e1 100644
+--- a/types/channels-chat/reducer.ts
++++ b/types/channels-chat/reducer.ts
+@@ -356,6 +356,7 @@ export function chatReducer(state: ChatState, action: ChatAction, log?: (msg: st
+     // ── Turn Lifecycle ────────────────────────────────────────────────────
+ 
+     case ActionType.ChatTurnStarted: {
++      // A replayed start must not reset the turn in progress or resurrect a finished one.
+       const alreadyStarted = state.activeTurn?.id === action.turnId
+         || state.turns.some(turn => turn.id === action.turnId);
+       if (alreadyStarted) {

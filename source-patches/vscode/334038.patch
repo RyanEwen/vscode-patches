@@ -1,0 +1,143 @@
+From f733a2bd102e87195a7dd68c283f9f9738d0051a Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:29:54 -0400
+Subject: [PATCH] agentHost: never throw from the Claude client-tool MCP
+ handler
+
+The in-process MCP handler that surfaces workbench client tools to the
+Claude SDK awaited the parked deferred with no try/catch, so a rejection
+(rejectAll at rebind or dispose, or a second register for the same
+tool_use_id) escaped into the SDK's tool path instead of being answered
+as a tool result. The handler now catches the rejection and returns an
+isError result carrying the reason, matching the server-tool MCP server
+and the existing missing-tool_use_id branch in the same file.
+
+PendingRequestRegistry.register no longer cancels the previous deferred
+when the key is already parked; it shares the existing one so a replayed
+tool_use_id settles on the same respond. The buffered early-result path
+is unchanged. No caller relied on the cancel-the-previous behaviour: the
+Claude, Copilot and Codex client-tool handlers and Copilot's permission,
+auto-approval, user-input, elicitation, plan-review and MCP-auth
+registries all register one key per request, and the rejectAll/denyAll
+sweeps used for abort and dispose are untouched.
+---
+ .../agentHost/common/pendingRequestRegistry.ts     | 10 ++++------
+ .../clientTools/claudeClientToolMcpServer.ts       | 14 ++++++++++++--
+ .../test/common/pendingRequestRegistry.test.ts     |  8 ++++++++
+ .../clientTools/claudeClientToolMcpServer.test.ts  | 10 ++++++++++
+ 4 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+index d90d8d2525df0..aef76f1e08724 100644
+--- a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
++++ b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+@@ -4,7 +4,6 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { DeferredPromise } from '../../../base/common/async.js';
+-import { CancellationError } from '../../../base/common/errors.js';
+ 
+ type MetadataArgument<TMeta> = [TMeta] extends [void] ? [metadata?: TMeta] : [metadata: TMeta];
+ 
+@@ -50,10 +49,9 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	 * path (e.g. an MCP handler invoked by the SDK whose completion
+ 	 * arrives via a workbench round-trip).
+ 	 *
+-	 * If `key` is already registered (duplicate `tool_use_id` from the
+-	 * SDK, retry, or logic bug), the previous deferred is rejected with
+-	 * a {@link CancellationError} so its awaiter unwinds instead of
+-	 * leaking forever.
++	 * If `key` is already parked (duplicate `tool_use_id` from the SDK,
++	 * a retry, or a logic bug), the existing deferred is shared so every
++	 * awaiter settles on the single {@link respond}.
+ 	 */
+ 	register(key: string, ...metadata: MetadataArgument<TMeta>): Promise<TResult> {
+ 		if (this._earlyResults.has(key)) {
+@@ -63,7 +61,7 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 		}
+ 		const existing = this._entries.get(key);
+ 		if (existing && !existing.deferred.isSettled) {
+-			existing.deferred.error(new CancellationError());
++			return existing.deferred.p;
+ 		}
+ 		const deferred = new DeferredPromise<TResult>();
+ 		this._entries.set(key, { deferred, metadata: metadata[0] as TMeta });
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+index 7d5b75cd6fe9b..8120cc2cabb5c 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+@@ -29,7 +29,9 @@ const TOOL_USE_ID_META_KEY = 'claudecode/toolUseId';
+  * which is expected to return a promise that settles when the workbench
+  * echoes a completion (typically via a parked deferred owned by the
+  * session). Keeping that plumbing behind a callback lets this factory
+- * stay ignorant of how the host tracks in-flight tool calls.
++ * stay ignorant of how the host tracks in-flight tool calls. A rejected
++ * `awaitResult` (cancellation on rebind or dispose) is answered as an
++ * `isError` result; the handler never throws.
+  *
+  * Pure factory — no SDK loading, no I/O.
+  */
+@@ -53,7 +55,15 @@ export async function buildClientToolMcpServer(
+ 					isError: true,
+ 				};
+ 			}
+-			return awaitResult(toolUseId);
++			try {
++				return await awaitResult(toolUseId);
++			} catch (error) {
++				const message = error instanceof Error ? error.message : String(error);
++				return {
++					content: [{ type: 'text', text: `Client tool "${def.name}" failed: ${message}` }],
++					isError: true,
++				};
++			}
+ 		}
+ 	)));
+ 	return sdk.createSdkMcpServer({ name: CLAUDE_CLIENT_MCP_SERVER_NAME, tools });
+diff --git a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+index 122e79dda6d1a..644d520faae53 100644
+--- a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+@@ -150,6 +150,14 @@ suite('PendingRequestRegistry', () => {
+ 		assert.strictEqual(await promise, 'value');
+ 	});
+ 
++	test('a duplicate register for a parked key shares the deferred', async () => {
++		const registry = new PendingRequestRegistry<string>();
++		const first = registry.register('k');
++		const second = registry.register('k');
++		assert.strictEqual(registry.respond('k', 'value'), true);
++		assert.deepStrictEqual([await Promise.all([first, second]), registry.has('k')], [['value', 'value'], false]);
++	});
++
+ 	test('hasBufferedResult reports only unconsumed early results', async () => {
+ 		const registry = new PendingRequestRegistry<string>();
+ 		assert.strictEqual(registry.hasBufferedResult('k'), false);
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
+index 5dd303748d372..c56efaa39d1e8 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import assert from 'assert';
++import { CancellationError } from '../../../../../base/common/errors.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+ import { PendingRequestRegistry } from '../../../common/pendingRequestRegistry.js';
+ import type { ToolDefinition } from '../../../common/state/protocol/state.js';
+@@ -96,6 +97,15 @@ suite('claudeClientToolMcpServer / buildClientToolMcpServer', () => {
+ 		assert.strictEqual(result.isError, true);
+ 	});
+ 
++	test('handler maps a rejected awaitResult to an isError result instead of throwing', async () => {
++		const { sdk, recorded } = makeSdk();
++		await buildClientToolMcpServer([tool()], () => Promise.reject(new CancellationError()), sdk);
++		const handler = recorded[0]!.handler;
++		const result = await handler({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_42' } });
++		assert.strictEqual(result.isError, true);
++		assert.match((result.content[0] as { type: string; text: string }).text, /cancel/i);
++	});
++
+ 	test('tools with missing description default to empty string (no crash)', async () => {
+ 		const { sdk, recorded } = makeSdk();
+ 		const registry = new PendingRequestRegistry<CallToolResult>();

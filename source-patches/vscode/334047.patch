@@ -1,0 +1,923 @@
+From fba1bcd1f5bbb91bd86773e7479c40a8da8bcc8c Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:54:54 -0400
+Subject: [PATCH 1/2] agentHost: expose the Claude replay attribution index
+
+Restoring a Claude session replays the transcript through ReplayBuilder,
+which already indexes every tool_use by id (announcing turn, name, client
+tool flag, parsed input) and then discards that index in finish(). The
+only thing kept was SubagentRegistry.primeFromTranscript, which recovers
+(toolCallId, agentId) pairs from completed Task results alone, so pending
+spawns and every other tool use were lost on restore.
+
+This is the pure foundation for hydrating a restored session's live
+attribution state; no call site hydrates a live session yet.
+
+replaySessionMessages now returns the turns together with the attribution
+index (entries keyed by tool_use_id plus the tail turn id). Each entry
+records whether its result was seen and, for Task/Agent spawns, the
+agentId suffix the SDK wrote into the result. mapSessionMessagesToTurns
+is a thin wrapper over it, so its callers are unchanged.
+
+claudeAttributionResolver partitions that index into pending (unresolved
+in the tail turn), dead (unresolved in an earlier turn, so no result can
+ever arrive) and spawns. hydrateAttribution seeds ClaudeToolCallRegistry
+through a new hydrate method that reuses the begin and _writeInfo paths
+so display info matches the live path, marks each entry restored, and
+records every spawn in SubagentRegistry.
+
+The one behaviour change: primeFromTranscript now also records pending
+Task/Agent parts (no agentId yet), matching what hydrateAttribution does,
+so switching the restore path over later is behaviour neutral.
+---
+ .../node/claude/claudeAttributionResolver.ts  |  65 +++++++++
+ .../node/claude/claudeReplayMapper.ts         |  85 ++++++++++--
+ .../node/claude/claudeSubagentRegistry.ts     |  29 +++-
+ .../node/claude/claudeToolCallRegistry.ts     |  26 +++-
+ .../node/claudeAttributionResolver.test.ts    | 131 ++++++++++++++++++
+ .../test/node/claudeReplayMapper.test.ts      |  32 ++++-
+ .../test/node/claudeSubagentRegistry.test.ts  |  30 +++-
+ 7 files changed, 375 insertions(+), 23 deletions(-)
+ create mode 100644 src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts
+ create mode 100644 src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts b/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts
+new file mode 100644
+index 0000000000000..4fb12fa6e3472
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts
+@@ -0,0 +1,65 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import type { ClaudeMapperState } from './claudeMapSessionEvents.js';
++import type { IClaudeReplayAttribution, IClaudeReplayToolUse } from './claudeReplayMapper.js';
++import type { ISubagentSpawnInit, SubagentRegistry } from './claudeSubagentRegistry.js';
++
++/**
++ * Replayed tool uses partitioned by what a restored session must do with them.
++ * `pending` and `dead` are both unresolved; only `pending` can still receive a result.
++ */
++export interface IClaudeAttributionSeed {
++	readonly pending: readonly IClaudeReplayToolUse[];
++	readonly dead: readonly IClaudeReplayToolUse[];
++	readonly spawns: readonly IClaudeReplayToolUse[];
++}
++
++/**
++ * Partition the replay index. An unresolved `tool_use` is only pending in the tail
++ * turn; in any earlier turn a later user envelope exists, so its result can never arrive.
++ */
++export function buildAttributionSeed(attribution: IClaudeReplayAttribution): IClaudeAttributionSeed {
++	const pending: IClaudeReplayToolUse[] = [];
++	const dead: IClaudeReplayToolUse[] = [];
++	const spawns: IClaudeReplayToolUse[] = [];
++	for (const entry of attribution.entries.values()) {
++		if (entry.isSubagentSpawn) {
++			spawns.push(entry);
++		}
++		if (entry.resultSeen) {
++			continue;
++		}
++		if (entry.turnId === attribution.tailTurnId) {
++			pending.push(entry);
++		} else {
++			dead.push(entry);
++		}
++	}
++	return { pending, dead, spawns };
++}
++
++/**
++ * Seed a restored session's live attribution state from a replay seed.
++ * Dead entries are deliberately not seeded; they only exist to be counted.
++ */
++export function hydrateAttribution(state: ClaudeMapperState, registry: SubagentRegistry, seed: IClaudeAttributionSeed): void {
++	for (const entry of seed.pending) {
++		state.toolCalls.hydrate(entry);
++	}
++	for (const spawn of seed.spawns) {
++		registry.recordSpawn(spawn.toolUseId, readSpawnInit(spawn));
++	}
++}
++
++function readSpawnInit(spawn: IClaudeReplayToolUse): ISubagentSpawnInit {
++	const input = spawn.parsedInput;
++	return {
++		agentId: spawn.agentId,
++		subagentType: typeof input?.subagent_type === 'string' ? input.subagent_type : undefined,
++		description: typeof input?.description === 'string' ? input.description : undefined,
++		prompt: typeof input?.prompt === 'string' ? input.prompt : undefined,
++	};
++}
+diff --git a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+index 5522564e786fd..1c36d7adc6c3a 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+@@ -25,9 +25,34 @@ import {
+ import { buildSubagentSessionUri } from '../../common/state/sessionState.js';
+ import { readToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+ import { formatGenericToolInput } from '../../common/streamingToolCallDisplay.js';
++import { SUBAGENT_ID_SUFFIX_REGEX, SUBAGENT_TOOL_NAMES } from './claudeSubagentRegistry.js';
+ import { buildClaudeToolMeta, getClaudeInvocationMessage, getClaudePastTenseMessage, getClaudeToolDisplayName, getClaudeToolInputString } from './claudeToolDisplay.js';
+ import { hasClientToolNamePrefix, stripClientToolNamePrefix } from './clientTools/claudeClientToolMcpServer.js';
+ 
++/**
++ * One `tool_use` seen during replay. `resultSeen` and `agentId` are written
++ * when the matching `tool_result` lands; everything else is fixed at announce time.
++ */
++export interface IClaudeReplayToolUse {
++	readonly toolUseId: string;
++	readonly turnId: string;
++	readonly toolName: string;
++	readonly isClientTool: boolean;
++	readonly parsedInput: Record<string, unknown> | undefined;
++	readonly isSubagentSpawn: boolean;
++	resultSeen: boolean;
++	agentId?: string;
++}
++
++/**
++ * The replay builder's cross-turn tool-use index, kept so a restored session
++ * can re-seed its live attribution state from durable transcript data.
++ */
++export interface IClaudeReplayAttribution {
++	readonly entries: ReadonlyMap<string, IClaudeReplayToolUse>;
++	readonly tailTurnId: string | undefined;
++}
++
+ /**
+  * Phase 13 — replay mapper. Reduces a flat `SessionMessage[]` (the SDK's
+  * on-disk JSONL transcript) into the protocol's `Turn[]` shape per
+@@ -44,11 +69,11 @@ import { hasClientToolNamePrefix, stripClientToolNamePrefix } from './clientTool
+  * `'user'` envelope and must resolve back to the announcing `tool_use`'s
+  * turn. This mapper builds an equivalent local map during its single pass.
+  */
+-export function mapSessionMessagesToTurns(
++export function replaySessionMessages(
+ 	messages: readonly SessionMessage[],
+ 	session: URI,
+ 	logService: ILogService,
+-): readonly Turn[] {
++): { readonly turns: readonly Turn[]; readonly attribution: IClaudeReplayAttribution } {
+ 	const builder = new ReplayBuilder(session, logService);
+ 	for (const msg of messages) {
+ 		const parsed = parseSessionMessage(msg);
+@@ -60,6 +85,15 @@ export function mapSessionMessagesToTurns(
+ 	return builder.finish();
+ }
+ 
++/** Turns-only view of {@link replaySessionMessages} for callers that do not need the attribution index. */
++export function mapSessionMessagesToTurns(
++	messages: readonly SessionMessage[],
++	session: URI,
++	logService: ILogService,
++): readonly Turn[] {
++	return replaySessionMessages(messages, session, logService).turns;
++}
++
+ /**
+  * Phase 6.5 — translate a protocol `turnId` (the last KEPT turn N) into the
+  * SDK envelope `uuid` that `forkSession({ upToMessageId })` accepts
+@@ -258,16 +292,10 @@ class ReplayBuilder {
+ 	private readonly _turns: Turn[] = [];
+ 	private _active: InProgressTurn | undefined;
+ 	/**
+-	 * Cross-turn tool-use tracking. Keyed by `tool_use_id`:
+-	 * - `turnId` — the announcing turn (so a late `tool_result` in a
+-	 *   later `user` envelope can attach back to the right turn per M7).
+-	 * - `parsedInput` — the original `tool_use.input`, looked up at
+-	 *   `_attachToolResult` so the past-tense message can include the
+-	 *   original parameters. Mirrors the live mapper's `_toolCallInfo`
+-	 *   pattern but simpler (replay has the full input synchronously on
+-	 *   the `tool_use` block).
++	 * Cross-turn tool-use index keyed by `tool_use_id`, so a late `tool_result`
++	 * attaches to its announcing turn (M7). Handed out by {@link finish}.
+ 	 */
+-	private readonly _toolUses = new Map<string, { readonly turnId: string; readonly parsedInput: Record<string, unknown> | undefined; readonly isClientTool: boolean }>();
++	private readonly _toolUses = new Map<string, IClaudeReplayToolUse>();
+ 
+ 	/** Turns opened from a leading assistant envelope because the prompt was missing. Reported once by {@link finish}. */
+ 	private _recoveredPromptlessTurns = 0;
+@@ -319,7 +347,7 @@ class ReplayBuilder {
+ 		}
+ 	}
+ 
+-	finish(): readonly Turn[] {
++	finish(): { readonly turns: readonly Turn[]; readonly attribution: IClaudeReplayAttribution } {
+ 		this._closeActive();
+ 		// One summary line per replay instead of one warn per envelope: a
+ 		// truncated transcript produces these by the hundred, and the
+@@ -328,7 +356,8 @@ class ReplayBuilder {
+ 		if (this._recoveredPromptlessTurns > 0 || this._orphanToolResults > 0) {
+ 			this._logService.warn(`[claudeReplayMapper] incomplete transcript for ${this._session.toString()}: ${this._recoveredPromptlessTurns} turn(s) recovered without their prompt, ${this._orphanToolResults} orphaned tool_result(s)`);
+ 		}
+-		return this._turns;
++		const tailTurnId = this._turns.at(-1)?.id;
++		return { turns: this._turns, attribution: { entries: this._toolUses, tailTurnId } };
+ 	}
+ 
+ 	private _consumeAssistant(msg: ParsedSessionMessage & { kind: 'assistant' }): void {
+@@ -413,7 +442,15 @@ class ReplayBuilder {
+ 		this._active.responseParts.push(part);
+ 		this._active.toolCallParts.set(toolUseId, part);
+ 		this._active.pendingToolUseIds.add(toolUseId);
+-		this._toolUses.set(toolUseId, { turnId: this._active.id, parsedInput, isClientTool });
++		this._toolUses.set(toolUseId, {
++			toolUseId,
++			turnId: this._active.id,
++			toolName,
++			isClientTool,
++			parsedInput,
++			isSubagentSpawn: !isClientTool && SUBAGENT_TOOL_NAMES.has(toolName),
++			resultSeen: false,
++		});
+ 	}
+ 
+ 	private _attachToolResult(block: UserToolResultBlock): string | undefined {
+@@ -422,6 +459,7 @@ class ReplayBuilder {
+ 			this._orphanToolResults++;
+ 			return undefined;
+ 		}
++		entry.resultSeen = true;
+ 		const announcingTurnId = entry.turnId;
+ 		// Find the part — it lives on the announcing turn (which may be `_active` or one already pushed to `_turns`).
+ 		const part = this._findToolCallPart(announcingTurnId, block.tool_use_id);
+@@ -432,6 +470,10 @@ class ReplayBuilder {
+ 		const previousState = part.toolCall;
+ 		const isSubagent = readToolCallMeta(previousState).toolKind === 'subagent';
+ 		const content: ToolResultContent[] = extractToolResultContent(block.content) ?? [];
++		const agentId = entry.isSubagentSpawn ? readSubagentIdSuffix(content) : undefined;
++		if (agentId !== undefined) {
++			entry.agentId = agentId;
++		}
+ 		const resultText = content
+ 			.filter((c): c is { type: ToolResultContentType.Text; text: string } => c.type === ToolResultContentType.Text)
+ 			.map(c => c.text)
+@@ -626,6 +668,21 @@ function extractToolResultContent(content: unknown): { type: ToolResultContentTy
+ 	return out.length > 0 ? out : undefined;
+ }
+ 
++/** Mirrors the registry's `extractAgentIdPair` scan: the last text block carrying the SDK's `agentId:` suffix wins. */
++function readSubagentIdSuffix(content: readonly ToolResultContent[]): string | undefined {
++	for (let i = content.length - 1; i >= 0; i--) {
++		const block = content[i];
++		if (block.type !== ToolResultContentType.Text) {
++			continue;
++		}
++		const match = SUBAGENT_ID_SUFFIX_REGEX.exec(block.text);
++		if (match) {
++			return match[1];
++		}
++	}
++	return undefined;
++}
++
+ function safeStringify(v: unknown): string | undefined {
+ 	try {
+ 		return JSON.stringify(v);
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+index e1b8414f72be1..b9cd8c1396b0f 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { Disposable } from '../../../../base/common/lifecycle.js';
++import { readToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+ import {
+ 	ResponsePartKind,
+ 	ToolCallStatus,
+@@ -204,14 +205,16 @@ export class SubagentRegistry extends Disposable {
+ 	}
+ 
+ 	/**
+-	 * Replay-path bulk populate: scan a parent transcript for the
+-	 * SDK's synthetic `agentId: <hex>` suffix on Task/Agent tool_result
+-	 * text blocks and record each `(toolUseId, agentId)` pair. Idempotent.
++	 * Replay-path bulk populate: record every subagent-spawning tool call in a parent
++	 * transcript, settled or not, with the SDK's `agentId:` suffix where present. Idempotent.
+ 	 */
+ 	primeFromTranscript(transcript: readonly Turn[]): void {
+ 		for (const [toolCallId, agentId] of scanTranscriptForAgentIds(transcript)) {
+ 			this.recordSpawn(toolCallId, { agentId });
+ 		}
++		for (const toolCallId of scanTranscriptForSpawns(transcript)) {
++			this.recordSpawn(toolCallId);
++		}
+ 	}
+ 
+ 	private _evictInnerEdgesFor(parentToolUseId: string): void {
+@@ -242,6 +245,26 @@ export function scanTranscriptForAgentIds(transcript: readonly Turn[]): Readonly
+ 	return out;
+ }
+ 
++/**
++ * Pure scan: the `toolCallId` of every subagent-spawning tool call, regardless of
++ * status. A client tool named `Task` carries no subagent meta and is skipped.
++ */
++function scanTranscriptForSpawns(transcript: readonly Turn[]): readonly string[] {
++	const out: string[] = [];
++	for (const turn of transcript) {
++		for (const part of turn.responseParts) {
++			if (part.kind !== ResponsePartKind.ToolCall) {
++				continue;
++			}
++			const state = part.toolCall;
++			if (SUBAGENT_TOOL_NAMES.has(state.toolName) && readToolCallMeta(state).toolKind === 'subagent') {
++				out.push(state.toolCallId);
++			}
++		}
++	}
++	return out;
++}
++
+ function extractAgentIdPair(part: ResponsePart): { toolCallId: string; agentId: string } | undefined {
+ 	if (part.kind !== ResponsePartKind.ToolCall) {
+ 		return undefined;
+diff --git a/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts b/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts
+index 0d5579a5218b5..2fd5ff0ea5c3d 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeToolCallRegistry.ts
+@@ -7,6 +7,7 @@ import type { ILogService } from '../../../log/common/log.js';
+ import { parsePartialToolInput } from '../../common/partialToolInput.js';
+ import { formatGenericToolInput, STREAMING_TOOL_DISPLAY_INTERVAL_MS, streamingToolDisplayText } from '../../common/streamingToolCallDisplay.js';
+ import type { StringOrMarkdown } from '../../common/state/protocol/state.js';
++import type { IClaudeReplayToolUse } from './claudeReplayMapper.js';
+ import { getClaudeInvocationMessage, getClaudeStreamingInvocationMessage, getClaudeToolDisplayName, getClaudeToolInputString } from './claudeToolDisplay.js';
+ 
+ /**
+@@ -30,6 +31,7 @@ interface IRegistryEntry {
+ 	readonly toolName: string;
+ 	readonly turnId: string;
+ 	readonly isClientTool: boolean;
++	readonly restored: boolean;
+ 	inputBuffer: string;
+ 	displayedInputLength: number;
+ 	displayedAt: number | undefined;
+@@ -80,16 +82,32 @@ export class ClaudeToolCallRegistry {
+ 	 * computed info bag is filled in by {@link finalize}.
+ 	 */
+ 	begin(toolUseId: string, toolName: string, turnId: string, isClientTool = false): void {
+-		this._entries.set(toolUseId, {
++		this._insert(toolUseId, toolName, turnId, isClientTool, false);
++	}
++
++	/**
++	 * Re-seed a tool call from a replayed transcript so a `tool_result` that
++	 * arrives after restore resolves the same attribution and display info as live.
++	 */
++	hydrate(entry: IClaudeReplayToolUse): void {
++		const inserted = this._insert(entry.toolUseId, entry.toolName, entry.turnId, entry.isClientTool, true);
++		this._writeInfo(inserted, entry.parsedInput);
++	}
++
++	private _insert(toolUseId: string, toolName: string, turnId: string, isClientTool: boolean, restored: boolean): IRegistryEntry {
++		const entry: IRegistryEntry = {
+ 			toolName,
+ 			turnId,
+ 			isClientTool,
++			restored,
+ 			inputBuffer: '',
+ 			displayedInputLength: 0,
+ 			displayedAt: undefined,
+ 			displayedMessage: undefined,
+ 			info: undefined,
+-		});
++		};
++		this._entries.set(toolUseId, entry);
++		return entry;
+ 	}
+ 
+ 	/**
+@@ -206,12 +224,12 @@ export class ClaudeToolCallRegistry {
+ 	 * drift / replay). The `info` field may be `undefined` if the
+ 	 * tool block never reached `content_block_stop`.
+ 	 */
+-	lookup(toolUseId: string): { readonly turnId: string; readonly toolName: string; readonly isClientTool: boolean; readonly info: IClaudeToolStartInfo | undefined } | undefined {
++	lookup(toolUseId: string): { readonly turnId: string; readonly toolName: string; readonly isClientTool: boolean; readonly restored: boolean; readonly info: IClaudeToolStartInfo | undefined } | undefined {
+ 		const entry = this._entries.get(toolUseId);
+ 		if (!entry) {
+ 			return undefined;
+ 		}
+-		return { turnId: entry.turnId, toolName: entry.toolName, isClientTool: entry.isClientTool, info: entry.info };
++		return { turnId: entry.turnId, toolName: entry.toolName, isClientTool: entry.isClientTool, restored: entry.restored, info: entry.info };
+ 	}
+ 
+ 	/**
+diff --git a/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts b/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts
+new file mode 100644
+index 0000000000000..fb818d094b785
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts
+@@ -0,0 +1,131 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import type { SessionMessage } from '@anthropic-ai/claude-agent-sdk';
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
++import { URI } from '../../../../base/common/uri.js';
++import { NullLogService } from '../../../log/common/log.js';
++import { ResponsePartKind, ToolCallStatus } from '../../common/state/protocol/state.js';
++import { buildAttributionSeed, hydrateAttribution } from '../../node/claude/claudeAttributionResolver.js';
++import { ClaudeMapperState } from '../../node/claude/claudeMapSessionEvents.js';
++import { replaySessionMessages } from '../../node/claude/claudeReplayMapper.js';
++import { SubagentRegistry } from '../../node/claude/claudeSubagentRegistry.js';
++import { getClaudePastTenseMessage } from '../../node/claude/claudeToolDisplay.js';
++
++suite('claudeAttributionResolver', () => {
++
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	const logService = new NullLogService();
++	const session = URI.parse('claude:/sess-1');
++
++	function makeUser(uuid: string, text: string): SessionMessage {
++		return {
++			type: 'user',
++			uuid,
++			session_id: 'sess-1',
++			parent_tool_use_id: null,
++			parent_agent_id: null,
++			message: { role: 'user', content: [{ type: 'text', text }] },
++		};
++	}
++
++	function makeAssistantToolUse(uuid: string, toolUseId: string, name: string, input: unknown = {}): SessionMessage {
++		return {
++			type: 'assistant',
++			uuid,
++			session_id: 'sess-1',
++			parent_tool_use_id: null,
++			parent_agent_id: null,
++			message: { id: `msg_${uuid}`, role: 'assistant', content: [{ type: 'tool_use', id: toolUseId, name, input }] },
++		};
++	}
++
++	function makeUserToolResult(uuid: string, toolUseId: string, text: string): SessionMessage {
++		return {
++			type: 'user',
++			uuid,
++			session_id: 'sess-1',
++			parent_tool_use_id: null,
++			parent_agent_id: null,
++			message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: text }] },
++		};
++	}
++
++	test('buildAttributionSeed: pending tool_use in a non-tail turn is dead, pending in the tail turn is hydrated', () => {
++		const messages: SessionMessage[] = [
++			makeUser('u1', 'first'),
++			makeAssistantToolUse('a1', 'tu_dead', 'Bash', { command: 'sleep 100' }),
++			makeAssistantToolUse('a2', 'tu_task_done', 'Task', { description: 'explore' }),
++			makeUserToolResult('r1', 'tu_task_done', 'agentId: agentaaa'),
++			makeUser('u2', 'second'),
++			makeAssistantToolUse('a3', 'tu_settled', 'Read', { file_path: '/tmp/x' }),
++			makeUserToolResult('r2', 'tu_settled', 'contents'),
++			makeAssistantToolUse('a4', 'tu_pending', 'Grep', { pattern: 'x' }),
++			makeAssistantToolUse('a5', 'tu_task_pending', 'Task', { description: 'still running' }),
++		];
++
++		const seed = buildAttributionSeed(replaySessionMessages(messages, session, logService).attribution);
++
++		assert.deepStrictEqual({
++			pending: seed.pending.map(e => e.toolUseId),
++			dead: seed.dead.map(e => e.toolUseId),
++			spawns: seed.spawns.map(e => [e.toolUseId, e.resultSeen, e.agentId]),
++		}, {
++			pending: ['tu_pending', 'tu_task_pending'],
++			dead: ['tu_dead'],
++			spawns: [['tu_task_done', true, 'agentaaa'], ['tu_task_pending', false, undefined]],
++		});
++	});
++
++	test('hydrateAttribution seeds registry info so pastTenseMessage parity holds and records spawns', () => {
++		const command = 'git status';
++		const messages: SessionMessage[] = [
++			makeUser('u1', 'first'),
++			makeAssistantToolUse('a1', 'tu_dead', 'Bash', { command }),
++			makeUser('u2', 'second'),
++			makeAssistantToolUse('a2', 'tu_settled', 'Bash', { command }),
++			makeUserToolResult('r1', 'tu_settled', 'clean'),
++			makeAssistantToolUse('a3', 'tu_pending', 'Bash', { command }),
++			makeAssistantToolUse('a4', 'tu_task_done', 'Task', { subagent_type: 'Explore', description: 'count files', prompt: 'count them' }),
++			makeUserToolResult('r2', 'tu_task_done', 'agentId: agentaaa'),
++			makeAssistantToolUse('a5', 'tu_task_pending', 'Task', { subagent_type: 'Plan', description: 'plan it', prompt: 'make a plan' }),
++		];
++		const { turns, attribution } = replaySessionMessages(messages, session, logService);
++		const state = new ClaudeMapperState();
++		const registry = disposables.add(new SubagentRegistry());
++
++		hydrateAttribution(state, registry, buildAttributionSeed(attribution));
++
++		const settledPart = turns[1].responseParts.find(p => p.kind === ResponsePartKind.ToolCall && p.toolCall.toolCallId === 'tu_settled');
++		const replayedPastTense = settledPart?.kind === ResponsePartKind.ToolCall && settledPart.toolCall.status === ToolCallStatus.Completed
++			? settledPart.toolCall.pastTenseMessage
++			: undefined;
++		const hydrated = state.toolCalls.lookup('tu_pending');
++		const livePastTense = hydrated?.info
++			? getClaudePastTenseMessage(hydrated.info.toolName, hydrated.info.displayName, hydrated.info.parsedInput, true, 'clean')
++			: undefined;
++		const spawnPending = registry.getSpawn('tu_task_pending');
++
++		assert.deepStrictEqual({
++			hydrated: { turnId: hydrated?.turnId, toolName: hydrated?.toolName, restored: hydrated?.restored, toolInput: hydrated?.info?.toolInput },
++			livePastTense,
++			replayedPastTense,
++			dead: state.toolCalls.lookup('tu_dead'),
++			settled: state.toolCalls.lookup('tu_settled'),
++			spawnDone: { agentId: registry.getSpawn('tu_task_done')?.agentId, subagentType: registry.getSpawn('tu_task_done')?.subagentType },
++			spawnPending: spawnPending && { agentId: spawnPending.agentId, subagentType: spawnPending.subagentType, description: spawnPending.description, prompt: spawnPending.prompt },
++		}, {
++			hydrated: { turnId: 'u2', toolName: 'Bash', restored: true, toolInput: 'git status' },
++			livePastTense: { markdown: 'Ran `git status`' },
++			replayedPastTense: { markdown: 'Ran `git status`' },
++			dead: undefined,
++			settled: undefined,
++			spawnDone: { agentId: 'agentaaa', subagentType: 'Explore' },
++			spawnPending: { agentId: undefined, subagentType: 'Plan', description: 'plan it', prompt: 'make a plan' },
++		});
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+index 3cb068acebf8f..c904d53d1d924 100644
+--- a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+@@ -9,7 +9,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
+ import { URI } from '../../../../base/common/uri.js';
+ import { NullLogService } from '../../../log/common/log.js';
+ import { ResponsePartKind, ToolCallStatus, ToolResultContentType, TurnState } from '../../common/state/protocol/state.js';
+-import { mapSessionMessagesToTurns, missingPromptPlaceholder, resolveForkAnchorUuid } from '../../node/claude/claudeReplayMapper.js';
++import { mapSessionMessagesToTurns, missingPromptPlaceholder, replaySessionMessages, resolveForkAnchorUuid } from '../../node/claude/claudeReplayMapper.js';
+ 
+ suite('claudeReplayMapper', () => {
+ 
+@@ -450,6 +450,36 @@ suite('claudeReplayMapper', () => {
+ 		assert.strictEqual(turns[0].message.text, missingPromptPlaceholder());
+ 		assert.strictEqual(turns[0].state, TurnState.Complete);
+ 	});
++
++	test('replaySessionMessages exposes the attribution index alongside the turns', () => {
++		const messages: SessionMessage[] = [
++			makeUser('u1', 'first'),
++			makeAssistantToolUse('a1', 'tu_bash', 'Bash', { command: 'ls' }),
++			makeUserToolResult('r1', 'tu_bash', 'file.txt'),
++			makeAssistantToolUse('a2', 'tu_task', 'Task', { description: 'explore', subagent_type: 'Explore', prompt: 'look around' }),
++			makeUserToolResult('r2', 'tu_task', 'done\nagentId: agent123 (use SendMessage with to: \'agent123\')'),
++			makeAssistantToolUse('a3', 'tu_client_task', 'mcp__client__Task', { description: 'client task' }),
++			makeUserToolResult('r3', 'tu_client_task', 'done'),
++			makeUser('u2', 'second'),
++			makeAssistantToolUse('a4', 'tu_read', 'Read', { file_path: '/tmp/x' }),
++		];
++
++		const { turns, attribution } = replaySessionMessages(messages, session, logService);
++
++		assert.deepStrictEqual(mapSessionMessagesToTurns(messages, session, logService), turns, 'the turns-only wrapper must be a pure view of the same pass');
++		assert.deepStrictEqual({
++			tailTurnId: attribution.tailTurnId,
++			entries: Array.from(attribution.entries.values()),
++		}, {
++			tailTurnId: 'u2',
++			entries: [
++				{ toolUseId: 'tu_bash', turnId: 'u1', toolName: 'Bash', isClientTool: false, parsedInput: { command: 'ls' }, isSubagentSpawn: false, resultSeen: true },
++				{ toolUseId: 'tu_task', turnId: 'u1', toolName: 'Task', isClientTool: false, parsedInput: { description: 'explore', subagent_type: 'Explore', prompt: 'look around' }, isSubagentSpawn: true, resultSeen: true, agentId: 'agent123' },
++				{ toolUseId: 'tu_client_task', turnId: 'u1', toolName: 'Task', isClientTool: true, parsedInput: { description: 'client task' }, isSubagentSpawn: false, resultSeen: true },
++				{ toolUseId: 'tu_read', turnId: 'u2', toolName: 'Read', isClientTool: false, parsedInput: { file_path: '/tmp/x' }, isSubagentSpawn: false, resultSeen: false },
++			],
++		});
++	});
+ });
+ 
+ suite('resolveForkAnchorUuid', () => {
+diff --git a/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts b/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
+index a231b4a33ddb6..3b78996b1cf1f 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
+@@ -8,7 +8,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
+ import { MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type Turn } from '../../common/state/protocol/state.js';
+ import { scanTranscriptForAgentIds, SUBAGENT_ID_SUFFIX_REGEX, SubagentRegistry, SubagentSpawn } from '../../node/claude/claudeSubagentRegistry.js';
+ 
+-function makeAgentToolCallTurn(toolCallId: string, opts: { suffixText?: string; toolName?: string; status?: ToolCallStatus }): Turn {
++function makeAgentToolCallTurn(toolCallId: string, opts: { suffixText?: string; toolName?: string; status?: ToolCallStatus; meta?: Record<string, unknown> }): Turn {
+ 	return {
+ 		id: 'turn-' + toolCallId,
+ 		message: { text: '', origin: { kind: MessageKind.User } },
+@@ -24,6 +24,7 @@ function makeAgentToolCallTurn(toolCallId: string, opts: { suffixText?: string;
+ 				success: true,
+ 				pastTenseMessage: 'task done',
+ 				content: opts.suffixText !== undefined ? [{ type: ToolResultContentType.Text, text: opts.suffixText }] : undefined,
++				...(opts.meta ? { _meta: opts.meta } : {}),
+ 			},
+ 		}],
+ 		state: 0 as unknown as Turn['state'],
+@@ -186,6 +187,33 @@ suite('SubagentRegistry', () => {
+ 		});
+ 	});
+ 
++	test('primeFromTranscript records pending Task parts too', () => {
++		const registry = r();
++		const subagentMeta = { toolKind: 'subagent' };
++		const transcript: readonly Turn[] = [
++			makeAgentToolCallTurn('toolu_done', { suffixText: 'agentId: agentdone', meta: subagentMeta }),
++			makeAgentToolCallTurn('toolu_pending', { status: ToolCallStatus.Cancelled, meta: subagentMeta }),
++			makeAgentToolCallTurn('toolu_client', { status: ToolCallStatus.Cancelled }), // client-tool Task: no subagent meta
++			makeAgentToolCallTurn('toolu_read', { status: ToolCallStatus.Cancelled, toolName: 'Read', meta: subagentMeta }),
++		];
++
++		registry.primeFromTranscript(transcript);
++
++		assert.deepStrictEqual({
++			done: registry.getSpawn('toolu_done')?.agentId,
++			pending: registry.getSpawn('toolu_pending')?.toolUseId,
++			pendingAgentId: registry.getSpawn('toolu_pending')?.agentId,
++			client: registry.getSpawn('toolu_client'),
++			read: registry.getSpawn('toolu_read'),
++		}, {
++			done: 'agentdone',
++			pending: 'toolu_pending',
++			pendingAgentId: undefined,
++			client: undefined,
++			read: undefined,
++		});
++	});
++
+ 	test('dispose clears spawns + inner-edge maps so a stray reference cannot resurrect stale state', () => {
+ 		const registry = new SubagentRegistry();
+ 		registry.recordSpawn('toolu_x', { agentId: 'agent-x' });
+
+From 4cca9568a8da5a304ed807ee11b639baa68ac1c2 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 13:29:27 -0400
+Subject: [PATCH 2/2] agentHost: retain steer-preempted replay tool_uses as
+ pending
+
+Two review points on the replay attribution index, both correct.
+
+buildAttributionSeed classified any unresolved tool_use outside the tail
+turn as dead. That is wrong during a steer preempt: the steer input is
+persisted as a later user envelope while a tool from the preempted request
+can still return afterward (the case #334008 fixes). The replay data has no
+reliable way to tell a steer folded into the running request from a genuine
+later turn (M10: steering carries no Turn.id and no dependable isMeta
+marker), so it now retains every unresolved entry as pending and never
+drops one that might still receive a result. The dead bucket stays in the
+seed shape, reserved for a future steer-aware transcript.
+
+primeFromTranscript is reverted to its origin/main form so this PR is
+genuinely foundation-only (option a). Recording pending spawns there was
+not behaviour-neutral: _reconstructTurns calls it with the live session
+registry, so a pending spawn would immediately make later inner envelopes
+emit subagent_started through tagWithParent. That recording belongs to the
+later hydration PR. hydrateAttribution still records pending spawns, but
+nothing calls it on a live session in this PR.
+---
+ .../node/claude/claudeAttributionResolver.ts  | 17 +++++------
+ .../node/claude/claudeSubagentRegistry.ts     | 29 ++----------------
+ .../node/claudeAttributionResolver.test.ts    | 24 ++++++++-------
+ .../test/node/claudeSubagentRegistry.test.ts  | 30 +------------------
+ 4 files changed, 25 insertions(+), 75 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts b/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts
+index 4fb12fa6e3472..262688f71c79c 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAttributionResolver.ts
+@@ -9,7 +9,9 @@ import type { ISubagentSpawnInit, SubagentRegistry } from './claudeSubagentRegis
+ 
+ /**
+  * Replayed tool uses partitioned by what a restored session must do with them.
+- * `pending` and `dead` are both unresolved; only `pending` can still receive a result.
++ * `pending` entries may still receive a result and are hydrated; `spawns` are every
++ * subagent-spawn tool call. `dead` is reserved for entries a future, steer-aware
++ * transcript can prove will never resolve; today it stays empty.
+  */
+ export interface IClaudeAttributionSeed {
+ 	readonly pending: readonly IClaudeReplayToolUse[];
+@@ -18,8 +20,10 @@ export interface IClaudeAttributionSeed {
+ }
+ 
+ /**
+- * Partition the replay index. An unresolved `tool_use` is only pending in the tail
+- * turn; in any earlier turn a later user envelope exists, so its result can never arrive.
++ * Partition the replay index. Every unresolved `tool_use` is retained as pending: a
++ * later user envelope can be a steer folded into the same request (M10) whose preempted
++ * tool still returns, and replay data cannot tell that apart from a genuine later turn,
++ * so dropping it would lose attribution a late result needs.
+  */
+ export function buildAttributionSeed(attribution: IClaudeReplayAttribution): IClaudeAttributionSeed {
+ 	const pending: IClaudeReplayToolUse[] = [];
+@@ -29,13 +33,8 @@ export function buildAttributionSeed(attribution: IClaudeReplayAttribution): ICl
+ 		if (entry.isSubagentSpawn) {
+ 			spawns.push(entry);
+ 		}
+-		if (entry.resultSeen) {
+-			continue;
+-		}
+-		if (entry.turnId === attribution.tailTurnId) {
++		if (!entry.resultSeen) {
+ 			pending.push(entry);
+-		} else {
+-			dead.push(entry);
+ 		}
+ 	}
+ 	return { pending, dead, spawns };
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+index b9cd8c1396b0f..e1b8414f72be1 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSubagentRegistry.ts
+@@ -4,7 +4,6 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { Disposable } from '../../../../base/common/lifecycle.js';
+-import { readToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+ import {
+ 	ResponsePartKind,
+ 	ToolCallStatus,
+@@ -205,16 +204,14 @@ export class SubagentRegistry extends Disposable {
+ 	}
+ 
+ 	/**
+-	 * Replay-path bulk populate: record every subagent-spawning tool call in a parent
+-	 * transcript, settled or not, with the SDK's `agentId:` suffix where present. Idempotent.
++	 * Replay-path bulk populate: scan a parent transcript for the
++	 * SDK's synthetic `agentId: <hex>` suffix on Task/Agent tool_result
++	 * text blocks and record each `(toolUseId, agentId)` pair. Idempotent.
+ 	 */
+ 	primeFromTranscript(transcript: readonly Turn[]): void {
+ 		for (const [toolCallId, agentId] of scanTranscriptForAgentIds(transcript)) {
+ 			this.recordSpawn(toolCallId, { agentId });
+ 		}
+-		for (const toolCallId of scanTranscriptForSpawns(transcript)) {
+-			this.recordSpawn(toolCallId);
+-		}
+ 	}
+ 
+ 	private _evictInnerEdgesFor(parentToolUseId: string): void {
+@@ -245,26 +242,6 @@ export function scanTranscriptForAgentIds(transcript: readonly Turn[]): Readonly
+ 	return out;
+ }
+ 
+-/**
+- * Pure scan: the `toolCallId` of every subagent-spawning tool call, regardless of
+- * status. A client tool named `Task` carries no subagent meta and is skipped.
+- */
+-function scanTranscriptForSpawns(transcript: readonly Turn[]): readonly string[] {
+-	const out: string[] = [];
+-	for (const turn of transcript) {
+-		for (const part of turn.responseParts) {
+-			if (part.kind !== ResponsePartKind.ToolCall) {
+-				continue;
+-			}
+-			const state = part.toolCall;
+-			if (SUBAGENT_TOOL_NAMES.has(state.toolName) && readToolCallMeta(state).toolKind === 'subagent') {
+-				out.push(state.toolCallId);
+-			}
+-		}
+-	}
+-	return out;
+-}
+-
+ function extractAgentIdPair(part: ResponsePart): { toolCallId: string; agentId: string } | undefined {
+ 	if (part.kind !== ResponsePartKind.ToolCall) {
+ 		return undefined;
+diff --git a/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts b/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts
+index fb818d094b785..372a0f10697fa 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAttributionResolver.test.ts
+@@ -55,16 +55,17 @@ suite('claudeAttributionResolver', () => {
+ 		};
+ 	}
+ 
+-	test('buildAttributionSeed: pending tool_use in a non-tail turn is dead, pending in the tail turn is hydrated', () => {
++	test('buildAttributionSeed: an unresolved tool_use in a non-tail turn is retained as pending, not dead, because a later steer may still return its result', () => {
++		// u2 may be a steer folded into u1 (M10), whose preempted u1 tool can still return, so tu_early stays pending.
+ 		const messages: SessionMessage[] = [
+ 			makeUser('u1', 'first'),
+-			makeAssistantToolUse('a1', 'tu_dead', 'Bash', { command: 'sleep 100' }),
++			makeAssistantToolUse('a1', 'tu_early', 'Bash', { command: 'sleep 100' }),
+ 			makeAssistantToolUse('a2', 'tu_task_done', 'Task', { description: 'explore' }),
+ 			makeUserToolResult('r1', 'tu_task_done', 'agentId: agentaaa'),
+ 			makeUser('u2', 'second'),
+ 			makeAssistantToolUse('a3', 'tu_settled', 'Read', { file_path: '/tmp/x' }),
+ 			makeUserToolResult('r2', 'tu_settled', 'contents'),
+-			makeAssistantToolUse('a4', 'tu_pending', 'Grep', { pattern: 'x' }),
++			makeAssistantToolUse('a4', 'tu_tail_pending', 'Grep', { pattern: 'x' }),
+ 			makeAssistantToolUse('a5', 'tu_task_pending', 'Task', { description: 'still running' }),
+ 		];
+ 
+@@ -75,21 +76,21 @@ suite('claudeAttributionResolver', () => {
+ 			dead: seed.dead.map(e => e.toolUseId),
+ 			spawns: seed.spawns.map(e => [e.toolUseId, e.resultSeen, e.agentId]),
+ 		}, {
+-			pending: ['tu_pending', 'tu_task_pending'],
+-			dead: ['tu_dead'],
++			pending: ['tu_early', 'tu_tail_pending', 'tu_task_pending'],
++			dead: [],
+ 			spawns: [['tu_task_done', true, 'agentaaa'], ['tu_task_pending', false, undefined]],
+ 		});
+ 	});
+ 
+-	test('hydrateAttribution seeds registry info so pastTenseMessage parity holds and records spawns', () => {
++	test('hydrateAttribution seeds registry info so pastTenseMessage parity holds, hydrates non-tail pending entries, and records spawns', () => {
+ 		const command = 'git status';
+ 		const messages: SessionMessage[] = [
+ 			makeUser('u1', 'first'),
+-			makeAssistantToolUse('a1', 'tu_dead', 'Bash', { command }),
++			makeAssistantToolUse('a1', 'tu_early', 'Bash', { command }),
+ 			makeUser('u2', 'second'),
+ 			makeAssistantToolUse('a2', 'tu_settled', 'Bash', { command }),
+ 			makeUserToolResult('r1', 'tu_settled', 'clean'),
+-			makeAssistantToolUse('a3', 'tu_pending', 'Bash', { command }),
++			makeAssistantToolUse('a3', 'tu_tail_pending', 'Bash', { command }),
+ 			makeAssistantToolUse('a4', 'tu_task_done', 'Task', { subagent_type: 'Explore', description: 'count files', prompt: 'count them' }),
+ 			makeUserToolResult('r2', 'tu_task_done', 'agentId: agentaaa'),
+ 			makeAssistantToolUse('a5', 'tu_task_pending', 'Task', { subagent_type: 'Plan', description: 'plan it', prompt: 'make a plan' }),
+@@ -104,25 +105,26 @@ suite('claudeAttributionResolver', () => {
+ 		const replayedPastTense = settledPart?.kind === ResponsePartKind.ToolCall && settledPart.toolCall.status === ToolCallStatus.Completed
+ 			? settledPart.toolCall.pastTenseMessage
+ 			: undefined;
+-		const hydrated = state.toolCalls.lookup('tu_pending');
++		const hydrated = state.toolCalls.lookup('tu_tail_pending');
+ 		const livePastTense = hydrated?.info
+ 			? getClaudePastTenseMessage(hydrated.info.toolName, hydrated.info.displayName, hydrated.info.parsedInput, true, 'clean')
+ 			: undefined;
++		const early = state.toolCalls.lookup('tu_early');
+ 		const spawnPending = registry.getSpawn('tu_task_pending');
+ 
+ 		assert.deepStrictEqual({
+ 			hydrated: { turnId: hydrated?.turnId, toolName: hydrated?.toolName, restored: hydrated?.restored, toolInput: hydrated?.info?.toolInput },
++			early: { turnId: early?.turnId, restored: early?.restored },
+ 			livePastTense,
+ 			replayedPastTense,
+-			dead: state.toolCalls.lookup('tu_dead'),
+ 			settled: state.toolCalls.lookup('tu_settled'),
+ 			spawnDone: { agentId: registry.getSpawn('tu_task_done')?.agentId, subagentType: registry.getSpawn('tu_task_done')?.subagentType },
+ 			spawnPending: spawnPending && { agentId: spawnPending.agentId, subagentType: spawnPending.subagentType, description: spawnPending.description, prompt: spawnPending.prompt },
+ 		}, {
+ 			hydrated: { turnId: 'u2', toolName: 'Bash', restored: true, toolInput: 'git status' },
++			early: { turnId: 'u1', restored: true },
+ 			livePastTense: { markdown: 'Ran `git status`' },
+ 			replayedPastTense: { markdown: 'Ran `git status`' },
+-			dead: undefined,
+ 			settled: undefined,
+ 			spawnDone: { agentId: 'agentaaa', subagentType: 'Explore' },
+ 			spawnPending: { agentId: undefined, subagentType: 'Plan', description: 'plan it', prompt: 'make a plan' },
+diff --git a/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts b/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
+index 3b78996b1cf1f..a231b4a33ddb6 100644
+--- a/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeSubagentRegistry.test.ts
+@@ -8,7 +8,7 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
+ import { MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type Turn } from '../../common/state/protocol/state.js';
+ import { scanTranscriptForAgentIds, SUBAGENT_ID_SUFFIX_REGEX, SubagentRegistry, SubagentSpawn } from '../../node/claude/claudeSubagentRegistry.js';
+ 
+-function makeAgentToolCallTurn(toolCallId: string, opts: { suffixText?: string; toolName?: string; status?: ToolCallStatus; meta?: Record<string, unknown> }): Turn {
++function makeAgentToolCallTurn(toolCallId: string, opts: { suffixText?: string; toolName?: string; status?: ToolCallStatus }): Turn {
+ 	return {
+ 		id: 'turn-' + toolCallId,
+ 		message: { text: '', origin: { kind: MessageKind.User } },
+@@ -24,7 +24,6 @@ function makeAgentToolCallTurn(toolCallId: string, opts: { suffixText?: string;
+ 				success: true,
+ 				pastTenseMessage: 'task done',
+ 				content: opts.suffixText !== undefined ? [{ type: ToolResultContentType.Text, text: opts.suffixText }] : undefined,
+-				...(opts.meta ? { _meta: opts.meta } : {}),
+ 			},
+ 		}],
+ 		state: 0 as unknown as Turn['state'],
+@@ -187,33 +186,6 @@ suite('SubagentRegistry', () => {
+ 		});
+ 	});
+ 
+-	test('primeFromTranscript records pending Task parts too', () => {
+-		const registry = r();
+-		const subagentMeta = { toolKind: 'subagent' };
+-		const transcript: readonly Turn[] = [
+-			makeAgentToolCallTurn('toolu_done', { suffixText: 'agentId: agentdone', meta: subagentMeta }),
+-			makeAgentToolCallTurn('toolu_pending', { status: ToolCallStatus.Cancelled, meta: subagentMeta }),
+-			makeAgentToolCallTurn('toolu_client', { status: ToolCallStatus.Cancelled }), // client-tool Task: no subagent meta
+-			makeAgentToolCallTurn('toolu_read', { status: ToolCallStatus.Cancelled, toolName: 'Read', meta: subagentMeta }),
+-		];
+-
+-		registry.primeFromTranscript(transcript);
+-
+-		assert.deepStrictEqual({
+-			done: registry.getSpawn('toolu_done')?.agentId,
+-			pending: registry.getSpawn('toolu_pending')?.toolUseId,
+-			pendingAgentId: registry.getSpawn('toolu_pending')?.agentId,
+-			client: registry.getSpawn('toolu_client'),
+-			read: registry.getSpawn('toolu_read'),
+-		}, {
+-			done: 'agentdone',
+-			pending: 'toolu_pending',
+-			pendingAgentId: undefined,
+-			client: undefined,
+-			read: undefined,
+-		});
+-	});
+-
+ 	test('dispose clears spawns + inner-edge maps so a stray reference cannot resurrect stale state', () => {
+ 		const registry = new SubagentRegistry();
+ 		registry.recordSpawn('toolu_x', { agentId: 'agent-x' });

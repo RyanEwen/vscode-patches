@@ -1,0 +1,156 @@
+From b2569ed68394ef1c57747ba3a64217de543f369b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Sat, 5 Sep 2026 21:02:10 -0400
+Subject: [PATCH] Report chat activity for the window before a turn produces
+ content
+
+AHP already has a progress channel and the workbench already renders it well:
+`chat/activityChanged` carries a human-readable string, and the client turns it
+into a shimmering row with a stable id, so each update replaces the previous one.
+
+Nothing produced it for Claude sessions. The only producer anywhere in the host
+is worktree creation, which is why "Creating isolated worktree" is the only
+activity a user ever sees. Every other turn reports no liveness, so a session
+waiting on CLI or MCP startup is indistinguishable on screen from a hung one.
+
+Report it from `ClaudeAgent` rather than `ClaudeAgentSession`, because the
+window worth covering is materialization itself, and the session does not exist
+until that has finished. `sendMessage` sets the label before queueing, so the
+row is up during startup rather than after it.
+
+The row renders only while the turn has produced no response parts, so there is
+no useful per-tool label to add: `ChatToolCallStart` appends a response part,
+which is exactly the condition that hides the row. Activity is therefore a
+pre-content indicator and nothing more.
+
+Cleared on every exit: turn completion and errors arrive as pipeline signals
+through the entry forwarder, cancellation is cleared in `_abortSession` because
+`AgentSideEffects` dispatches `ChatTurnCancelled` without going through the
+pipeline, and a preflight failure is cleared from the send promise. Labels are
+deduplicated per chat, so an unchanged one is not re-sent.
+---
+ .../agentHost/node/claude/claudeAgent.ts      | 44 ++++++++++++++++++-
+ .../agentHost/test/node/claudeAgent.test.ts   | 30 +++++++++++++
+ 2 files changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index f1949bd1b03b0..22fa7e316fbfd 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -552,10 +552,45 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		return this._findAnySession(sdkSessionId);
+ 	}
+ 
++	/** Last activity label reported per chat, so an unchanged one is not re-sent. */
++	private readonly _chatActivity = new Map<string, string>();
++
++	/**
++	 * Reports what a chat is doing on its activity channel. The workbench renders this
++	 * as a single replacing row, and only while the turn has produced no content yet.
++	 */
++	private _setChatActivity(chat: URI, activity: string | undefined): void {
++		const key = chat.toString();
++		if (this._chatActivity.get(key) === activity) {
++			return;
++		}
++		if (activity === undefined) {
++			this._chatActivity.delete(key);
++		} else {
++			this._chatActivity.set(key, activity);
++		}
++		this._onDidChatProgress.fire({
++			kind: 'action',
++			resource: chat,
++			action: { type: ActionType.ChatActivityChanged, activity },
++		});
++	}
++
++	/** Clears a chat's activity once its turn reaches a terminal signal. */
++	private _clearActivityOnTerminalSignal(signal: AgentSignal): void {
++		if (signal.kind !== 'action') {
++			return;
++		}
++		if (signal.action.type === ActionType.ChatTurnComplete || signal.action.type === ActionType.ChatError) {
++			this._setChatActivity(signal.resource, undefined);
++		}
++	}
++
+ 	/** Wrap a { ClaudeAgentSession} in a chat-leaf entry and forward its events. */
+ 	private _wireEntry(session: ClaudeAgentSession): ClaudeChatEntry {
+ 		const entry = new ClaudeChatEntry(session);
+ 		entry.addDisposable(session.onDidSessionProgress(signal => {
++			this._clearActivityOnTerminalSignal(signal);
+ 			this._onDidChatProgress.fire(signal);
+ 			this._emitSpawnedChatEvents(signal);
+ 		}));
+@@ -2299,7 +2334,9 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		const clientTelemetryContext = URI.isUri(operationContext) ? undefined : operationContext?.clientTelemetryContext;
+ 		const context = this._resolveChatContext(chat, sendContext);
+ 
+-		return this._sessionSequencer.queue(context.sequencerKey, async () => {
++		// Materialization (CLI and MCP startup) runs before `send`, and is the dead window.
++		this._setChatActivity(chat, localize('claude.activity.working', "Working"));
++		const sent = this._sessionSequencer.queue(context.sequencerKey, async () => {
+ 			const current = this._resolveChatContext(chat, sendContext);
+ 			const session = await this._ensureResolvedChatSession(current, workingDirectories);
+ 			// The send carries the host's latest customization snapshot. An
+@@ -2315,6 +2352,9 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 				await this._metadataStore.write(current.resource, { workingDirectories });
+ 			}
+ 		});
++		// A preflight failure never reaches the pipeline's terminal signals.
++		sent.catch(() => this._setChatActivity(chat, undefined));
++		return sent;
+ 	}
+ 
+ 	/** Builds the SDK user message for a send, addressed to `sdkSessionId`. */
+@@ -2363,6 +2403,8 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 
+ 	private async _abortSession(chat: URI, context: URI | IAgentChatContext): Promise<void> {
+ 		resolveAgentChatContext(context, chat);
++		// Cancellation never reaches the pipeline's terminal signals.
++		this._setChatActivity(chat, undefined);
+ 		// Cancel via the abort controller, NOT `Query.interrupt()`. Abort is a
+ 		// control-plane operation — it must NOT serialize through
+ 		// `_sessionSequencer` because an in-flight `sendMessage` task is
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index fde567e90763e..4b97cf4b5dac0 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -3615,6 +3615,36 @@ suite('ClaudeAgent', () => {
+ 		});
+ 	});
+ 
++	test('reports Working activity for the pre-content window and clears it when the turn ends', async () => {
++		// The row renders only before any response part, so this window is all it can show.
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		sdk.nextQueryMessages = [
++			makeSystemInitMessage(sessionId),
++			makeStreamEvent(sessionId, makeMessageStart()),
++			makeStreamEvent(sessionId, makeContentBlockStartText(0)),
++			makeStreamEvent(sessionId, makeTextDelta(0, 'hi')),
++			makeStreamEvent(sessionId, makeContentBlockStop(0)),
++			makeStreamEvent(sessionId, makeMessageStop()),
++			makeResultSuccess(sessionId),
++		];
++
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(s => signals.push(s)));
++
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		const activity = signals.flatMap(s => s.kind === 'action' && s.action.type === ActionType.ChatActivityChanged
++			? [s.action.activity]
++			: []);
++
++		// Set once, cleared once, and never re-sent in between thanks to the dedupe.
++		assert.deepStrictEqual(activity, ['Working', undefined]);
++	});
++
+ 	test('text content_block emits ChatResponsePart(Markdown) before ChatDelta', async () => {
+ 		// Phase 6 §5.1 Test 6 + §3.6. The protocol reducer at
+ 		// `actions.ts:233 (ChatDelta)` requires the targeted

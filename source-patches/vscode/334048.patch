@@ -1,0 +1,126 @@
+From 689b7ccb00d3116a7d67a876098c993170fb1c29 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 12:57:48 -0400
+Subject: [PATCH] agentHost: keep remote workspace folders at session create
+
+A window attached to a remote (dev container, SSH, WSL) has workspace
+folders spelled as vscode-remote: URIs. When the chat handler creates the
+session itself, _hostAddressableWorkingDirectories compares each folder's
+scheme, after resourceUris.toAgentHost, with the scheme of the host's
+defaultDirectory. The remote client's mapper only unwraps vscode-agent-host:
+URIs, so the folders keep their vscode-remote: scheme, while every host
+reports defaultDirectory as file:. Every folder was dropped, the session was
+created with workingDirectories undefined, and the host chose its own
+working directory instead of the workspace.
+
+The comparison is wrong for this window because
+EditorRemoteAgentHostTransport already rewrites vscode-remote: directories
+of the window's authority to file: on createSession, createChat and the
+working-directory actions, and maps them back on the way in. The other
+create path, the provisional session that the chat input picker pre-creates,
+sends the raw folders through that transport and works. The handler path is
+taken whenever no provisional session exists at first send, for example when
+the picker never attached or the target folder was untrusted when it
+prewarmed. The same filtered set also seeds the customization scope roots
+of a new session, so those were empty in a remote window too.
+
+Keep a directory when its unwrapped scheme is either the host's scheme or
+vscode-remote:. This matches isSupportedWorkingDirectory, which PR #334005
+adds on the host side to accept exactly file: and vscode-remote: working
+directories, so both ends of createSession agree on which folders are sent.
+Folders of schemes the host cannot address, such as a virtual https:
+repository, are still dropped, and a local window's file: folders are
+handled as before.
+
+Tests cover a remote window with two vscode-remote: folders, a local window
+with two file: folders, and an unaddressable folder next to a remote one.
+---
+ .../agentHost/agentHostSessionHandler.ts      |  8 +++-
+ .../agentHostChatContribution.test.ts         | 48 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 1847355cbf345..5916a4cba4a79 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -5846,7 +5846,8 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 
+ 	/**
+ 	 * Drop working directories whose scheme the host cannot address, falling back to `undefined` so
+-	 * it picks its own. Schemes are compared as the host receives them, after unwrapping.
++	 * it picks its own. Schemes are compared as the host receives them: unwrapped, and with a remote
++	 * window's `vscode-remote:` folders kept since `EditorRemoteAgentHostTransport` sends those as host-local paths.
+ 	 */
+ 	private _hostAddressableWorkingDirectories(directories: readonly URI[] | undefined): readonly URI[] | undefined {
+ 		const defaultDirectory = this._config.connection.initializeResult.get()?.defaultDirectory;
+@@ -5854,7 +5855,10 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 			return directories;
+ 		}
+ 		const hostScheme = URI.isUri(defaultDirectory) ? URI.revive(defaultDirectory).scheme : URI.parse(defaultDirectory).scheme;
+-		const addressable = directories.filter(directory => this._config.connection.resourceUris.toAgentHost(directory).scheme === hostScheme);
++		const addressable = directories.filter(directory => {
++			const scheme = this._config.connection.resourceUris.toAgentHost(directory).scheme;
++			return scheme === hostScheme || scheme === Schemas.vscodeRemote;
++		});
+ 		if (addressable.length === directories.length) {
+ 			return directories;
+ 		}
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+index faa690690dd41..03dafd89f4aa1 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts
+@@ -12645,6 +12645,54 @@ suite('AgentHostChatContribution', () => {
+ 			);
+ 		});
+ 
++		/** Sends the first prompt of a new session in a workspace of `folders` and returns the working directories it was created with. */
++		async function createSessionInWorkspace(folders: readonly URI[], resourceUris = identityAgentHostResourceUriMapper): Promise<string[] | undefined> {
++			const { sessionHandler, agentHostService, chatAgentService } = createContribution(disposables, {
++				workingDirectoryResolver: { resolve: () => folders[0] },
++				workspaceFolders: folders,
++			});
++			agentHostService.resourceUris = resourceUris;
++			agentHostService.setRootState({
++				agents: [{ provider: 'copilot', displayName: 'Agent Host - Copilot', description: 'test', models: [], capabilities: { multipleWorkingDirectories: { immutablePrimary: true } } }],
++				activeSessions: 0,
++			});
++			agentHostService.setInitializeResult({ defaultDirectory: 'file:///home/user' });
++
++			const { turnPromise, session, turnId, fire } = await startTurn(sessionHandler, agentHostService, chatAgentService, disposables);
++			fire({ type: 'chat/turnComplete', endedAt: '2025-01-01T00:00:00.000Z', session, turnId } as ChatAction);
++			await turnPromise;
++
++			return agentHostService.createSessionCalls.at(-1)?.workingDirectories?.map(directory => directory.toString());
++		}
++
++		test('keeps the workspace folders of a remote window, which reach the host as local paths', async () => {
++			// The remote client maps `vscode-agent-host:` only, so the folders keep their `vscode-remote:` scheme here.
++			const primary = URI.parse('vscode-remote://dev-container+abc123/workspaces/vscode');
++			const secondary = URI.parse('vscode-remote://dev-container+abc123/workspaces/shared');
++
++			const workingDirectories = await createSessionInWorkspace([primary, secondary], createAgentHostResourceUriMapper(agentHostAuthority('vscode-remote://dev-container+abc123')));
++
++			assert.deepStrictEqual(workingDirectories, [primary.toString(), secondary.toString()]);
++		});
++
++		test('keeps the workspace folders of a local window', async () => {
++			const primary = URI.file('/workspaces/vscode');
++			const secondary = URI.file('/workspaces/shared');
++
++			const workingDirectories = await createSessionInWorkspace([primary, secondary]);
++
++			assert.deepStrictEqual(workingDirectories, [primary.toString(), secondary.toString()]);
++		});
++
++		test('still drops a folder the host cannot address alongside remote folders', async () => {
++			const primary = URI.parse('vscode-remote://dev-container+abc123/workspaces/vscode');
++			const virtualRepository = URI.parse('https://github.com/microsoft/vscode');
++
++			const workingDirectories = await createSessionInWorkspace([primary, virtualRepository], createAgentHostResourceUriMapper(agentHostAuthority('vscode-remote://dev-container+abc123')));
++
++			assert.deepStrictEqual(workingDirectories, [primary.toString()]);
++		});
++
+ 		test('waits for initial scope resolution before creating a session', async () => {
+ 			const { instantiationService, agentHostService, chatAgentService, seedActiveClient } = createTestServices(disposables);
+ 			const customizations = observableValue<ClientPluginCustomization[]>('customizations', []);

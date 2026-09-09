@@ -1,0 +1,163 @@
+From 96dadb80faf6b71791a1335830cd168682b40976 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 21 Aug 2026 17:58:10 -0400
+Subject: [PATCH] agentHost: resolve Claude customizations for a chat that is
+ not resident
+
+`getChatCustomizations` resolved the chat through its live runtime, so a chat with a
+backing but no resident runtime reported no customizations at all: no project commands,
+no skills, no agents, not even the read-only built-ins. That is every session restored
+into a fresh host process and every session idle eviction released, and it leaves the
+session without slash commands until its next message.
+
+Read through a throwaway runtime built from the chat's exact backing instead.
+`_createProvisionalChatSession` is split into `_buildProvisionalChatSession`, which only
+builds, and a wrapper that registers it and re-applies client contributions for the send
+path. The read uses the build step, which starts no SDK Query and recovers the working
+directories from the SDK transcript cwd or the persisted overlay, so it reaches the
+pre-materialize path `getSessionCustomizations` already implements.
+
+The throwaway runtime is never registered and is disposed when the read returns. A
+resident one would make the next send take the chat for a provisional one and materialize
+it fresh rather than resume it, and it would queue an active-client refresh onto the
+session sequencer that could only run after the read had finished.
+
+Fixes #332047
+---
+ .../agentHost/node/claude/claudeAgent.ts      | 44 ++++++++++++++++---
+ .../agentHost/test/node/claudeAgent.test.ts   | 42 ++++++++++++++++++
+ 2 files changed, 79 insertions(+), 7 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index b5a70e97d81a6..0db86be9d9d7f 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -1790,7 +1790,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 	 * Build a provisional {@link ClaudeAgentSession} from an exact chat backing
+ 	 * and its provider-owned overlay.
+ 	 */
+-	private async _createProvisionalChatSession(configurationResource: URI, chat: URI, resource: URI, fallbackWorkingDirectories?: readonly URI[]): Promise<ClaudeAgentSession> {
++	private async _buildProvisionalChatSession(configurationResource: URI, chat: URI, resource: URI, fallbackWorkingDirectories?: readonly URI[]): Promise<ClaudeAgentSession> {
+ 		const info = this._chatBackings.get(chat.toString());
+ 		if (!info) {
+ 			throw new Error(`[Claude] no backing chat for chat ${chat.toString()}`);
+@@ -1839,12 +1839,17 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 			this._instantiationService,
+ 			additionalDirectories,
+ 		);
++		return chatSession;
++	}
++
++	/**
++	 * Registers a provisional runtime for `chat` and re-applies the tools and
++	 * customizations its clients assigned before that runtime existed.
++	 */
++	private async _createProvisionalChatSession(configurationResource: URI, chat: URI, resource: URI, fallbackWorkingDirectories?: readonly URI[]): Promise<ClaudeAgentSession> {
++		const chatSession = await this._buildProvisionalChatSession(configurationResource, chat, resource, fallbackWorkingDirectories);
+ 		this._registerLiveChat(chat, chatSession);
+ 		this._recordChatScope(chat, configurationResource, resource);
+-		// The chat now has a live runtime, so re-apply the contributions of
+-		// every client addressed to this exact chat. This replaces nothing —
+-		// it only pushes each handle's already-assigned tools/customizations
+-		// into the conversation that just came up.
+ 		this._forEachActiveClientHandleForChat(chat, handle => handle.refresh());
+ 		return chatSession;
+ 	}
+@@ -2632,10 +2637,10 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 	 * never falls back to guessing the SDK conversation id from the
+ 	 * configuration scope, since a fresh chat's SDK id is independent of it.
+ 	 */
+-	async getChatCustomizations(chat: URI, _context: URI | IAgentChatContext, hostCustomizations?: readonly Customization[]): Promise<readonly Customization[]> {
++	async getChatCustomizations(chat: URI, context: URI | IAgentChatContext, hostCustomizations?: readonly Customization[]): Promise<readonly Customization[]> {
+ 		const sess = this._findChatByUri(chat);
+ 		if (!sess) {
+-			return [];
++			return this._readNonResidentChatCustomizations(chat, context, hostCustomizations);
+ 		}
+ 		if (hostCustomizations) {
+ 			sess.setHostCustomizations(hostCustomizations);
+@@ -2643,6 +2648,31 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		return sess.getSessionCustomizations();
+ 	}
+ 
++	/**
++	 * Reads customizations for a chat with no resident runtime through a
++	 * throwaway one, which is never registered so the read cannot change how
++	 * the next send resolves the chat.
++	 */
++	private async _readNonResidentChatCustomizations(chat: URI, operationContext: URI | IAgentChatContext, hostCustomizations: readonly Customization[] | undefined): Promise<readonly Customization[]> {
++		if (!this._chatBackings.has(chat.toString())) {
++			return [];
++		}
++		const { configurationResource, resource } = resolveAgentChatContext(operationContext, chat);
++		let transient: ClaudeAgentSession | undefined;
++		try {
++			transient = await this._buildProvisionalChatSession(configurationResource, chat, resource);
++			if (hostCustomizations) {
++				transient.setHostCustomizations(hostCustomizations);
++			}
++			return await transient.getSessionCustomizations();
++		} catch (err) {
++			this._logService.warn(`[Claude] customization read could not resolve chat ${chat.toString()}`, err);
++			return [];
++		} finally {
++			transient?.dispose();
++		}
++	}
++
+ 	/**
+ 	 * Hides the multi-root Folder picker unless several working directories carry
+ 	 * Claude configuration that would pin them as the primary — an `.mcp.json`
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index c969f4f486a1c..06f8891790cae 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -9088,6 +9088,48 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		assert.deepStrictEqual(customizations.map(c => c.uri), ['https://a', 'file:///mock-home/.claude/agents', 'agent-builtin:/skills']);
+ 	});
+ 
++	test('getChatCustomizations resolves a chat whose runtime is no longer resident', async () => {
++		const { agent, sdk } = buildCtxWith(new FakeAgentPluginManager());
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		const chat = defaultChatUri(created.session);
++
++		sdk.nextQueryMessages = [makeSystemInitMessage(sessionId), makeResultSuccess(sessionId)];
++		await agent.chats.sendMessage(chat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
++
++		// Drops the live runtime and keeps the backing, as a restore into a fresh window does.
++		await releaseDefaultChat(agent, created.session);
++		sdk.sessionList = [{ sessionId, cwd: URI.file('/work').fsPath, summary: '', lastModified: 1 }];
++
++		// The host has published no snapshot for a session it has only just restored.
++		const customizations = await agent.getChatCustomizations(chat, chatContext(chat), undefined);
++		assert.deepStrictEqual(customizations.map(c => c.uri), ['file:///mock-home/.claude/agents', 'agent-builtin:/skills']);
++	});
++
++	test('a customization read leaves a non-resident chat non-resident, so the next send still resumes', async () => {
++		const { agent, sdk } = buildCtxWith(new FakeAgentPluginManager());
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		const chat = defaultChatUri(created.session);
++
++		sdk.nextQueryMessages = [makeSystemInitMessage(sessionId), makeResultSuccess(sessionId)];
++		await agent.chats.sendMessage(chat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
++
++		await releaseDefaultChat(agent, created.session);
++		sdk.sessionList = [{ sessionId, cwd: URI.file('/work').fsPath, summary: '', lastModified: 1 }];
++
++		await agent.getChatCustomizations(chat, chatContext(chat), undefined);
++
++		// A resident runtime would make the next send materialize fresh instead of resuming.
++		assert.deepStrictEqual(listLiveChats(agent), []);
++
++		sdk.nextQueryMessages = [makeSystemInitMessage(sessionId), makeResultSuccess(sessionId)];
++		await agent.chats.sendMessage(chat, 'turn 2', undefined, undefined, 'turn-2', undefined, undefined, chatContext(chat));
++		assert.strictEqual(sdk.capturedStartupOptions.at(-1)?.resume, sessionId, 'the send after a customization read must resume the existing conversation');
++	});
++
+ 	test('getChatCustomizations overlays the enablement state onto client-pushed entries', async () => {
+ 		const pm = new FakeAgentPluginManager();
+ 		pm.syncResult = [makeSyncedRef('https://a', '/p/a')];

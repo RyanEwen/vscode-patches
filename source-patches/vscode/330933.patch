@@ -1,0 +1,614 @@
+From f8ce489ae988782973a4347a9c36352c381cf575 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 28 Aug 2026 12:05:12 -0400
+Subject: [PATCH] Execute a client tool on the runtime's invocation
+
+---
+ src/vs/platform/agentHost/common/agent.ts     |  27 ++++
+ .../agentHost/node/agentSideEffects.ts        | 119 +++++++++++++++++-
+ .../agentHost/node/claude/claudeAgent.ts      |   3 +
+ .../node/claude/claudeAgentSession.ts         |  19 ++-
+ .../agentHost/node/claude/claudeSdkOptions.ts |   5 +-
+ .../clientTools/claudeClientToolMcpServer.ts  |   6 +-
+ .../test/node/agentSideEffects.test.ts        |  75 +++++++++++
+ .../agentHost/test/node/claudeAgent.test.ts   |  71 ++++++++++-
+ .../claudeClientToolMcpServer.test.ts         |  11 ++
+ .../platform/agentHost/test/node/mockAgent.ts |   3 +
+ 10 files changed, 325 insertions(+), 14 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agent.ts b/src/vs/platform/agentHost/common/agent.ts
+index 7f0a8469d1e7d..1d205df7dcabd 100644
+--- a/src/vs/platform/agentHost/common/agent.ts
++++ b/src/vs/platform/agentHost/common/agent.ts
+@@ -820,6 +820,7 @@ export type AgentSignal =
+ 	| IAgentActionSignal
+ 	| IAgentModelCallCompletedSignal
+ 	| IAgentToolPendingConfirmationSignal
++	| IAgentClientToolInvokedSignal
+ 	| IAgentSubagentStartedSignal
+ 	| IAgentSubagentResumedSignal
+ 	| IAgentSubagentCompletedSignal
+@@ -907,6 +908,25 @@ export interface IAgentToolPendingConfirmationSignal {
+ 	readonly parentToolCallId?: string;
+ }
+ 
++/**
++ * The runtime invoked a client-provided tool and is awaiting its result.
++ * Kept as a non-action signal because a call replayed from the transcript
++ * streams nothing, so the host must drive it for any client to execute it.
++ */
++export interface IAgentClientToolInvokedSignal {
++	readonly kind: 'client_tool_invoked';
++	/** Target chat channel URI the tool call belongs to. */
++	readonly chat: URI;
++	/** SDK `tool_use_id` of the invocation. */
++	readonly toolCallId: string;
++	/** Unprefixed client tool name. */
++	readonly toolName: string;
++	/** JSON-serialized tool input. */
++	readonly toolInput: string;
++	/** See {@link IAgentToolPendingConfirmationSignal.parentToolCallId}. */
++	readonly parentToolCallId?: string;
++}
++
+ /**
+  * A subagent was spawned by a tool call. The host creates a child session
+  * silently and routes subsequent inner-tool events to it.
+@@ -1109,6 +1129,13 @@ export interface IAgent {
+ 	/** Provider descriptor and capabilities. */
+ 	getDescriptor(): IAgentDescriptor;
+ 
++	/**
++	 * Whether the runtime announces each client tool invocation, so the host
++	 * executes on {@link IAgentClientToolInvokedSignal} rather than on the
++	 * streamed tool call reaching {@link ToolCallStatus.Running}.
++	 */
++	readonly drivesClientToolExecution?: boolean;
++
+ 	/** Available provider models. */
+ 	readonly models: IObservable<readonly IAgentModelInfo[]>;
+ 
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index ef64a75885f46..ccbb548aff0a9 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -3,6 +3,7 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { localize } from '../../../nls.js';
+ import { getErrorCode } from '../../../base/common/errors.js';
+ import type { Event } from '../../../base/common/event.js';
+ import { Disposable, DisposableStore, IDisposable, IReference } from '../../../base/common/lifecycle.js';
+@@ -20,7 +21,9 @@ import { IAgentHostCheckpointService } from '../common/agentHostCheckpointServic
+ import { IAgentHostChatContributions, type ISendTurnMessageOptions } from '../common/agentHostChatContributionsService.js';
+ import { AgentHostClientType } from '../common/agentHostClientInfo.js';
+ import { AgentHostLaunchKind, createUnknownAgentHostClientTelemetryContext, type IAgentHostClientTelemetryContext } from '../common/agentHostTelemetry.js';
+-import { AgentSession, AgentSignal, IAgent, IAgentChatContext, IAgentToolPendingConfirmationSignal, type IAgentModelCallCompletedSignal } from '../common/agent.js';
++
++import { AgentSession, AgentSignal, IAgent, IAgentChatContext, IAgentClientToolInvokedSignal, IAgentToolPendingConfirmationSignal, type IAgentModelCallCompletedSignal } from '../common/agent.js';
++
+ import { readToolCallMeta, toToolCallMeta } from '../common/meta/agentToolCallMeta.js';
+ 
+ import { ITelemetryService } from '../../telemetry/common/telemetry.js';
+@@ -28,7 +31,7 @@ import { ISessionDatabase, ISessionDataService } from '../common/sessionDataServ
+ import { SessionConfigKey } from '../common/sessionConfigKeys.js';
+ import { resolveChatAttachment } from '../common/state/chatAttachmentContext.js';
+ import { buildOpenSessionLinkForChatResource } from '../common/openSessionLink.js';
+-import { SessionInputRequestKind, ToolCallContributorKind, type AgentInfo, type SessionActiveClient, type SessionInputRequest } from '../common/state/protocol/state.js';
++import { type AgentInfo, type SessionActiveClient, type SessionInputRequest, SessionInputRequestKind, ToolCallConfirmationReason, ToolCallContributorKind } from '../common/state/protocol/state.js';
+ import type { CustomizationEnablement } from '../common/state/protocol/channels-session/state.js';
+ import { ActionType, isChatAction, StateAction, type ChatAction, type ChatToolCallCompleteAction } from '../common/state/sessionActions.js';
+ import {
+@@ -601,6 +604,29 @@ export class AgentSideEffects extends Disposable {
+ 		});
+ 	}
+ 
++	/** Drops invocation tracking for a chat whose turn ended with calls outstanding. */
++	private _clearInvokedClientTools(chatUri: ProtocolURI): void {
++		const prefix = `${chatUri}:`;
++		for (const key of this._sdkInvokedClientTools) {
++			if (key.startsWith(prefix)) {
++				this._sdkInvokedClientTools.delete(key);
++			}
++		}
++	}
++
++	/** Whether a streamed tool call already carries arguments to run with. */
++	private static _hasToolInput(toolCall: ToolCallState): boolean {
++		const input = 'toolInput' in toolCall ? toolCall.toolInput : undefined;
++		return input !== undefined && input !== '' && input !== '{}';
++	}
++
++	/**
++	 * Client tool calls the runtime has invoked, keyed `${chat}:${toolCallId}`.
++	 * For a provider that announces invocations this is what admits a call to
++	 * execution, so a streamed ready alone never starts one.
++	 */
++	private readonly _sdkInvokedClientTools = new Set<string>();
++
+ 	private _syncToolInputNeeded(chatUri: ProtocolURI, turnId: string, toolCallId: string): void {
+ 		const confirmationId = this._toolConfirmationNeededId(chatUri, turnId, toolCallId);
+ 		const clientExecutionId = this._toolClientExecutionNeededId(chatUri, turnId, toolCallId);
+@@ -629,7 +655,10 @@ export class AgentSideEffects extends Disposable {
+ 		}
+ 
+ 		const contributor = toolCall?.contributor;
+-		if (toolCall?.status === ToolCallStatus.Running && contributor?.kind === ToolCallContributorKind.Client) {
++		const awaitingInvocation = contributor?.kind === ToolCallContributorKind.Client
++			&& this._options.getAgent(parseRequiredSessionUriFromChatUri(chatUri))?.drivesClientToolExecution === true
++			&& !this._sdkInvokedClientTools.has(`${chatUri}:${toolCallId}`);
++		if (toolCall?.status === ToolCallStatus.Running && contributor?.kind === ToolCallContributorKind.Client && !awaitingInvocation) {
+ 			this._setSessionInputNeeded(chatUri, {
+ 				id: clientExecutionId,
+ 				kind: SessionInputRequestKind.ToolClientExecution,
+@@ -904,6 +933,82 @@ export class AgentSideEffects extends Disposable {
+ 		}
+ 	}
+ 
++	/**
++	 * The runtime invoked a client tool whose call never streamed, so no client
++	 * execution was ever requested. Synthesizes the start/ready pair the stream
++	 * would have produced; a call that did stream is left alone.
++	 */
++	private _handleClientToolInvoked(signal: IAgentClientToolInvokedSignal, sessionKey: ProtocolURI, turnId: string): void {
++		this._sdkInvokedClientTools.add(`${sessionKey}:${signal.toolCallId}`);
++		const streamed = this._findToolCall(sessionKey, turnId, signal.toolCallId);
++		if (streamed) {
++			// The runtime's arguments are authoritative; the streamed ones can be absent.
++			if (!AgentSideEffects._hasToolInput(streamed)) {
++				this._stateManager.dispatchServerAction(sessionKey, {
++					type: ActionType.ChatToolCallReady,
++					turnId,
++					toolCallId: signal.toolCallId,
++					invocationMessage: ('invocationMessage' in streamed ? streamed.invocationMessage : undefined) ?? signal.toolName,
++					toolInput: signal.toolInput,
++					confirmed: 'confirmed' in streamed ? streamed.confirmed : ToolCallConfirmationReason.NotNeeded,
++				});
++			}
++			this._syncToolInputNeeded(sessionKey, turnId, signal.toolCallId);
++			return;
++		}
++		const sessionUri = parseRequiredSessionUriFromChatUri(sessionKey);
++		const owner = this._stateManager.getSessionState(sessionUri)?.activeClients.find(client => client.tools.some(tool => tool.name === signal.toolName));
++		if (!owner) {
++			// The runtime is parked on this call, so failing it is the only way to unwind the turn.
++			this._logService.warn(`[AgentSideEffects] No active client provides replayed tool ${signal.toolName}; failing ${signal.toolCallId}`);
++			const error = { message: localize('agentHost.clientTool.noOwner', "No connected client provides the tool \"{0}\".", signal.toolName), code: 'toolUnavailable' };
++			// A completion for a call that was never started reduces to nothing, so open it first.
++			this._stateManager.dispatchServerAction(sessionKey, {
++				type: ActionType.ChatToolCallStart,
++				turnId,
++				toolCallId: signal.toolCallId,
++				toolName: signal.toolName,
++				displayName: signal.toolName,
++			});
++			this._stateManager.dispatchServerAction(sessionKey, {
++				type: ActionType.ChatToolCallReady,
++				turnId,
++				toolCallId: signal.toolCallId,
++				invocationMessage: signal.toolName,
++				toolInput: signal.toolInput,
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			});
++			this._stateManager.dispatchServerAction(sessionKey, {
++				type: ActionType.ChatToolCallComplete,
++				turnId,
++				toolCallId: signal.toolCallId,
++				result: { success: false, pastTenseMessage: error.message, error },
++			});
++			this._options.getAgent(sessionUri)?.onClientToolCallComplete(
++				URI.parse(sessionKey), signal.toolCallId, { success: false, pastTenseMessage: error.message, error },
++				this._chatContext(sessionUri, sessionKey),
++			);
++			return;
++		}
++		this._logService.info(`[AgentSideEffects] Requesting client execution for replayed tool call ${signal.toolCallId} (${signal.toolName})`);
++		this._stateManager.dispatchServerAction(sessionKey, {
++			type: ActionType.ChatToolCallStart,
++			turnId,
++			toolCallId: signal.toolCallId,
++			toolName: signal.toolName,
++			displayName: signal.toolName,
++			contributor: { kind: ToolCallContributorKind.Client, clientId: owner.clientId },
++		});
++		this._stateManager.dispatchServerAction(sessionKey, {
++			type: ActionType.ChatToolCallReady,
++			turnId,
++			toolCallId: signal.toolCallId,
++			invocationMessage: signal.toolName,
++			toolInput: signal.toolInput,
++			confirmed: ToolCallConfirmationReason.NotNeeded,
++		});
++	}
++
+ 	/**
+ 	 * Dispatches a signal to a resolved chat, preserving top-level turn identity or remapping cross-channel subagent actions.
+ 	 */
+@@ -916,6 +1021,10 @@ export class AgentSideEffects extends Disposable {
+ 			}
+ 			return;
+ 		}
++		if (signal.kind === 'client_tool_invoked') {
++			this._handleClientToolInvoked(signal, sessionKey, turnId);
++			return;
++		}
+ 		if (signal.kind !== 'action') {
+ 			return;
+ 		}
+@@ -1037,6 +1146,7 @@ export class AgentSideEffects extends Disposable {
+ 		}
+ 
+ 		if (action.type === ActionType.ChatToolCallComplete) {
++			this._sdkInvokedClientTools.delete(`${sessionKey}:${action.toolCallId}`);
+ 			this._turnTracker.toolCallEnded(sessionKey, turnId, action.toolCallId);
+ 
+ 			// Emit `languageModelToolInvoked` telemetry for the completed tool
+@@ -1057,6 +1167,7 @@ export class AgentSideEffects extends Disposable {
+ 		if (action.type === ActionType.ChatTurnComplete) {
+ 			const clientContext = this._turnTracker.getClientTelemetryContext(sessionKey, turnId);
+ 			this._completeTurn(sessionKey, turnId, 'success');
++			this._clearInvokedClientTools(sessionKey);
+ 			this._toolCallTracker.clearSession(sessionKey);
+ 			this._runTurnCompleteSideEffects(sessionKey, turnId, clientContext);
+ 		}
+@@ -1064,6 +1175,7 @@ export class AgentSideEffects extends Disposable {
+ 		if (action.type === ActionType.ChatTurnCancelled) {
+ 			const clientContext = this._turnTracker.getClientTelemetryContext(sessionKey, turnId);
+ 			this._completeTurn(sessionKey, turnId, 'cancelled');
++			this._clearInvokedClientTools(sessionKey);
+ 			this._toolCallTracker.clearSession(sessionKey);
+ 			this._chatContributions.turnEnd({ session: sessionUri, channel: sessionKey, turnId, reason: { kind: 'cancelled' }, clientContext });
+ 		}
+@@ -1071,6 +1183,7 @@ export class AgentSideEffects extends Disposable {
+ 		if (action.type === ActionType.ChatError) {
+ 			const clientContext = this._turnTracker.getClientTelemetryContext(sessionKey, turnId);
+ 			this._completeTurn(sessionKey, turnId, 'error', { stage: 'provider', error: action.part.error });
++			this._clearInvokedClientTools(sessionKey);
+ 			this._toolCallTracker.clearSession(sessionKey);
+ 			this._chatContributions.turnEnd({
+ 				session: sessionUri,
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index 67111ec4d6196..6cd46259ffda6 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -704,6 +704,9 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 
+ 	// #region Descriptor + auth
+ 
++	/** The in-process MCP server announces every client tool call the SDK makes. */
++	readonly drivesClientToolExecution = true;
++
+ 	getDescriptor(): IAgentDescriptor {
+ 		return {
+ 			provider: this.id,
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 87c826ce5c1c2..8a1b5465b620c 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -831,7 +831,7 @@ export class ClaudeAgentSession extends Disposable {
+ 		serverToolHost: IAgentServerToolHost | undefined,
+ 	): Promise<{ mcpServers: Record<string, McpServerConfig> | undefined; deniedMcpServers: readonly ClaudeDeniedMcpServerSpec[]; allowedTools: readonly string[] | undefined }> {
+ 		const externalServers = await this._buildExternalMcpServers(await this._getGitHubMcpServerConfiguration());
+-		const clientServers = await buildClientMcpServers(this.toolDiff, this._pendingClientToolCalls, this._sdkService);
++		const clientServers = await buildClientMcpServers(this.toolDiff, (id, name, args) => this._awaitClientToolResult(id, name, args), this._sdkService);
+ 		const serverToolDefinitions = serverToolHost?.getDefinitionsForSession(resource.toString());
+ 		const serverToolServer = serverToolHost && serverToolDefinitions?.length
+ 			? await buildServerToolMcpServer(serverToolHost, this._chatChannelUri.toString(), this._sdkService, serverToolDefinitions)
+@@ -1347,6 +1347,23 @@ export class ClaudeAgentSession extends Disposable {
+ 		}
+ 	}
+ 
++	/**
++	 * Park the SDK's client-tool invocation until the workbench echoes its
++	 * result. `registerAndFire` collects a buffered result without firing.
++	 */
++	private _awaitClientToolResult(toolUseId: string, toolName: string, args: unknown): Promise<CallToolResult> {
++		// A tool called inside a subagent is routed by its parent spawn.
++		const parentToolCallId = this.subagents.getParentSpawn(toolUseId)?.toolUseId;
++		return this._pendingClientToolCalls.registerAndFire(toolUseId, () => this._onDidSessionProgress.fire({
++			kind: 'client_tool_invoked',
++			chat: this._chatChannelUri,
++			toolCallId: toolUseId,
++			toolName,
++			toolInput: JSON.stringify(args ?? {}),
++			...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
++		}));
++	}
++
+ 	/**
+ 	 * Resolve a parked client-tool MCP handler with the workbench-supplied
+ 	 * result. Returns `true` if a matching deferred was found and settled.
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+index fe591665cf2f2..94503099c6872 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+@@ -12,7 +12,6 @@ import { rgDiskPath } from '../../../../base/node/ripgrep.js';
+ import { AiAgentEnvValue, AiAgentEnvVar } from '../../../chat/common/aiAgentEnv.js';
+ import { ClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { resolveClaudeEffort } from '../../common/claudeModelConfig.js';
+-import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
+ import type { ModelSelection } from '../../common/state/protocol/state.js';
+ import { IClaudeAgentSdkService } from './claudeAgentSdkService.js';
+ import { buildClientToolMcpServer } from './clientTools/claudeClientToolMcpServer.js';
+@@ -212,14 +211,14 @@ export async function buildOptions(
+  */
+ export async function buildClientMcpServers(
+ 	toolDiff: SessionClientToolsDiff,
+-	registry: PendingRequestRegistry<CallToolResult>,
++	awaitResult: (toolUseId: string, toolName: string, args: unknown) => Promise<CallToolResult>,
+ 	sdkService: IClaudeAgentSdkService,
+ ): Promise<Record<string, McpSdkServerConfigWithInstance> | undefined> {
+ 	const tools = toolDiff.consume();
+ 	if (tools.length === 0) {
+ 		return undefined;
+ 	}
+-	const server = await buildClientToolMcpServer(tools, id => registry.register(id), sdkService);
++	const server = await buildClientToolMcpServer(tools, awaitResult, sdkService);
+ 	return { client: server };
+ }
+ 
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+index 7d5b75cd6fe9b..384eb4f106030 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+@@ -35,14 +35,14 @@ const TOOL_USE_ID_META_KEY = 'claudecode/toolUseId';
+  */
+ export async function buildClientToolMcpServer(
+ 	snapshot: readonly ToolDefinition[],
+-	awaitResult: (toolUseId: string) => Promise<CallToolResult>,
++	awaitResult: (toolUseId: string, toolName: string, args: unknown) => Promise<CallToolResult>,
+ 	sdk: IClaudeAgentSdkService
+ ): Promise<McpSdkServerConfigWithInstance> {
+ 	const tools = await Promise.all(snapshot.map(def => sdk.tool(
+ 		def.name,
+ 		def.description ?? '',
+ 		jsonSchemaToZodRawShape(def.inputSchema),
+-		async (_args, extra) => {
++		async (args, extra) => {
+ 			const toolUseId = extractToolUseId(extra);
+ 			if (toolUseId === undefined) {
+ 				return {
+@@ -53,7 +53,7 @@ export async function buildClientToolMcpServer(
+ 					isError: true,
+ 				};
+ 			}
+-			return awaitResult(toolUseId);
++			return awaitResult(toolUseId, def.name, args);
+ 		}
+ 	)));
+ 	return sdk.createSdkMcpServer({ name: CLAUDE_CLIENT_MCP_SERVER_NAME, tools });
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index 7f1bd95924eee..d14b3c24f1e5b 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -1962,6 +1962,48 @@ suite('AgentSideEffects', () => {
+ 			});
+ 		});
+ 
++		test('client_tool_invoked synthesizes execution for a replayed call and leaves a streamed one alone', () => {
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			stateManager.dispatchClientAction(sessionUri.toString(), {
++				type: ActionType.SessionActiveClientSet,
++				activeClient: { clientId: 'client-A', tools: [{ name: 'openBrowserPage', inputSchema: { type: 'object' } }] },
++			}, { clientId: 'test', clientSeq: 1 });
++			startTurn('turn-1');
++
++			// Replay: the call is absent from turn state, so the host must create it.
++			agent.fireProgress({ kind: 'client_tool_invoked', chat: URI.parse(defaultChatUri), toolCallId: 'tu_replay', toolName: 'openBrowserPage', toolInput: '{"url":"http://x/"}' });
++			// Streamed: the call already has state and must not be duplicated.
++			agent.fireProgress({ kind: 'client_tool_invoked', chat: URI.parse(defaultChatUri), toolCallId: 'tu_replay', toolName: 'openBrowserPage', toolInput: '{"url":"http://x/"}' });
++
++			const parts = stateManager.getChatState(defaultChatUri)?.activeTurn?.responseParts ?? [];
++			const toolCalls = parts.filter(part => part.kind === ResponsePartKind.ToolCall).map(part => part.toolCall);
++			const inputNeeded = stateManager.getSessionState(sessionUri.toString())?.inputNeeded ?? [];
++			assert.deepStrictEqual({
++				toolCalls: toolCalls.map(tc => ({ id: tc.toolCallId, status: tc.status, contributor: tc.contributor, toolInput: tc.status === ToolCallStatus.Running ? tc.toolInput : undefined })),
++				executionRequests: inputNeeded.filter(request => request.kind === SessionInputRequestKind.ToolClientExecution).map(request => ({ toolCallId: request.toolCall.toolCallId, clientId: request.clientId })),
++			}, {
++				toolCalls: [{ id: 'tu_replay', status: ToolCallStatus.Running, contributor: { kind: ToolCallContributorKind.Client, clientId: 'client-A' }, toolInput: '{"url":"http://x/"}' }],
++				executionRequests: [{ toolCallId: 'tu_replay', clientId: 'client-A' }],
++			});
++		});
++
++		test('a replayed call no client provides completes as a visible failure', () => {
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			startTurn('turn-1');
++
++			// No active client contributes the tool, so the call can only be failed.
++			agent.fireProgress({ kind: 'client_tool_invoked', chat: URI.parse(defaultChatUri), toolCallId: 'tu_orphan', toolName: 'openBrowserPage', toolInput: '{}' });
++
++			const parts = stateManager.getChatState(defaultChatUri)?.activeTurn?.responseParts ?? [];
++			const toolCalls = parts.filter(part => part.kind === ResponsePartKind.ToolCall).map(part => part.toolCall);
++			assert.deepStrictEqual(
++				toolCalls.map(tc => ({ id: tc.toolCallId, status: tc.status, success: tc.status === ToolCallStatus.Completed ? tc.success : undefined })),
++				[{ id: 'tu_orphan', status: ToolCallStatus.Completed, success: false }],
++			);
++		});
++
+ 		test('does not duplicate a Codex provider-owned failure when sendMessage resolves', async () => {
+ 			setupSession();
+ 			disposables.add(sideEffects.registerProgressListener(agent));
+@@ -6721,6 +6763,39 @@ suite('AgentSideEffects', () => {
+ 			assert.deepStrictEqual(sessionInputNeeded(), []);
+ 		});
+ 
++		test('a runtime that announces invocations executes on the invocation, not on the streamed ready', () => {
++			setupSession();
++			startTurn('turn-1');
++			disposables.add(sideEffects.registerProgressListener(agent));
++			agent.drivesClientToolExecution = true;
++
++			stateManager.dispatchServerAction(defaultChatUri, {
++				type: ActionType.ChatToolCallStart, turnId: 'turn-1',
++				toolCallId: 'tc-client', toolName: 'runTask', displayName: 'Run Task',
++				contributor: { kind: ToolCallContributorKind.Client, clientId: 'client-1' },
++			});
++			stateManager.dispatchServerAction(defaultChatUri, {
++				type: ActionType.ChatToolCallReady, turnId: 'turn-1',
++				toolCallId: 'tc-client', invocationMessage: 'Run Task', toolInput: '{"task":"build"}',
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			});
++			const afterReady = sessionInputNeeded().filter(r => r.kind === SessionInputRequestKind.ToolClientExecution);
++
++			agent.fireProgress({
++				kind: 'client_tool_invoked', chat: URI.parse(defaultChatUri),
++				toolCallId: 'tc-client', toolName: 'runTask', toolInput: '{"task":"build"}',
++			});
++			const afterInvocation = sessionInputNeeded().filter(r => r.kind === SessionInputRequestKind.ToolClientExecution);
++
++			assert.deepStrictEqual({
++				requestsAfterReady: afterReady.length,
++				requestsAfterInvocation: afterInvocation.map(r => r.toolCall.toolCallId),
++			}, {
++				requestsAfterReady: 0,
++				requestsAfterInvocation: ['tc-client'],
++			});
++		});
++
+ 		test('client tool execution is produced while running and removed once complete', () => {
+ 			setupSession();
+ 			startTurn('turn-1');
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index df8cef3a73721..b45228ae1f8ed 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -730,7 +730,10 @@ class FakeClaudeAgentSdkService implements IClaudeAgentSdkService {
+ 		readonly description: string;
+ 		readonly inputSchema: Record<string, any>;
+ 	}> = [];
+-	readonly toolHandlers = new Map<string, (args: any, extra: unknown) => Promise<CallToolResult>>();
++	readonly toolHandlers: Array<{
++		readonly name: string;
++		readonly handler: (args: any, extra: unknown) => Promise<CallToolResult>;
++	}> = [];
+ 	readonly createSdkMcpServerCalls: Array<{
+ 		readonly name: string;
+ 		readonly toolNames: readonly string[];
+@@ -740,10 +743,10 @@ class FakeClaudeAgentSdkService implements IClaudeAgentSdkService {
+ 		name: string,
+ 		description: string,
+ 		inputSchema: Record<string, any>,
+-		_handler: (args: any, extra: unknown) => Promise<CallToolResult>,
++		handler: (args: any, extra: unknown) => Promise<CallToolResult>,
+ 	): Promise<SdkMcpToolDefinition<any>> {
+ 		this.toolCalls.push({ name, description, inputSchema });
+-		this.toolHandlers.set(name, _handler);
++		this.toolHandlers.push({ name, handler });
+ 		return { name } as unknown as SdkMcpToolDefinition<any>;
+ 	}
+ 
+@@ -5681,6 +5684,66 @@ suite('ClaudeAgent', () => {
+ 		});
+ 	});
+ 
++	test('an SDK client tool invocation fires client_tool_invoked and resolves on completion', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		getOrCreateActiveClient(agent, defaultChatUri(created.session), 'client-1').tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
++		sdk.nextQueryMessages = [makeSystemInitMessage(sessionId), makeResultSuccess(sessionId)];
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'go', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		const session = agent.getSessionForTesting(created.session)!;
++		const signals: AgentSignal[] = [];
++		disposables.add(session.onDidSessionProgress(s => signals.push(s)));
++
++		// A replayed invocation streams nothing, so the fired signal is the only cue.
++		const handler = sdk.toolHandlers.find(t => t.name === 'echo')!.handler;
++		const callPromise = handler({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_replay' } });
++		const fired = signals.filter(s => s.kind === 'client_tool_invoked');
++		session.completeClientToolCall('tu_replay', { success: true, pastTenseMessage: 'ok', content: [{ type: ToolResultContentType.Text, text: 'done' }] });
++
++		assert.deepStrictEqual({ fired, resolvedContent: (await callPromise).content }, {
++			fired: [{
++				kind: 'client_tool_invoked',
++				chat: session.chatChannelUri,
++				toolCallId: 'tu_replay',
++				toolName: 'echo',
++				toolInput: '{"msg":"hi"}',
++			}],
++			resolvedContent: [{ type: 'text', text: 'done' }],
++		});
++	});
++
++	test('a client tool invoked inside a subagent carries its parent so the host routes it to the subagent chat', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const sessionId = created.sdkSessionId;
++		getOrCreateActiveClient(agent, defaultChatUri(created.session), 'client-1').tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
++		sdk.nextQueryMessages = [makeSystemInitMessage(sessionId), makeResultSuccess(sessionId)];
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'go', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		const session = agent.getSessionForTesting(created.session)!;
++		session.subagents.recordSpawn('toolu_parent');
++		session.subagents.noteInnerTool('tu_inner', 'toolu_parent');
++		const signals: AgentSignal[] = [];
++		disposables.add(session.onDidSessionProgress(s => signals.push(s)));
++
++		const handler = sdk.toolHandlers.find(t => t.name === 'echo')!.handler;
++		const callPromise = handler({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_inner' } });
++		session.completeClientToolCall('tu_inner', { success: true, pastTenseMessage: 'ok', content: [] });
++		await callPromise;
++
++		assert.deepStrictEqual(
++			signals.filter(s => s.kind === 'client_tool_invoked').map(s => ({
++				toolCallId: (s as { toolCallId: string }).toolCallId,
++				parentToolCallId: (s as { parentToolCallId?: string }).parentToolCallId,
++			})),
++			[{ toolCallId: 'tu_inner', parentToolCallId: 'toolu_parent' }],
++		);
++	});
++
+ 	test('setClientTools after materialize triggers yield-restart on next sendMessage with the new tool set', async () => {
+ 		const { agent, sdk } = createTestContext(disposables);
+ 		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
+@@ -10900,7 +10963,7 @@ suite('ClaudeAgent — host seams', () => {
+ 		sdk.nextQueryMessages = [makeSystemInitMessage(peerSdkId), makeResultSuccess(peerSdkId)];
+ 
+ 		await agent.chats.sendMessage(peerChat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(peerChat));
+-		const result = await sdk.toolHandlers.get(toolName)!({}, undefined);
++		const result = await sdk.toolHandlers.find(t => t.name === toolName)!.handler({}, undefined);
+ 
+ 		assert.deepStrictEqual({
+ 			executedChatUri,
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
+index 5dd303748d372..6cf697dbe33ba 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
+@@ -76,6 +76,17 @@ suite('claudeClientToolMcpServer / buildClientToolMcpServer', () => {
+ 		assert.deepStrictEqual(await callPromise, expected);
+ 	});
+ 
++	test('handler forwards the tool name and args to awaitResult', async () => {
++		const { sdk, recorded } = makeSdk();
++		const calls: Array<{ id: string; name: string; args: unknown }> = [];
++		await buildClientToolMcpServer([tool({ name: 'echo' })], async (id, name, args) => {
++			calls.push({ id, name, args });
++			return { content: [] };
++		}, sdk);
++		await recorded[0]!.handler({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_1' } });
++		assert.deepStrictEqual(calls, [{ id: 'tu_1', name: 'echo', args: { msg: 'hi' } }]);
++	});
++
+ 	test('handler returns an error result when SDK omits the tool_use_id meta field', async () => {
+ 		const { sdk, recorded } = makeSdk();
+ 		const registry = new PendingRequestRegistry<CallToolResult>();
+diff --git a/src/vs/platform/agentHost/test/node/mockAgent.ts b/src/vs/platform/agentHost/test/node/mockAgent.ts
+index 16813579b99f4..0e6968bae5ec0 100644
+--- a/src/vs/platform/agentHost/test/node/mockAgent.ts
++++ b/src/vs/platform/agentHost/test/node/mockAgent.ts
+@@ -441,6 +441,9 @@ export class MockAgent implements IAgent {
+ 		this.removeActiveClientCalls.push({ chat, clientId });
+ 	}
+ 
++	/** Mutable so a test can model a runtime that announces its invocations. */
++	drivesClientToolExecution = false;
++
+ 	onClientToolCallComplete(chat: URI, toolCallId: string, result: ToolCallResult, context?: IAgentChatContext): void {
+ 		this.clientToolCallCompleteCalls.push({ chat, toolCallId, result, context });
+ 	}

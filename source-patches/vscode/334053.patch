@@ -1,0 +1,486 @@
+From d4cbff462e6b3b1347031a9d0d3b09595801b0d9 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 13:13:15 -0400
+Subject: [PATCH 1/2] codex: keep MCP tool progress out of the tool result
+
+The Codex mapper appended every mcpToolCall/progress message to the
+entry's output and re-sent the whole concatenation as the content of a
+ChatToolCallContentChanged action. That output field is what completion
+falls back to, so when an MCP tool legitimately returned nothing the
+progress narration was persisted as its result, an orphaned call's result
+became the narration, and each notification resent an ever-growing string.
+
+Progress now rides on _meta.progressMessage, a new IToolCallMeta key that
+readToolCallMeta validates. The mapper records the _meta it emitted at
+start on the tool call entry and spreads it into the progress action,
+because the reducer replaces the whole bag whenever an action carries
+one. Identical consecutive messages are coalesced. The mcpToolCall
+completion no longer falls back to entry.output: nothing writes output for
+that item type any more, and keeping the fallback would have left the one
+path by which narration could still leak into the result.
+
+On the workbench side, updateRunningToolSpecificData and
+toolCallStateToInvocation surface the message through
+ChatToolInvocation.acceptProgress while the call is Running, so a client
+attaching mid-turn sees it as well. finalizeToolInvocation clears the
+progress before didExecuteTool, which otherwise promotes any progress
+message to pastTenseMessage whenever toolResultMessage is absent. The
+adapter never sets toolResultMessage, so without the clear the last
+progress string replaced the provider's past-tense text and became the
+label for providers that omit one.
+---
+ .../common/meta/agentToolCallMeta.ts          |  3 +
+ .../node/codex/codexMapAppServerEvents.ts     | 29 +++++--
+ .../test/common/agentMetaReaders.test.ts      |  9 ++
+ .../codex/codexMapAppServerEvents.test.ts     | 82 ++++++++++++++++++-
+ .../agentHost/stateToProgressAdapter.ts       | 13 ++-
+ .../stateToProgressAdapter.test.ts            | 32 ++++++++
+ 6 files changed, 157 insertions(+), 11 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts b/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts
+index 81a5d56e083d0..b6a598cc8a5bf 100644
+--- a/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts
++++ b/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts
+@@ -49,6 +49,8 @@ export interface IToolCallMeta {
+ 	readonly autoApproveRuleResolvable?: boolean;
+ 	/** Transient runtime corpus for the local client tool-search invocation. */
+ 	readonly toolSearchCandidates?: readonly IToolSearchCandidate[];
++	/** Latest progress message from a running tool; transient, meaningful only while Running. */
++	readonly progressMessage?: string;
+ }
+ 
+ /** Minimal metadata needed to embed and rank a deferred tool. */
+@@ -132,6 +134,7 @@ export function readToolCallMeta(source: IHasToolCallMeta): IToolCallMeta {
+ 	if (typeof meta['subagentChatUri'] === 'string') { result.subagentChatUri = meta['subagentChatUri']; }
+ 	if (typeof meta['mcpServerName'] === 'string') { result.mcpServerName = meta['mcpServerName']; }
+ 	if (typeof meta['mcpToolName'] === 'string') { result.mcpToolName = meta['mcpToolName']; }
++	if (typeof meta['progressMessage'] === 'string') { result.progressMessage = meta['progressMessage']; }
+ 	if (typeof meta['autoApproveBySetting'] === 'boolean') { result.autoApproveBySetting = meta['autoApproveBySetting']; }
+ 	if (typeof meta['autoApproveRuleResolvable'] === 'boolean') { result.autoApproveRuleResolvable = meta['autoApproveRuleResolvable']; }
+ 	const toolSearchCandidates = readToolSearchCandidates(meta['toolSearchCandidates']);
+diff --git a/src/vs/platform/agentHost/node/codex/codexMapAppServerEvents.ts b/src/vs/platform/agentHost/node/codex/codexMapAppServerEvents.ts
+index fdd306689525b..9785588ab526e 100644
+--- a/src/vs/platform/agentHost/node/codex/codexMapAppServerEvents.ts
++++ b/src/vs/platform/agentHost/node/codex/codexMapAppServerEvents.ts
+@@ -137,6 +137,10 @@ export interface ICodexToolCallEntry {
+ 	readonly turnId: string;
+ 	readonly toolName: string;
+ 	output: string;
++	/** Latest `mcpToolCall/progress` message, kept out of {@link output} so it never becomes the result. */
++	progressMessage?: string;
++	/** The `_meta` emitted at start, re-spread by later actions since the reducer replaces the whole bag. */
++	meta?: Record<string, unknown>;
+ }
+ 
+ export function createCodexSessionMapState(serverToolNames: ReadonlySet<string> = new Set(), clientToolSet: ActiveClientToolSet = new ActiveClientToolSet()): ICodexSessionMapState {
+@@ -596,11 +600,13 @@ function mapItemStartedBody(
+ 		// fresh toolCallId; the `commandExecution` item id only
+ 		// disambiguates the codex side.
+ 		const toolCallId = generateUuid();
++		const meta = toToolCallMeta({ toolKind: 'terminal' });
+ 		state.itemToToolCall.set(params.item.id, {
+ 			toolCallId,
+ 			turnId: params.turnId,
+ 			toolName: 'shell',
+ 			output: '',
++			meta,
+ 		});
+ 		const command = unwrapShellInvocation(params.item.command ?? '');
+ 		return [
+@@ -610,7 +616,7 @@ function mapItemStartedBody(
+ 				toolCallId,
+ 				toolName: 'shell',
+ 				displayName: 'Run shell command',
+-				_meta: toToolCallMeta({ toolKind: 'terminal' }),
++				_meta: meta,
+ 			},
+ 			{
+ 				type: ActionType.ChatToolCallDelta,
+@@ -625,17 +631,19 @@ function mapItemStartedBody(
+ 				invocationMessage: command,
+ 				toolInput: command,
+ 				confirmed: ToolCallConfirmationReason.NotNeeded,
+-				_meta: toToolCallMeta({ toolKind: 'terminal' }),
++				_meta: meta,
+ 			},
+ 		];
+ 	}
+ 	if (params.item.type === 'webSearch') {
+ 		const toolCallId = generateUuid();
++		const meta = toToolCallMeta({ toolKind: 'search' });
+ 		state.itemToToolCall.set(params.item.id, {
+ 			toolCallId,
+ 			turnId: params.turnId,
+ 			toolName: 'web_search',
+ 			output: '',
++			meta,
+ 		});
+ 		const query = describeWebSearch(params.item.query, params.item.action);
+ 		return [
+@@ -645,7 +653,7 @@ function mapItemStartedBody(
+ 				toolCallId,
+ 				toolName: 'web_search',
+ 				displayName: 'Web search',
+-				_meta: toToolCallMeta({ toolKind: 'search' }),
++				_meta: meta,
+ 			},
+ 			{
+ 				type: ActionType.ChatToolCallDelta,
+@@ -660,7 +668,7 @@ function mapItemStartedBody(
+ 				invocationMessage: webSearchInvocationMessage(query),
+ 				toolInput: query,
+ 				confirmed: ToolCallConfirmationReason.NotNeeded,
+-				_meta: toToolCallMeta({ toolKind: 'search' }),
++				_meta: meta,
+ 			},
+ 		];
+ 	}
+@@ -962,20 +970,25 @@ export function mapFileChangeOutputDelta(
+ 	}];
+ }
+ 
++/**
++ * Progress is a transient status line rather than output, so it travels as
++ * `_meta.progressMessage` (see {@link IToolCallMeta}) and never joins the result.
++ */
+ export function mapMcpToolCallProgress(
+ 	state: ICodexSessionMapState,
+ 	params: McpToolCallProgressNotification,
+ ): (SessionAction | ChatAction)[] {
+ 	const entry = state.itemToToolCall.get(params.itemId);
+-	if (!entry) {
++	if (!entry || params.message === entry.progressMessage) {
+ 		return [];
+ 	}
+-	entry.output = [entry.output, params.message].filter(Boolean).join('\n');
++	entry.progressMessage = params.message;
+ 	return [{
+ 		type: ActionType.ChatToolCallContentChanged,
+ 		turnId: entry.turnId,
+ 		toolCallId: entry.toolCallId,
+-		content: [{ type: ToolResultContentType.Text, text: entry.output }],
++		content: entry.output ? [{ type: ToolResultContentType.Text, text: entry.output }] : [],
++		_meta: { ...entry.meta, ...toToolCallMeta({ progressMessage: params.message }) },
+ 	}];
+ }
+ 
+@@ -1136,7 +1149,7 @@ export function mapItemCompleted(
+ 	}
+ 	if (params.item.type === 'mcpToolCall') {
+ 		const success = params.item.status === 'completed' && !params.item.error;
+-		const output = mcpToolOutput(params.item.result, params.item.error?.message) || entry.output;
++		const output = mcpToolOutput(params.item.result, params.item.error?.message);
+ 		const content = output ? [{ type: ToolResultContentType.Text as const, text: output }] : undefined;
+ 		return [{
+ 			type: ActionType.ChatToolCallComplete,
+diff --git a/src/vs/platform/agentHost/test/common/agentMetaReaders.test.ts b/src/vs/platform/agentHost/test/common/agentMetaReaders.test.ts
+index 43717b1f0c974..5d6a0de38fe51 100644
+--- a/src/vs/platform/agentHost/test/common/agentMetaReaders.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentMetaReaders.test.ts
+@@ -84,6 +84,15 @@ suite('Agent host _meta readers', () => {
+ 			assert.deepStrictEqual(wire, { toolKind: 'search' });
+ 			assert.deepStrictEqual(readToolCallMeta(toolCall(wire)), { toolKind: 'search' });
+ 		});
++
++		test('reads a progress message and drops a non-string one', () => {
++			const wire = toToolCallMeta({ progressMessage: 'Searching' });
++			assert.deepStrictEqual({ wire, read: readToolCallMeta(toolCall(wire)), dropped: readToolCallMeta(toolCall({ progressMessage: 42 })) }, {
++				wire: { progressMessage: 'Searching' },
++				read: { progressMessage: 'Searching' },
++				dropped: {},
++			});
++		});
+ 	});
+ 
+ 	suite('readEphemeralSessionMeta', () => {
+diff --git a/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts b/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts
+index 9bdee45db918c..70b47e1b04624 100644
+--- a/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts
++++ b/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts
+@@ -7,7 +7,7 @@ import assert from 'assert';
+ import { URI } from '../../../../../base/common/uri.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+ import { readAgentMessageDelegationMeta } from '../../../common/meta/agentMessageDelegationMeta.js';
+-import { createCodexSessionMapState, extractUserInputText, finalizeCodexTurnMapState, mapAgentMessageDelta, mapCommandExecutionOutputDelta, mapFileChangePatchUpdated, mapItemCompleted, mapItemStarted, mapMcpToolCallProgress, mapReasoningSummaryPartAdded, mapReasoningSummaryTextDelta, mapReasoningTextDelta, mapTokenUsageModelCallCompleted, mapTokenUsageUpdated, mapTurnCompleted, mapTurnStarted, resetCodexTurnMapState, turnStateFromStatus } from '../../../node/codex/codexMapAppServerEvents.js';
++import { createCodexSessionMapState, extractUserInputText, finalizeCodexTurnMapState, mapAgentMessageDelta, mapCommandExecutionOutputDelta, mapFileChangePatchUpdated, mapItemCompleted, mapItemStarted, mapMcpToolCallProgress, mapReasoningSummaryPartAdded, mapReasoningSummaryTextDelta, mapReasoningTextDelta, mapTokenUsageModelCallCompleted, mapTokenUsageUpdated, mapTurnCompleted, mapTurnStarted, resetCodexTurnMapState, turnStateFromStatus, type ICodexSessionMapState } from '../../../node/codex/codexMapAppServerEvents.js';
+ import { ActionType, type ChatAction, type SessionAction } from '../../../common/state/sessionActions.js';
+ import { chatReducer } from '../../../common/state/protocol/reducers.js';
+ import { ChatOriginKind, MessageKind, ResponsePartKind, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolResultContentType, TurnState, type ChatState } from '../../../common/state/sessionState.js';
+@@ -20,6 +20,23 @@ function markdownPartContent(action: SessionAction | ChatAction | undefined): st
+ 		: undefined;
+ }
+ 
++/** Starts an in-progress `github.search` mcpToolCall item and returns its tool call id. */
++function startMcpToolCall(state: ICodexSessionMapState, itemId: string): string {
++	mapItemStarted(state, {
++		item: { type: 'mcpToolCall', id: itemId, server: 'github', tool: 'search', status: 'inProgress', arguments: { query: 'vscode' }, mcpAppResourceUri: undefined, pluginId: null, result: null, error: null, durationMs: null } as never,
++		threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
++	});
++	return state.itemToToolCall.get(itemId)!.toolCallId;
++}
++
++/** Completes a started mcpToolCall item with the given MCP result. */
++function completeMcpToolCall(state: ICodexSessionMapState, itemId: string, result: { content: unknown[]; structuredContent: unknown }): (SessionAction | ChatAction)[] {
++	return mapItemCompleted(state, {
++		item: { type: 'mcpToolCall', id: itemId, server: 'github', tool: 'search', status: 'completed', arguments: { query: 'vscode' }, mcpAppResourceUri: undefined, pluginId: null, result: { ...result, _meta: null }, error: null, durationMs: 5 } as never,
++		threadId: 'thr_1', turnId: 'turn_a', completedAtMs: 0,
++	});
++}
++
+ suite('codexMapAppServerEvents', () => {
+ 
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+@@ -769,12 +786,73 @@ suite('codexMapAppServerEvents', () => {
+ 			startTypes: [ActionType.ChatToolCallStart, ActionType.ChatToolCallDelta, ActionType.ChatToolCallReady],
+ 			delta: { type: ActionType.ChatToolCallDelta, turnId: 'turn_a', toolCallId, content: '{\n  "query": "vscode"\n}' },
+ 			ready: { type: ActionType.ChatToolCallReady, turnId: 'turn_a', toolCallId, invocationMessage: 'Calling github.search', toolInput: '{\n  "query": "vscode"\n}', confirmed: ToolCallConfirmationReason.NotNeeded },
+-			progressActions: [{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [{ type: ToolResultContentType.Text, text: 'Searching' }] }],
++			progressActions: [{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [], _meta: { progressMessage: 'Searching' } }],
+ 			completeActions: [{ type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId, result: { success: true, pastTenseMessage: 'Called github.search', content: [{ type: ToolResultContentType.Text, text: 'done\n{\n  "count": 1\n}' }] } }],
+ 			remainingToolCalls: 0,
+ 		});
+ 	});
+ 
++	test('mcpToolCall progress is not persisted as the result when the MCP result is empty', () => {
++		const state = createCodexSessionMapState();
++		const toolCallId = startMcpToolCall(state, 'mcp_1');
++		mapMcpToolCallProgress(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'mcp_1', message: 'Searching' });
++		assert.deepStrictEqual(completeMcpToolCall(state, 'mcp_1', { content: [], structuredContent: null }), [{
++			type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId,
++			result: { success: true, pastTenseMessage: 'Called github.search', content: undefined },
++		}]);
++	});
++
++	test('mcpToolCall progress is not carried into an orphaned completion', () => {
++		const state = createCodexSessionMapState();
++		const toolCallId = startMcpToolCall(state, 'mcp_1');
++		mapMcpToolCallProgress(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'mcp_1', message: 'Searching' });
++		assert.deepStrictEqual(finalizeCodexTurnMapState(state, 'Turn interrupted before the tool completed'), [{
++			type: ActionType.ChatToolCallComplete, turnId: 'turn_a', toolCallId,
++			result: { success: false, pastTenseMessage: 'Stopped github.search', content: undefined, error: { message: 'Turn interrupted before the tool completed' } },
++		}]);
++	});
++
++	test('mcpToolCall progress after item/completed is dropped', () => {
++		const state = createCodexSessionMapState();
++		startMcpToolCall(state, 'mcp_1');
++		completeMcpToolCall(state, 'mcp_1', { content: ['done'], structuredContent: null });
++		assert.deepStrictEqual(mapMcpToolCallProgress(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'mcp_1', message: 'Late' }), []);
++	});
++
++	test('identical consecutive mcpToolCall progress messages are coalesced', () => {
++		const state = createCodexSessionMapState();
++		const toolCallId = startMcpToolCall(state, 'mcp_1');
++		const progress = (message: string) => mapMcpToolCallProgress(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'mcp_1', message });
++		assert.deepStrictEqual([progress('Searching'), progress('Searching'), progress('Ranking')], [
++			[{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [], _meta: { progressMessage: 'Searching' } }],
++			[],
++			[{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [], _meta: { progressMessage: 'Ranking' } }],
++		]);
++	});
++
++	test('mcpToolCall progress does not clobber start-time _meta', () => {
++		const state = createCodexSessionMapState();
++		state.itemToToolCall.set('mcp_1', { toolCallId: 'tc_1', turnId: 'turn_a', toolName: 'github.search', output: '', meta: { ui: { resourceUri: 'ui://github/app' } } });
++		assert.deepStrictEqual(mapMcpToolCallProgress(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'mcp_1', message: 'Searching' }), [{
++			type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId: 'tc_1', content: [],
++			_meta: { ui: { resourceUri: 'ui://github/app' }, progressMessage: 'Searching' },
++		}]);
++	});
++
++	test('tool call entries record the _meta emitted at start', () => {
++		const state = createCodexSessionMapState();
++		mapItemStarted(state, {
++			item: { type: 'commandExecution', id: 'cmd_1', command: 'ls', cwd: '/tmp', processId: null, source: 'agent', status: 'inProgress', commandActions: [], aggregatedOutput: null, exitCode: null, durationMs: null } as never,
++			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
++		});
++		mapItemStarted(state, {
++			item: { type: 'webSearch', id: 'web_1', query: 'vscode tests', action: { type: 'search', query: 'vscode tests', queries: null } } as never,
++			threadId: 'thr_1', turnId: 'turn_a', startedAtMs: 0,
++		});
++		startMcpToolCall(state, 'mcp_1');
++		assert.deepStrictEqual([...state.itemToToolCall.values()].map(entry => entry.meta), [{ toolKind: 'terminal' }, { toolKind: 'search' }, undefined]);
++	});
++
+ 	test('mcpToolCall start carries an MCP contributor when the server has a customization', () => {
+ 		const state = createCodexSessionMapState();
+ 		state.mcpCustomizationIds.set('github', 'cust-gh');
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
+index 44d02bf689e63..4cd017d9cd275 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
+@@ -383,6 +383,14 @@ function getSubagentAgentName(tc: ToolCallState): string | undefined {
+ 	return v && v.length > 0 ? v : undefined;
+ }
+ 
++/** Surfaces `_meta.progressMessage` of a running tool call as the invocation's progress step. */
++function applyToolCallProgress(invocation: ChatToolInvocation, tc: ToolCallState): void {
++	const progressMessage = tc.status === ToolCallStatus.Running ? readToolCallMeta(tc).progressMessage : undefined;
++	if (progressMessage) {
++		invocation.acceptProgress({ message: progressMessage });
++	}
++}
++
+ /** The subagent chat resource for a subagent-spawning tool call: prefer the host-stamped `_meta.subagentChatUri`, then a discovery block, then a derived fallback. */
+ function getSubagentChatResource(tc: ToolCallState, subagentContent: ToolResultSubagentContent | undefined, sessionResource: URI): string {
+ 	return readToolCallMeta(tc).subagentChatUri ?? subagentContent?.resource ?? buildSubagentChatUri(sessionResource.toString(), tc.toolCallId);
+@@ -2383,6 +2391,7 @@ export function toolCallStateToInvocation(tc: ToolCallState, subAgentInvocationI
+ 	if (tc.status === ToolCallStatus.AuthRequired) {
+ 		invocation.setAuthenticationRequired(toolCallAuthenticationServer(tc, mcpServerAuthority));
+ 	}
++	applyToolCallProgress(invocation, tc);
+ 
+ 	// Tools that render a bespoke, client-authored invocation message override
+ 	// the server text here. Add new per-tool cases alongside this branch.
+@@ -2564,7 +2573,7 @@ export function updateRunningToolSpecificData(existing: ChatToolInvocation, tc:
+ 	if (isAddCommentTool(tc.toolName)) {
+ 		existing.invocationMessage = addCommentReference(tc, resourceUris) ?? existing.invocationMessage;
+ 	}
+-
++	applyToolCallProgress(existing, tc);
+ 
+ 	const subagentContent = getToolSubagentContent(tc);
+ 	if (subagentContent) {
+@@ -2793,6 +2802,8 @@ export function finalizeToolInvocation(invocation: ChatToolInvocation, tc: ToolC
+ 	const result: IToolResult | undefined = isFailure || resultDetails
+ 		? { content: [], toolResultError: isFailure ? errorString : undefined, toolResultDetails: resultDetails }
+ 		: undefined;
++	// Clear transient progress so didExecuteTool does not promote it to the past-tense message.
++	invocation.acceptProgress({ message: undefined });
+ 	const cancelledFromStreaming = isCancelled && invocation.cancelFromStreaming(
+ 		tc.reason === ToolCallCancellationReason.Skipped ? ToolConfirmKind.Skipped : ToolConfirmKind.Denied,
+ 		tc.reasonMessage ? stringOrMarkdownToString(tc.reasonMessage, connectionAuthority) : undefined,
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
+index 07a0bb98aed8b..37931e224ca1f 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
+@@ -122,6 +122,12 @@ function updateRunningToolSpecificData(existing: Parameters<typeof rawUpdateRunn
+ 	return rawUpdateRunningToolSpecificData(existing, tc, URI.file('/'), 'local');
+ }
+ 
++/** The progress message an executing invocation currently shows, if any. */
++function executingProgressMessage(invocation: Parameters<typeof rawUpdateRunningToolSpecificData>[0]): string | IMarkdownString | undefined {
++	const state = invocation.state.get();
++	return state.type === IChatToolInvocation.StateKind.Executing ? state.progress.get().message : undefined;
++}
++
+ function assertInputOutputDetails(details: unknown): asserts details is IToolResultInputOutputDetails {
+ 	assert.ok(isToolResultInputOutputDetails(details));
+ }
+@@ -2132,6 +2138,16 @@ suite('stateToProgressAdapter', () => {
+ 			assert.strictEqual(value, 'Read [](vscode-agent-host://ssh__macbook-air/path/to/foo.ts?_ah%3DeyJzY2hlbWUiOiJmaWxlIn0)');
+ 		});
+ 
++		test('does not promote transient progress to the past-tense message', () => {
++			const withPastTense = toolCallStateToInvocation(createToolCallState());
++			updateRunningToolSpecificData(withPastTense, createToolCallState({ _meta: { progressMessage: 'Searching' } }));
++			finalizeToolInvocation(withPastTense, createCompletedToolCall({ pastTenseMessage: 'Called test tool' }));
++			const withoutPastTense = toolCallStateToInvocation(createToolCallState());
++			updateRunningToolSpecificData(withoutPastTense, createToolCallState({ _meta: { progressMessage: 'Searching' } }));
++			finalizeToolInvocation(withoutPastTense, createCompletedToolCall({ pastTenseMessage: undefined }));
++			assert.deepStrictEqual({ withPastTense: withPastTense.pastTenseMessage, withoutPastTense: withoutPastTense.pastTenseMessage }, { withPastTense: 'Called test tool', withoutPastTense: undefined });
++		});
++
+ 		test('finalizes pty terminal tool with compatibility output and exit code', () => {
+ 			const tc = createToolCallState({
+ 				toolInput: 'echo hi',
+@@ -3429,6 +3445,22 @@ suite('stateToProgressAdapter', () => {
+ 			assert.strictEqual(termData.terminalCommandId, 'cmd-id-from-revive');
+ 			assert.strictEqual(termData.terminalCommandOutput?.text, 'hi\r\n');
+ 		});
++
++		test('applies _meta.progressMessage to the executing invocation progress', () => {
++			const updated = toolCallStateToInvocation(createToolCallState());
++			updateRunningToolSpecificData(updated, createToolCallState({ _meta: { progressMessage: 'Searching' } }));
++			const seeded = toolCallStateToInvocation(createToolCallState({ _meta: { progressMessage: 'Ranking' } }));
++			assert.deepStrictEqual({ updated: executingProgressMessage(updated), seeded: executingProgressMessage(seeded) }, { updated: 'Searching', seeded: 'Ranking' });
++		});
++
++		test('keeps the current progress when _meta.progressMessage is missing or not a string', () => {
++			const invocation = toolCallStateToInvocation(createToolCallState());
++			updateRunningToolSpecificData(invocation, createToolCallState({ _meta: { progressMessage: 'Searching' } }));
++			updateRunningToolSpecificData(invocation, createToolCallState({ _meta: { progressMessage: 42 } }));
++			updateRunningToolSpecificData(invocation, createToolCallState());
++			const untouched = toolCallStateToInvocation(createToolCallState({ _meta: { progressMessage: 42 } }));
++			assert.deepStrictEqual({ kept: executingProgressMessage(invocation), untouched: executingProgressMessage(untouched) }, { kept: 'Searching', untouched: undefined });
++		});
+ 	});
+ 
+ 	suite('usageInfoToQuotas', () => {
+
+From 65c23c13239c0cee0382945719a41a0ad509187b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 13:38:44 -0400
+Subject: [PATCH 2/2] chat: let an empty tool progress message clear the status
+ line
+
+`applyToolCallProgress` gated the call to `acceptProgress` on the message
+being truthy, so an empty string was dropped. `progressMessage` is typed
+and validated as any string, and Codex can send an empty message to clear
+a status line it set earlier, so the invocation kept showing the stale
+text instead. Both the running-refresh path and the mid-turn seeding path
+go through this one helper, so both were affected; testing for undefined
+instead fixes them together.
+
+The mapper needed no change. It coalesces on
+`params.message === entry.progressMessage`, and the entry's
+`progressMessage` starts undefined rather than empty, so a first empty
+message is a real change and still emits; only a repeat of the same empty
+message is dropped.
+---
+ .../test/node/codex/codexMapAppServerEvents.test.ts       | 8 ++++++++
+ .../agentSessions/agentHost/stateToProgressAdapter.ts     | 2 +-
+ .../browser/agentSessions/stateToProgressAdapter.test.ts  | 8 ++++++++
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts b/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts
+index 70b47e1b04624..5082de08b94c4 100644
+--- a/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts
++++ b/src/vs/platform/agentHost/test/node/codex/codexMapAppServerEvents.test.ts
+@@ -830,6 +830,14 @@ suite('codexMapAppServerEvents', () => {
+ 		]);
+ 	});
+ 
++	test('an empty mcpToolCall progress message clears the previous one', () => {
++		const state = createCodexSessionMapState();
++		const toolCallId = startMcpToolCall(state, 'mcp_1');
++		const progress = (message: string) => mapMcpToolCallProgress(state, { threadId: 'thr_1', turnId: 'turn_a', itemId: 'mcp_1', message });
++		const emitted = (progressMessage: string) => [{ type: ActionType.ChatToolCallContentChanged, turnId: 'turn_a', toolCallId, content: [], _meta: { progressMessage } }];
++		assert.deepStrictEqual([progress(''), progress('Searching'), progress(''), progress('')], [emitted(''), emitted('Searching'), emitted(''), []]);
++	});
++
+ 	test('mcpToolCall progress does not clobber start-time _meta', () => {
+ 		const state = createCodexSessionMapState();
+ 		state.itemToToolCall.set('mcp_1', { toolCallId: 'tc_1', turnId: 'turn_a', toolName: 'github.search', output: '', meta: { ui: { resourceUri: 'ui://github/app' } } });
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
+index 4cd017d9cd275..f41c7c2d8d6f3 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/stateToProgressAdapter.ts
+@@ -386,7 +386,7 @@ function getSubagentAgentName(tc: ToolCallState): string | undefined {
+ /** Surfaces `_meta.progressMessage` of a running tool call as the invocation's progress step. */
+ function applyToolCallProgress(invocation: ChatToolInvocation, tc: ToolCallState): void {
+ 	const progressMessage = tc.status === ToolCallStatus.Running ? readToolCallMeta(tc).progressMessage : undefined;
+-	if (progressMessage) {
++	if (progressMessage !== undefined) {
+ 		invocation.acceptProgress({ message: progressMessage });
+ 	}
+ }
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
+index 37931e224ca1f..304a7b958271d 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/stateToProgressAdapter.test.ts
+@@ -3453,6 +3453,14 @@ suite('stateToProgressAdapter', () => {
+ 			assert.deepStrictEqual({ updated: executingProgressMessage(updated), seeded: executingProgressMessage(seeded) }, { updated: 'Searching', seeded: 'Ranking' });
+ 		});
+ 
++		test('an empty _meta.progressMessage clears the message already shown', () => {
++			const invocation = toolCallStateToInvocation(createToolCallState());
++			updateRunningToolSpecificData(invocation, createToolCallState({ _meta: { progressMessage: 'Searching' } }));
++			updateRunningToolSpecificData(invocation, createToolCallState({ _meta: { progressMessage: '' } }));
++			const seeded = toolCallStateToInvocation(createToolCallState({ _meta: { progressMessage: '' } }));
++			assert.deepStrictEqual({ cleared: executingProgressMessage(invocation), seeded: executingProgressMessage(seeded) }, { cleared: '', seeded: '' });
++		});
++
+ 		test('keeps the current progress when _meta.progressMessage is missing or not a string', () => {
+ 			const invocation = toolCallStateToInvocation(createToolCallState());
+ 			updateRunningToolSpecificData(invocation, createToolCallState({ _meta: { progressMessage: 'Searching' } }));

@@ -1,0 +1,1146 @@
+From 18f0ecd2197f31cfa5ed97d017c625a0c0cd8991 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 19:04:11 -0400
+Subject: [PATCH 1/2] agentHost: admit a client tool call on the runtime's
+ invocation
+
+A client tool call had two independent triggers and no single record of
+ownership. The stream mapper's ready action drove the session-input-needed
+contribution to publish an execution request, while the in-process MCP handler
+separately parked the SDK. Nothing tied "a client owns this call" to "the runtime
+is parked waiting for it", so an ownerless or unclaimed call could hang, a
+replayed call had no owner, and waiting for a claim was unbounded.
+
+Add a `client_tool_invoked` provider signal carrying the root chat, the SDK
+`tool_use_id`, the tool name, the input, and a subagent's `parentToolCallId`. The
+Claude session fires it from `registerAndFire` where the MCP handler parks, so a
+result buffered before the SDK asked for it short-circuits without firing.
+Providers opt in through `IAgent.drivesClientToolExecution`; Copilot and Codex
+keep executing on the streamed ready.
+
+AgentSideEffects owns the admission record (invoked, admitted, settled,
+abandoned) and stamps the admission into the tool call's protocol `_meta`, so it
+survives a state snapshot and a client reconnect. The session-input-needed
+contribution publishes a client execution request only for an admitted call, and
+only for a provider that opts in. A call the runtime replays with no prior state
+has its start and ready synthesized with the owner; a call no connected client
+provides is failed once and forwarded once as `toolUnavailable`; an admitted call
+no connected client claims within the existing client-disconnect window is failed
+the same way, while a call whose owner is still connected is left to run.
+
+The disconnect window moves from protocolServerHandler to
+agentHostClientConnectionService so both uses share one number, and a rebind now
+keeps buffered results instead of discarding an answer the SDK is about to ask
+for again.
+---
+ src/vs/platform/agentHost/common/agent.ts     |  28 +++
+ .../common/meta/agentToolCallMeta.ts          |   7 +
+ .../common/pendingRequestRegistry.ts          |  10 +-
+ .../node/agentHostClientConnectionService.ts  |   7 +
+ .../agentHost/node/agentSideEffects.ts        | 200 +++++++++++++++-
+ .../sessionInputNeededContribution.ts         |   6 +-
+ .../agentHost/node/claude/claudeAgent.ts      |   3 +
+ .../node/claude/claudeAgentSession.ts         |  23 +-
+ .../agentHost/node/claude/claudeSdkOptions.ts |   5 +-
+ .../clientTools/claudeClientToolMcpServer.ts  |  12 +-
+ .../agentHost/node/protocolServerHandler.ts   |   4 +-
+ .../common/pendingRequestRegistry.test.ts     |   7 +
+ .../test/node/agentSideEffects.test.ts        | 216 ++++++++++++++++++
+ .../agentHost/test/node/claudeAgent.test.ts   |  52 +++++
+ .../claudeClientToolMcpServer.test.ts         |  11 +
+ .../platform/agentHost/test/node/mockAgent.ts |   3 +
+ 16 files changed, 576 insertions(+), 18 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agent.ts b/src/vs/platform/agentHost/common/agent.ts
+index f4b28c2034c80..b8d9d2defc6c6 100644
+--- a/src/vs/platform/agentHost/common/agent.ts
++++ b/src/vs/platform/agentHost/common/agent.ts
+@@ -822,6 +822,7 @@ export type AgentSignal =
+ 	| IAgentActionSignal
+ 	| IAgentModelCallCompletedSignal
+ 	| IAgentToolPendingConfirmationSignal
++	| IAgentClientToolInvokedSignal
+ 	| IAgentSubagentStartedSignal
+ 	| IAgentSubagentResumedSignal
+ 	| IAgentSubagentCompletedSignal
+@@ -909,6 +910,25 @@ export interface IAgentToolPendingConfirmationSignal {
+ 	readonly parentToolCallId?: string;
+ }
+ 
++/**
++ * The runtime invoked a client-provided tool and is parked awaiting its result,
++ * which is what admits the call to client execution. Kept as a non-action signal
++ * because it reports a runtime fact rather than a state transition.
++ */
++export interface IAgentClientToolInvokedSignal {
++	readonly kind: 'client_tool_invoked';
++	/** Root chat channel URI the tool call belongs to. */
++	readonly chat: URI;
++	/** SDK `tool_use_id` of the invocation, the call's identity end to end. */
++	readonly toolCallId: string;
++	/** Unprefixed client tool name. */
++	readonly toolName: string;
++	/** JSON-serialized tool input, authoritative over anything streamed. */
++	readonly toolInput: string;
++	/** See {@link IAgentToolPendingConfirmationSignal.parentToolCallId}. */
++	readonly parentToolCallId?: string;
++}
++
+ /**
+  * A subagent was spawned by a tool call. The host creates a child session
+  * silently and routes subsequent inner-tool events to it.
+@@ -1111,6 +1131,14 @@ export interface IAgent {
+ 	/** Provider descriptor and capabilities. */
+ 	getDescriptor(): IAgentDescriptor;
+ 
++	/**
++	 * Whether the runtime announces every client tool invocation, so the host
++	 * admits a call on {@link IAgentClientToolInvokedSignal} rather than on the
++	 * streamed tool call reaching `Running`. Absent means the streamed ready
++	 * stays the trigger, as it is for Copilot and Codex.
++	 */
++	readonly drivesClientToolExecution?: boolean;
++
+ 	/** Available provider models. */
+ 	readonly models: IObservable<readonly IAgentModelInfo[]>;
+ 
+diff --git a/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts b/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts
+index 81a5d56e083d0..61fa7a3c506d1 100644
+--- a/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts
++++ b/src/vs/platform/agentHost/common/meta/agentToolCallMeta.ts
+@@ -47,6 +47,12 @@ export interface IToolCallMeta {
+ 	readonly autoApproveBySetting?: boolean;
+ 	/** Whether adding a persistent terminal auto-approve rule can suppress future prompts for this confirmation. */
+ 	readonly autoApproveRuleResolvable?: boolean;
++	/**
++	 * Set by the host when a provider that drives client tool execution has
++	 * announced this call, admitting it to client execution. Stamped into state
++	 * so the admission survives a snapshot and a client reconnect.
++	 */
++	readonly clientToolAdmitted?: boolean;
+ 	/** Transient runtime corpus for the local client tool-search invocation. */
+ 	readonly toolSearchCandidates?: readonly IToolSearchCandidate[];
+ }
+@@ -134,6 +140,7 @@ export function readToolCallMeta(source: IHasToolCallMeta): IToolCallMeta {
+ 	if (typeof meta['mcpToolName'] === 'string') { result.mcpToolName = meta['mcpToolName']; }
+ 	if (typeof meta['autoApproveBySetting'] === 'boolean') { result.autoApproveBySetting = meta['autoApproveBySetting']; }
+ 	if (typeof meta['autoApproveRuleResolvable'] === 'boolean') { result.autoApproveRuleResolvable = meta['autoApproveRuleResolvable']; }
++	if (typeof meta['clientToolAdmitted'] === 'boolean') { result.clientToolAdmitted = meta['clientToolAdmitted']; }
+ 	const toolSearchCandidates = readToolSearchCandidates(meta['toolSearchCandidates']);
+ 	if (toolSearchCandidates) { result.toolSearchCandidates = toolSearchCandidates; }
+ 	const ui = readToolCallUiMeta(meta['ui']);
+diff --git a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+index d90d8d2525df0..6aca035e5341b 100644
+--- a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
++++ b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+@@ -155,14 +155,20 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	 * supplied value — that is right for the permission-deny path where a
+ 	 * "deny" is itself a successful answer, but wrong for cancellation
+ 	 * where the awaited consumer must observe an error to unwind.
++	 *
++	 * Pass `keepBufferedResults` when the requester will come back and re-park
++	 * the same keys (a rebind), so an answer that already arrived is not thrown
++	 * away and re-asked for.
+ 	 */
+-	rejectAll(error: Error): void {
++	rejectAll(error: Error, keepBufferedResults = false): void {
+ 		for (const [, entry] of this._entries) {
+ 			if (!entry.deferred.isSettled) {
+ 				entry.deferred.error(error);
+ 			}
+ 		}
+ 		this._entries.clear();
+-		this._earlyResults.clear();
++		if (!keepBufferedResults) {
++			this._earlyResults.clear();
++		}
+ 	}
+ }
+diff --git a/src/vs/platform/agentHost/node/agentHostClientConnectionService.ts b/src/vs/platform/agentHost/node/agentHostClientConnectionService.ts
+index 973cfed7b3990..e85bdb1ff3869 100644
+--- a/src/vs/platform/agentHost/node/agentHostClientConnectionService.ts
++++ b/src/vs/platform/agentHost/node/agentHostClientConnectionService.ts
+@@ -8,6 +8,13 @@ import { createDecorator } from '../../instantiation/common/instantiation.js';
+ 
+ export const AGENT_HOST_CLIENT_CONNECTION_HISTORY_RETENTION = 30_000 * 10;
+ 
++/**
++ * Grace window a disconnected client gets before the host stops waiting on it:
++ * its active-client slot is released and the client tool calls it owed are
++ * failed. Also bounds a client tool call no connected client ever claims.
++ */
++export const CLIENT_TOOL_CALL_DISCONNECT_TIMEOUT = 30_000;
++
+ export interface IAgentHostClientConnectionCounts {
+ 	readonly connectedClientCount: number;
+ 	readonly connectedTransportCount: number;
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index 969e653613441..d97d49b5f470c 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -3,9 +3,10 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { disposableTimeout } from '../../../base/common/async.js';
+ import { getErrorCode } from '../../../base/common/errors.js';
+ import type { Event } from '../../../base/common/event.js';
+-import { Disposable, DisposableStore, IDisposable } from '../../../base/common/lifecycle.js';
++import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
+ import { NKeyMap } from '../../../base/common/map.js';
+ import { equals } from '../../../base/common/objects.js';
+ import { autorun, IObservable, IReader } from '../../../base/common/observable.js';
+@@ -13,6 +14,7 @@ import { StopWatch } from '../../../base/common/stopwatch.js';
+ import { hasKey } from '../../../base/common/types.js';
+ import { URI } from '../../../base/common/uri.js';
+ import { generateUuid } from '../../../base/common/uuid.js';
++import { localize } from '../../../nls.js';
+ import { IInstantiationService } from '../../instantiation/common/instantiation.js';
+ import { ILogService } from '../../log/common/log.js';
+ import { IAgentHostChangesetService } from '../common/agentHostChangesetService.js';
+@@ -20,7 +22,7 @@ import { IAgentHostCheckpointService } from '../common/agentHostCheckpointServic
+ import { IAgentHostChatContributions, type ISendTurnMessageOptions } from '../common/agentHostChatContributionsService.js';
+ import { AgentHostClientType } from '../common/agentHostClientInfo.js';
+ import { AgentHostLaunchKind, createUnknownAgentHostClientTelemetryContext, type IAgentHostClientTelemetryContext } from '../common/agentHostTelemetry.js';
+-import { AgentSession, AgentSignal, IAgent, IAgentChatContext, IAgentToolPendingConfirmationSignal, type IAgentModelCallCompletedSignal } from '../common/agent.js';
++import { AgentSession, AgentSignal, IAgent, IAgentChatContext, IAgentToolPendingConfirmationSignal, type IAgentClientToolInvokedSignal, type IAgentModelCallCompletedSignal } from '../common/agent.js';
+ import { readToolCallMeta, toToolCallMeta } from '../common/meta/agentToolCallMeta.js';
+ import { isAgentMergeMessage } from '../common/meta/agentMergeMessageMeta.js';
+ 
+@@ -51,6 +53,7 @@ import {
+ 	ROOT_STATE_URI,
+ 	SessionLifecycle,
+ 	CustomizationType,
++	ToolCallConfirmationReason,
+ 	ToolCallStatus,
+ 	ToolResultContentType,
+ 	type ErrorInfo,
+@@ -58,7 +61,9 @@ import {
+ 	type Message,
+ 	type MessageAttachment,
+ 	type URI as ProtocolURI,
++	type StringOrMarkdown,
+ 	type ToolCallResult,
++	type ToolCallState,
+ 	type ToolResultContent,
+ 	type Turn,
+ 	type UsageInfo,
+@@ -66,6 +71,7 @@ import {
+ 	type McpServerCustomization,
+ 	type PluginCustomization
+ } from '../common/state/sessionState.js';
++import { CLIENT_TOOL_CALL_DISCONNECT_TIMEOUT } from './agentHostClientConnectionService.js';
+ import { AgentHostInputRequestTracker } from './agentHostInputRequestTracker.js';
+ import { AgentHostLocalTurns } from './agentHostLocalTurns.js';
+ import { IAgentHostSessionTitleController } from './agentHostSessionTitleController.js';
+@@ -176,6 +182,39 @@ interface IResumedTurnExecution {
+ 	readonly stopWatch: StopWatch;
+ }
+ 
++/**
++ * How far a client tool call has got through host admission: announced by the
++ * runtime, admitted to client execution, settled by a result, or abandoned
++ * because no client could produce one.
++ */
++type ClientToolAdmissionState = 'invoked' | 'admitted' | 'settled' | 'abandoned';
++
++/** The host's record that a client owns a tool call and the runtime is parked on it. */
++interface IClientToolAdmission {
++	state: ClientToolAdmissionState;
++	readonly chat: ProtocolURI;
++	readonly turnId: string;
++	readonly toolCallId: string;
++	readonly toolName: string;
++	/** Active client expected to run the call, absent when none provides the tool. */
++	readonly clientId: string | undefined;
++	/** Armed at admission; fails the call if no connected client claims it. */
++	unclaimed?: IDisposable;
++}
++
++/** `ToolCallResult.error.code` for a client tool call no connected client can run. */
++const CLIENT_TOOL_UNAVAILABLE_ERROR_CODE = 'toolUnavailable';
++
++/** The invocation message a tool call already carries, if its status has one. */
++function toolCallInvocationMessage(toolCall: ToolCallState | undefined): StringOrMarkdown | undefined {
++	return toolCall && hasKey(toolCall, { invocationMessage: true }) ? toolCall.invocationMessage : undefined;
++}
++
++/** The confirmation reason a tool call already carries, if its status has one. */
++function toolCallConfirmation(toolCall: ToolCallState | undefined): ToolCallConfirmationReason | undefined {
++	return toolCall && hasKey(toolCall, { confirmed: true }) ? toolCall.confirmed : undefined;
++}
++
+ /**
+  * Shared implementation of agent side-effect handling.
+  *
+@@ -190,6 +229,12 @@ export class AgentSideEffects extends Disposable {
+ 
+ 	/** Maps tool call IDs to the agent that owns them, for routing confirmations. */
+ 	private readonly _toolCallAgents = new Map<string, string>();
++	/**
++	 * Admission records for client tool calls, keyed `${chat}:${toolCallId}`.
++	 * For a provider that drives client tool execution this is the single
++	 * record of ownership, so a streamed ready alone never starts a call.
++	 */
++	private readonly _clientToolAdmissions = new Map<string, IClientToolAdmission>();
+ 	/** Managed confirmations are human-only and must never seed host-side session permissions. */
+ 	private readonly _managedApprovalToolCalls = new Set<string>();
+ 	private readonly _resumedTurnExecutions = new Map<string, IResumedTurnExecution>();
+@@ -242,6 +287,12 @@ export class AgentSideEffects extends Disposable {
+ 		this.onDidStartTurn = this._turnTracker.onDidStartTurn;
+ 		this._inputRequestTracker = new AgentHostInputRequestTracker(this._telemetryReporter, undefined, (session, turnId) => this._turnTracker.getClientTelemetryContext(session, turnId));
+ 		this._permissionManager = this._register(this._instantiationService.createInstance(SessionPermissionManager, this._stateManager, {}));
++		this._register(toDisposable(() => {
++			for (const admission of this._clientToolAdmissions.values()) {
++				admission.unclaimed?.dispose();
++			}
++			this._clientToolAdmissions.clear();
++		}));
+ 		this._register(this._stateManager.onDidSnapshotDefaultChatTitle(event => this._persistDefaultChatTitleSnapshot(event.session, event.chat, event.title)));
+ 		this._register(this._chatContributions.registerHost({
+ 			hostLaunchKind: this._options.hostLaunchKind ?? AgentHostLaunchKind.Unknown,
+@@ -329,13 +380,18 @@ export class AgentSideEffects extends Disposable {
+ 					case ActionType.ChatInputCompleted:
+ 						this._inputRequestTracker.inputCompleted(envelope.channel, action, chatState);
+ 						break;
++					case ActionType.ChatToolCallComplete:
++						this._settleClientToolAdmission(envelope.channel, action.toolCallId);
++						break;
+ 					case ActionType.ChatTurnComplete:
+ 					case ActionType.ChatTurnCancelled:
+ 					case ActionType.ChatError:
+ 						this._inputRequestTracker.clearTurn(envelope.channel, action.turnId);
++						this._clearClientToolAdmissions(envelope.channel);
+ 						break;
+ 					case ActionType.ChatTruncated:
+ 						this._inputRequestTracker.clearChat(envelope.channel);
++						this._clearClientToolAdmissions(envelope.channel);
+ 						break;
+ 				}
+ 				if (envelope.action.type === ActionType.ChatTurnCancelled) {
+@@ -696,6 +752,11 @@ export class AgentSideEffects extends Disposable {
+ 			});
+ 			return;
+ 		}
++		if (signal.kind === 'client_tool_invoked') {
++			// No turn to attach the call to, so nothing can ever answer it.
++			this._logService.warn(`[AgentSideEffects] Dropping client tool invocation ${signal.toolCallId} on ${sessionKey}: no active turn`);
++			return;
++		}
+ 		if (signal.kind === 'action') {
+ 			const action = signal.action;
+ 			if (action.type === ActionType.ChatTurnComplete && this._cancelledTurnIds.get(sessionKey)?.has(action.turnId)) {
+@@ -713,6 +774,10 @@ export class AgentSideEffects extends Disposable {
+ 	 * Dispatches a signal to a resolved chat, preserving top-level turn identity or remapping cross-channel subagent actions.
+ 	 */
+ 	private _dispatchActionForSession(signal: AgentSignal, sessionKey: ProtocolURI, turnId: string, turnIdRouting: AgentSignalTurnIdRouting, agent?: IAgent): void {
++		if (signal.kind === 'client_tool_invoked') {
++			this._handleClientToolInvoked(signal, sessionKey, turnId);
++			return;
++		}
+ 		if (signal.kind === 'pending_confirmation') {
+ 			if (agent) {
+ 				void this._handleToolReady(signal, sessionKey, turnId, agent).catch(err => {
+@@ -1242,6 +1307,137 @@ export class AgentSideEffects extends Disposable {
+ 		agent.onClientToolCallComplete(URI.parse(completionChat), toolCallId, result, this._chatContext(sessionChannel, chatChannel));
+ 	}
+ 
++	/**
++	 * The runtime invoked a client tool, which is what admits the call to client
++	 * execution. Repairs the streamed input from the runtime's own arguments and
++	 * synthesizes the start/ready pair when the call was replayed and never streamed.
++	 */
++	private _handleClientToolInvoked(signal: IAgentClientToolInvokedSignal, chatChannel: ProtocolURI, turnId: string): void {
++		const key = this._clientToolAdmissionKey(chatChannel, signal.toolCallId);
++		if (this._clientToolAdmissions.has(key)) {
++			// A rebind re-parks the same call; its admission already stands.
++			return;
++		}
++		const streamed = this._findToolCall(chatChannel, turnId, signal.toolCallId);
++		const clientId = streamed?.contributor?.kind === ToolCallContributorKind.Client
++			? streamed.contributor.clientId
++			: this._clientProvidingTool(chatChannel, signal.toolName);
++		const admission: IClientToolAdmission = { state: 'invoked', chat: chatChannel, turnId, toolCallId: signal.toolCallId, toolName: signal.toolName, clientId };
++		this._clientToolAdmissions.set(key, admission);
++		if (!streamed) {
++			this._logService.info(`[AgentSideEffects] Opening replayed client tool call ${signal.toolCallId} (${signal.toolName}) on ${chatChannel}`);
++			this._stateManager.dispatchServerAction(chatChannel, {
++				type: ActionType.ChatToolCallStart,
++				turnId,
++				toolCallId: signal.toolCallId,
++				toolName: signal.toolName,
++				displayName: signal.toolName,
++				...(clientId !== undefined ? { contributor: { kind: ToolCallContributorKind.Client, clientId } } : {}),
++			});
++		}
++		if (clientId === undefined) {
++			this._failClientToolCall(admission, localize('agentHost.clientTool.noOwner', "No connected client provides the tool \"{0}\".", signal.toolName), ToolCallConfirmationReason.NotNeeded);
++			return;
++		}
++		this._admitClientToolCall(admission, signal.toolInput, streamed);
++	}
++
++	/**
++	 * Stamps the admission into the call's protocol `_meta` and repairs its input,
++	 * which is what lets the execution request publish. A call still awaiting a
++	 * user confirmation keeps waiting for it.
++	 */
++	private _admitClientToolCall(admission: IClientToolAdmission, toolInput: string, streamed: ToolCallState | undefined): void {
++		admission.state = 'admitted';
++		this._stateManager.dispatchServerAction(admission.chat, {
++			type: ActionType.ChatToolCallReady,
++			turnId: admission.turnId,
++			toolCallId: admission.toolCallId,
++			invocationMessage: toolCallInvocationMessage(streamed) ?? admission.toolName,
++			toolInput,
++			...(streamed?.status === ToolCallStatus.PendingConfirmation ? {} : { confirmed: toolCallConfirmation(streamed) ?? ToolCallConfirmationReason.NotNeeded }),
++			// The reducer replaces `_meta` outright, so carry the streamed bag forward.
++			_meta: { ...streamed?._meta, ...toToolCallMeta({ clientToolAdmitted: true }) },
++		});
++		admission.unclaimed = disposableTimeout(() => this._failUnclaimedClientToolCall(admission), CLIENT_TOOL_CALL_DISCONNECT_TIMEOUT);
++	}
++
++	/**
++	 * Bounds an admitted call no connected client ever claimed. A call whose owner
++	 * is still connected is being run by it, so this leaves that one alone.
++	 */
++	private _failUnclaimedClientToolCall(admission: IClientToolAdmission): void {
++		if (admission.state !== 'admitted' || (admission.clientId !== undefined && this._isActiveClient(admission.chat, admission.clientId))) {
++			return;
++		}
++		this._failClientToolCall(admission, localize('agentHost.clientTool.unclaimed', "No connected client claimed the tool \"{0}\" in time.", admission.toolName), toolCallConfirmation(this._findToolCall(admission.chat, admission.turnId, admission.toolCallId)));
++	}
++
++	/**
++	 * Fails a client tool call the host cannot get a result for. The completion is
++	 * dispatched as a server action, which forwards it to the provider exactly once.
++	 */
++	private _failClientToolCall(admission: IClientToolAdmission, message: string, confirmed: ToolCallConfirmationReason | undefined): void {
++		admission.state = 'abandoned';
++		admission.unclaimed?.dispose();
++		this._logService.warn(`[AgentSideEffects] Failing client tool call ${admission.toolCallId} on ${admission.chat}: ${message}`);
++		this._stateManager.dispatchServerAction(admission.chat, {
++			type: ActionType.ChatToolCallReady,
++			turnId: admission.turnId,
++			toolCallId: admission.toolCallId,
++			invocationMessage: admission.toolName,
++			confirmed: confirmed ?? ToolCallConfirmationReason.NotNeeded,
++		});
++		this._stateManager.dispatchServerAction(admission.chat, {
++			type: ActionType.ChatToolCallComplete,
++			turnId: admission.turnId,
++			toolCallId: admission.toolCallId,
++			result: { success: false, pastTenseMessage: message, error: { message, code: CLIENT_TOOL_UNAVAILABLE_ERROR_CODE } },
++		});
++	}
++
++	/** Marks a client tool call settled, so its unclaimed bound stops applying. */
++	private _settleClientToolAdmission(chatChannel: ProtocolURI, toolCallId: string): void {
++		const admission = this._clientToolAdmissions.get(this._clientToolAdmissionKey(chatChannel, toolCallId));
++		if (admission) {
++			admission.state = 'settled';
++			admission.unclaimed?.dispose();
++		}
++	}
++
++	/** Drops every admission for a chat whose turn ended with calls outstanding. */
++	private _clearClientToolAdmissions(chatChannel: ProtocolURI): void {
++		for (const [key, admission] of this._clientToolAdmissions) {
++			if (admission.chat === chatChannel) {
++				admission.unclaimed?.dispose();
++				this._clientToolAdmissions.delete(key);
++			}
++		}
++	}
++
++	private _clientToolAdmissionKey(chatChannel: ProtocolURI, toolCallId: string): string {
++		return `${chatChannel}:${toolCallId}`;
++	}
++
++	/** The active client currently contributing `toolName` to the chat's session. */
++	private _clientProvidingTool(chatChannel: ProtocolURI, toolName: string): string | undefined {
++		const session = parseRequiredSessionUriFromChatUri(chatChannel);
++		return this._stateManager.getSessionState(session)?.activeClients.find(client => client.tools.some(tool => tool.name === toolName))?.clientId;
++	}
++
++	/** Whether `clientId` is still one of the session's active clients. */
++	private _isActiveClient(chatChannel: ProtocolURI, clientId: string): boolean {
++		const session = parseRequiredSessionUriFromChatUri(chatChannel);
++		return this._stateManager.getSessionState(session)?.activeClients.some(client => client.clientId === clientId) === true;
++	}
++
++	private _findToolCall(chatChannel: ProtocolURI, turnId: string, toolCallId: string): ToolCallState | undefined {
++		const state = this._stateManager.getSessionState(chatChannel);
++		const turn = state?.activeTurn?.id === turnId ? state.activeTurn : state?.turns.find(t => t.id === turnId);
++		const part = turn?.responseParts.find(p => p.kind === ResponsePartKind.ToolCall && p.toolCall.toolCallId === toolCallId);
++		return part?.kind === ResponsePartKind.ToolCall ? part.toolCall : undefined;
++	}
++
+ 	// ---- Side-effect handlers --------------------------------------------------
+ 
+ 	/**
+diff --git a/src/vs/platform/agentHost/node/chatContributions/sessionInputNeeded/sessionInputNeededContribution.ts b/src/vs/platform/agentHost/node/chatContributions/sessionInputNeeded/sessionInputNeededContribution.ts
+index cce0573ce889d..87ef1fe10117a 100644
+--- a/src/vs/platform/agentHost/node/chatContributions/sessionInputNeeded/sessionInputNeededContribution.ts
++++ b/src/vs/platform/agentHost/node/chatContributions/sessionInputNeeded/sessionInputNeededContribution.ts
+@@ -125,7 +125,11 @@ export class SessionInputNeededContribution extends Disposable implements IAgent
+ 		}
+ 
+ 		const contributor = toolCall?.contributor;
+-		if (toolCall?.status === ToolCallStatus.Running && contributor?.kind === ToolCallContributorKind.Client) {
++		// A provider that drives client tool execution admits each call itself.
++		const awaitingAdmission = !!toolCall
++			&& this._providerService.getProviderForSession(parseRequiredSessionUriFromChatUri(chatUri))?.drivesClientToolExecution === true
++			&& readToolCallMeta(toolCall).clientToolAdmitted !== true;
++		if (toolCall?.status === ToolCallStatus.Running && contributor?.kind === ToolCallContributorKind.Client && !awaitingAdmission) {
+ 			this._setSessionInputNeeded(chatUri, {
+ 				id: clientExecutionId,
+ 				kind: SessionInputRequestKind.ToolClientExecution,
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index dbb1d79a5b592..f0706c888fba6 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -699,6 +699,9 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 
+ 	// #region Descriptor + auth
+ 
++	/** The in-process MCP server sees every client tool call the SDK makes. */
++	readonly drivesClientToolExecution = true;
++
+ 	getDescriptor(): IAgentDescriptor {
+ 		return {
+ 			provider: this.id,
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+index 7ec7a0a50e79c..67598ff80554f 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts
+@@ -835,7 +835,7 @@ export class ClaudeAgentSession extends Disposable {
+ 		serverToolHost: IAgentServerToolHost | undefined,
+ 	): Promise<{ mcpServers: Record<string, McpServerConfig> | undefined; deniedMcpServers: readonly ClaudeDeniedMcpServerSpec[]; allowedTools: readonly string[] | undefined }> {
+ 		const externalServers = await this._buildExternalMcpServers(await this._getGitHubMcpServerConfiguration());
+-		const clientServers = await buildClientMcpServers(this.toolDiff, this._pendingClientToolCalls, this._sdkService);
++		const clientServers = await buildClientMcpServers(this.toolDiff, (id, name, args) => this._awaitClientToolResult(id, name, args), this._sdkService);
+ 		const serverToolDefinitions = serverToolHost?.getDefinitionsForSession(resource.toString());
+ 		const serverToolServer = serverToolHost && serverToolDefinitions?.length
+ 			? await buildServerToolMcpServer(serverToolHost, this._chatChannelUri.toString(), this._sdkService, serverToolDefinitions)
+@@ -1124,7 +1124,8 @@ export class ClaudeAgentSession extends Disposable {
+ 	 * resolved server-side entries from the rebuilt `Query`.
+ 	 */
+ 	private async _rebindForSyncedState(): Promise<void> {
+-		this._pendingClientToolCalls.rejectAll(new CancellationError());
++		// Keep buffered results: the SDK re-parks the same ids after the rebind.
++		this._pendingClientToolCalls.rejectAll(new CancellationError(), true);
+ 		await this._requirePipeline().rebindForRestart();
+ 		this._onDidCustomizationsChange.fire();
+ 	}
+@@ -1374,6 +1375,24 @@ export class ClaudeAgentSession extends Disposable {
+ 		}
+ 	}
+ 
++	/**
++	 * Park the SDK's client-tool invocation until the workbench echoes a result,
++	 * announcing the invocation as it parks. A result buffered before the SDK
++	 * asked for it short-circuits without announcing anything.
++	 */
++	private _awaitClientToolResult(toolUseId: string, toolName: string, args: unknown): Promise<CallToolResult> {
++		// A tool called inside a subagent is routed by the spawn that owns it.
++		const parentToolCallId = this.subagents.getParentSpawn(toolUseId)?.toolUseId;
++		return this._pendingClientToolCalls.registerAndFire(toolUseId, () => this._onDidSessionProgress.fire({
++			kind: 'client_tool_invoked',
++			chat: this._chatChannelUri,
++			toolCallId: toolUseId,
++			toolName,
++			toolInput: JSON.stringify(args ?? {}),
++			...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
++		}));
++	}
++
+ 	/**
+ 	 * Resolve a parked client-tool MCP handler with the workbench-supplied
+ 	 * result. Returns `true` if a matching deferred was found and settled.
+diff --git a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+index 0f9a3ce742910..4db9ede9c6a00 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeSdkOptions.ts
+@@ -12,7 +12,6 @@ import { rgDiskPath } from '../../../../base/node/ripgrep.js';
+ import { AiAgentEnvValue, AiAgentEnvVar } from '../../../chat/common/aiAgentEnv.js';
+ import { ClaudePermissionMode } from '../../common/claudeSessionConfigKeys.js';
+ import { resolveClaudeEffort } from '../../common/claudeModelConfig.js';
+-import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
+ import type { ModelSelection } from '../../common/state/protocol/state.js';
+ import { IClaudeAgentSdkService } from './claudeAgentSdkService.js';
+ import { buildClientToolMcpServer } from './clientTools/claudeClientToolMcpServer.js';
+@@ -221,14 +220,14 @@ export async function buildOptions(
+  */
+ export async function buildClientMcpServers(
+ 	toolDiff: SessionClientToolsDiff,
+-	registry: PendingRequestRegistry<CallToolResult>,
++	awaitResult: (toolUseId: string, toolName: string, args: unknown) => Promise<CallToolResult>,
+ 	sdkService: IClaudeAgentSdkService,
+ ): Promise<Record<string, McpSdkServerConfigWithInstance> | undefined> {
+ 	const tools = toolDiff.consume();
+ 	if (tools.length === 0) {
+ 		return undefined;
+ 	}
+-	const server = await buildClientToolMcpServer(tools, id => registry.register(id), sdkService);
++	const server = await buildClientToolMcpServer(tools, awaitResult, sdkService);
+ 	return { client: server };
+ }
+ 
+diff --git a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+index 7d5b75cd6fe9b..98f7da36625d7 100644
+--- a/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
++++ b/src/vs/platform/agentHost/node/claude/clientTools/claudeClientToolMcpServer.ts
+@@ -28,21 +28,23 @@ const TOOL_USE_ID_META_KEY = 'claudecode/toolUseId';
+  * `extra._meta["claudecode/toolUseId"]` and delegates to `awaitResult`,
+  * which is expected to return a promise that settles when the workbench
+  * echoes a completion (typically via a parked deferred owned by the
+- * session). Keeping that plumbing behind a callback lets this factory
+- * stay ignorant of how the host tracks in-flight tool calls.
++ * session). The handler also hands `awaitResult` the tool name and the
++ * runtime's own arguments, which are authoritative over anything streamed.
++ * Keeping that plumbing behind a callback lets this factory stay ignorant of
++ * how the host tracks in-flight tool calls.
+  *
+  * Pure factory — no SDK loading, no I/O.
+  */
+ export async function buildClientToolMcpServer(
+ 	snapshot: readonly ToolDefinition[],
+-	awaitResult: (toolUseId: string) => Promise<CallToolResult>,
++	awaitResult: (toolUseId: string, toolName: string, args: unknown) => Promise<CallToolResult>,
+ 	sdk: IClaudeAgentSdkService
+ ): Promise<McpSdkServerConfigWithInstance> {
+ 	const tools = await Promise.all(snapshot.map(def => sdk.tool(
+ 		def.name,
+ 		def.description ?? '',
+ 		jsonSchemaToZodRawShape(def.inputSchema),
+-		async (_args, extra) => {
++		async (args, extra) => {
+ 			const toolUseId = extractToolUseId(extra);
+ 			if (toolUseId === undefined) {
+ 				return {
+@@ -53,7 +55,7 @@ export async function buildClientToolMcpServer(
+ 					isError: true,
+ 				};
+ 			}
+-			return awaitResult(toolUseId);
++			return awaitResult(toolUseId, def.name, args);
+ 		}
+ 	)));
+ 	return sdk.createSdkMcpServer({ name: CLAUDE_CLIENT_MCP_SERVER_NAME, tools });
+diff --git a/src/vs/platform/agentHost/node/protocolServerHandler.ts b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+index bb8aed912d53f..cdb617acf8386 100644
+--- a/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -67,15 +67,13 @@ import {
+ } from '../common/otlp/otlpLogEmitter.js';
+ import { isFileResourceRead } from '../common/resourceReadLogging.js';
+ import type { Implementation } from '../common/state/protocol/common/commands.js';
+-import { AGENT_HOST_CLIENT_CONNECTION_HISTORY_RETENTION, IAgentHostClientConnectionService, type IAgentHostClientConnectionSource } from './agentHostClientConnectionService.js';
++import { AGENT_HOST_CLIENT_CONNECTION_HISTORY_RETENTION, CLIENT_TOOL_CALL_DISCONNECT_TIMEOUT, IAgentHostClientConnectionService, type IAgentHostClientConnectionSource } from './agentHostClientConnectionService.js';
+ import { AgentHostTelemetryReporter } from './agentHostTelemetryReporter.js';
+ import { isAgentHostTelemetryService } from './agentHostTelemetryService.js';
+ 
+ /** Default capacity of the server-side action replay buffer. */
+ const REPLAY_BUFFER_CAPACITY = 1000;
+ 
+-const CLIENT_TOOL_CALL_DISCONNECT_TIMEOUT = 30_000;
+-
+ /** Client actions whose state transition has no corresponding host-side behavior. */
+ const UNSUPPORTED_CLIENT_ACTION_TYPES: ReadonlySet<ActionType> = new Set([
+ 	ActionType.ChatWorkingDirectorySet,
+diff --git a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+index 122e79dda6d1a..0cb3859cf07ec 100644
+--- a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+@@ -150,6 +150,13 @@ suite('PendingRequestRegistry', () => {
+ 		assert.strictEqual(await promise, 'value');
+ 	});
+ 
++	test('rejectAll keeps buffered results when the requester will re-park', async () => {
++		const registry = new PendingRequestRegistry<string>();
++		registry.respondOrBuffer('k', 'value');
++		registry.rejectAll(new Error('rebind'), true);
++		assert.deepStrictEqual([registry.hasBufferedResult('k'), await registry.register('k')], [true, 'value']);
++	});
++
+ 	test('hasBufferedResult reports only unconsumed early results', async () => {
+ 		const registry = new PendingRequestRegistry<string>();
+ 		assert.strictEqual(registry.hasBufferedResult('k'), false);
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index 03fac7f948404..fcbd33b0dbe51 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import assert from 'assert';
++import * as sinon from 'sinon';
+ import { VSBuffer } from '../../../../base/common/buffer.js';
+ import { DeferredPromise, timeout } from '../../../../base/common/async.js';
+ import { Event } from '../../../../base/common/event.js';
+@@ -6988,6 +6989,221 @@ suite('AgentSideEffects', () => {
+ 		});
+ 	});
+ 
++	suite('client tool admission', () => {
++
++		function executionRequests() {
++			return (stateManager.getSessionState(sessionUri.toString())?.inputNeeded ?? [])
++				.filter(request => request.kind === SessionInputRequestKind.ToolClientExecution)
++				.map(request => ({ toolCallId: request.toolCall.toolCallId, clientId: request.clientId }));
++		}
++
++		function toolCalls(chat = defaultChatUri) {
++			return (stateManager.getChatState(chat)?.activeTurn?.responseParts ?? [])
++				.filter(part => part.kind === ResponsePartKind.ToolCall)
++				.map(part => part.toolCall);
++		}
++
++		function setClientTools(clientId: string, ...tools: string[]) {
++			stateManager.dispatchClientAction(sessionUri.toString(), {
++				type: ActionType.SessionActiveClientSet,
++				activeClient: { clientId, tools: tools.map(name => ({ name, inputSchema: { type: 'object' } })) },
++			}, { clientId: 'test', clientSeq: 1 });
++		}
++
++		function streamClientToolCall(toolCallId: string, toolName: string, clientId: string | undefined, toolInput?: string) {
++			stateManager.dispatchServerAction(defaultChatUri, {
++				type: ActionType.ChatToolCallStart, turnId: 'turn-1',
++				toolCallId, toolName, displayName: toolName,
++				...(clientId ? { contributor: { kind: ToolCallContributorKind.Client, clientId } } : {}),
++			});
++			stateManager.dispatchServerAction(defaultChatUri, {
++				type: ActionType.ChatToolCallReady, turnId: 'turn-1',
++				toolCallId, invocationMessage: toolName, confirmed: ToolCallConfirmationReason.NotNeeded,
++				...(toolInput !== undefined ? { toolInput } : {}),
++			});
++		}
++
++		function invoke(toolCallId: string, toolName: string, toolInput: string, parentToolCallId?: string) {
++			agent.fireProgress({
++				kind: 'client_tool_invoked', chat: URI.parse(defaultChatUri),
++				toolCallId, toolName, toolInput,
++				...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
++			});
++		}
++
++		test('a streamed ready alone does not publish execution for a provider that drives it', () => {
++			agent.drivesClientToolExecution = true;
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			setClientTools('client-1', 'runTask');
++			startTurn('turn-1');
++
++			streamClientToolCall('tc-1', 'runTask', 'client-1', '{"task":"build"}');
++
++			assert.deepStrictEqual({ requests: executionRequests(), status: toolCalls()[0]?.status }, { requests: [], status: ToolCallStatus.Running });
++		});
++
++		test('the invocation admits the call, repairs the input and publishes exactly one request', () => {
++			agent.drivesClientToolExecution = true;
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			setClientTools('client-1', 'runTask');
++			startTurn('turn-1');
++
++			// The streamed input never finished; the runtime's arguments are authoritative.
++			streamClientToolCall('tc-1', 'runTask', 'client-1', '{"tas');
++			invoke('tc-1', 'runTask', '{"task":"build"}');
++			// A second invocation (the SDK re-parking after a rebind) must not publish again.
++			invoke('tc-1', 'runTask', '{"task":"build"}');
++
++			const toolCall = toolCalls()[0];
++			assert.deepStrictEqual({
++				requests: executionRequests(),
++				toolInput: toolCall?.status === ToolCallStatus.Running ? toolCall.toolInput : undefined,
++				admitted: toolCall ? readToolCallMeta(toolCall).clientToolAdmitted : undefined,
++			}, {
++				requests: [{ toolCallId: 'tc-1', clientId: 'client-1' }],
++				toolInput: '{"task":"build"}',
++				admitted: true,
++			});
++		});
++
++		test('a provider that does not drive execution keeps publishing on the streamed ready', () => {
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			setClientTools('client-1', 'runTask');
++			startTurn('turn-1');
++
++			streamClientToolCall('tc-1', 'runTask', 'client-1', '{"task":"build"}');
++
++			assert.deepStrictEqual(executionRequests(), [{ toolCallId: 'tc-1', clientId: 'client-1' }]);
++		});
++
++		test('a call with no connected owner fails once and is forwarded once', () => {
++			agent.drivesClientToolExecution = true;
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			startTurn('turn-1');
++
++			// No active client contributes the tool, so the call can only be failed.
++			streamClientToolCall('tc-1', 'runTask', undefined);
++			invoke('tc-1', 'runTask', '{}');
++
++			const toolCall = toolCalls()[0];
++			assert.deepStrictEqual({
++				status: toolCall?.status,
++				success: toolCall?.status === ToolCallStatus.Completed ? toolCall.success : undefined,
++				forwarded: agent.clientToolCallCompleteCalls.map(call => ({ toolCallId: call.toolCallId, code: call.result.error?.code })),
++				requests: executionRequests(),
++			}, {
++				status: ToolCallStatus.Completed,
++				success: false,
++				forwarded: [{ toolCallId: 'tc-1', code: 'toolUnavailable' }],
++				requests: [],
++			});
++		});
++
++		test('an admitted call nobody claims within the bound fails with a clear error', () => {
++			const clock = sinon.useFakeTimers();
++			try {
++				agent.drivesClientToolExecution = true;
++				setupSession();
++				disposables.add(sideEffects.registerProgressListener(agent));
++				setClientTools('client-1', 'runTask');
++				startTurn('turn-1');
++				streamClientToolCall('tc-1', 'runTask', 'client-1');
++				invoke('tc-1', 'runTask', '{}');
++
++				// The owner is still there while it runs the call, so the bound must not fire.
++				clock.tick(30_000);
++				const whileConnected = { status: toolCalls()[0]?.status, forwarded: agent.clientToolCallCompleteCalls.length };
++
++				// A second call whose owner goes away without answering.
++				streamClientToolCall('tc-2', 'runTask', 'client-1');
++				invoke('tc-2', 'runTask', '{}');
++				stateManager.dispatchClientAction(sessionUri.toString(), { type: ActionType.SessionActiveClientRemoved, clientId: 'client-1' }, { clientId: 'test', clientSeq: 2 });
++				clock.tick(30_000);
++
++				const failed = toolCalls().find(tc => tc.toolCallId === 'tc-2');
++				assert.deepStrictEqual({
++					whileConnected,
++					status: failed?.status,
++					message: failed?.status === ToolCallStatus.Completed ? failed.error?.message : undefined,
++					code: failed?.status === ToolCallStatus.Completed ? failed.error?.code : undefined,
++				}, {
++					whileConnected: { status: ToolCallStatus.Running, forwarded: 0 },
++					status: ToolCallStatus.Completed,
++					message: 'No connected client claimed the tool "runTask" in time.',
++					code: 'toolUnavailable',
++				});
++			} finally {
++				clock.restore();
++			}
++		});
++
++		test('a replayed call with no prior state synthesizes start and ready with the owner', () => {
++			agent.drivesClientToolExecution = true;
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			setClientTools('client-A', 'openBrowserPage');
++			startTurn('turn-1');
++
++			// A replayed call streams nothing, so the invocation is the only cue.
++			invoke('tu_replay', 'openBrowserPage', '{"url":"http://x/"}');
++
++			const toolCall = toolCalls()[0];
++			assert.deepStrictEqual({
++				toolCalls: toolCalls().map(tc => ({ id: tc.toolCallId, status: tc.status, contributor: tc.contributor })),
++				toolInput: toolCall?.status === ToolCallStatus.Running ? toolCall.toolInput : undefined,
++				requests: executionRequests(),
++			}, {
++				toolCalls: [{ id: 'tu_replay', status: ToolCallStatus.Running, contributor: { kind: ToolCallContributorKind.Client, clientId: 'client-A' } }],
++				toolInput: '{"url":"http://x/"}',
++				requests: [{ toolCallId: 'tu_replay', clientId: 'client-A' }],
++			});
++		});
++
++		test('a subagent client tool is admitted on the subagent chat', () => {
++			agent.drivesClientToolExecution = true;
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			setClientTools('client-1', 'runTask');
++			startTurn('turn-1');
++			agent.fireProgress({ kind: 'subagent_started', chat: URI.parse(defaultChatUri), toolCallId: 'tc-parent', agentName: 'helper', agentDisplayName: 'Helper' });
++
++			invoke('tu_inner', 'runTask', '{"task":"build"}', 'tc-parent');
++
++			const subagentChat = buildSubagentChatUri(sessionUri.toString(), 'tc-parent');
++			const admitted = {
++				parentToolCalls: toolCalls().map(tc => tc.toolCallId),
++				subagentToolCalls: toolCalls(subagentChat).map(tc => ({ id: tc.toolCallId, status: tc.status })),
++				requests: executionRequests(),
++			};
++
++			// The client answers on the subagent chat; the runtime is parked on the root session.
++			const completion = {
++				type: ActionType.ChatToolCallComplete as const, turnId: stateManager.getActiveTurnId(subagentChat)!, toolCallId: 'tu_inner',
++				result: { success: true, pastTenseMessage: 'Ran' },
++			};
++			stateManager.dispatchClientAction(subagentChat, completion, { clientId: 'client-1', clientSeq: 2 });
++			sideEffects.handleAction(subagentChat, completion, 'client-1');
++
++			assert.deepStrictEqual({
++				admitted,
++				forwarded: agent.clientToolCallCompleteCalls.map(call => ({ chat: call.chat.toString(), toolCallId: call.toolCallId })),
++				requests: executionRequests(),
++			}, {
++				admitted: {
++					parentToolCalls: [],
++					subagentToolCalls: [{ id: 'tu_inner', status: ToolCallStatus.Running }],
++					requests: [{ toolCallId: 'tu_inner', clientId: 'client-1' }],
++				},
++				forwarded: [{ chat: defaultChatUri, toolCallId: 'tu_inner' }],
++				requests: [],
++			});
++		});
++	});
++
+ 	// ---- Session permissions ------------------------------------------------
+ 
+ 	suite('session permissions', () => {
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index 12ba500c5b771..2c5984ca29a56 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -5682,6 +5682,58 @@ suite('ClaudeAgent', () => {
+ 		});
+ 	});
+ 
++	test('an SDK client tool invocation fires client_tool_invoked and resolves on completion', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		getOrCreateActiveClient(agent, defaultChatUri(created.session), 'client-1').tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
++		sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'go', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		const session = agent.getSessionForTesting(created.session)!;
++		const signals: AgentSignal[] = [];
++		disposables.add(session.onDidSessionProgress(signal => signals.push(signal)));
++
++		const callPromise = sdk.toolHandlers.get('echo')!({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_1' } });
++		const fired = signals.filter(signal => signal.kind === 'client_tool_invoked');
++		session.completeClientToolCall('tu_1', { success: true, pastTenseMessage: 'ok', content: [{ type: ToolResultContentType.Text, text: 'done' }] });
++
++		assert.deepStrictEqual({ fired, resolvedContent: (await callPromise).content }, {
++			fired: [{
++				kind: 'client_tool_invoked',
++				chat: session.chatChannelUri,
++				toolCallId: 'tu_1',
++				toolName: 'echo',
++				toolInput: '{"msg":"hi"}',
++			}],
++			resolvedContent: [{ type: 'text', text: 'done' }],
++		});
++	});
++
++	test('a client tool invoked inside a subagent carries its parent so the host routes it to the subagent chat', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		getOrCreateActiveClient(agent, defaultChatUri(created.session), 'client-1').tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
++		sdk.nextQueryMessages = [makeSystemInitMessage(created.sdkSessionId), makeResultSuccess(created.sdkSessionId)];
++		await agent.chats.sendMessage(defaultChatUri(created.session), 'go', undefined, undefined, 'turn-1', undefined, undefined, chatContext(defaultChatUri(created.session)));
++
++		const session = agent.getSessionForTesting(created.session)!;
++		session.subagents.recordSpawn('toolu_parent');
++		session.subagents.noteInnerTool('tu_inner', 'toolu_parent');
++		const signals: AgentSignal[] = [];
++		disposables.add(session.onDidSessionProgress(signal => signals.push(signal)));
++
++		const callPromise = sdk.toolHandlers.get('echo')!({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_inner' } });
++		session.completeClientToolCall('tu_inner', { success: true, pastTenseMessage: 'ok', content: [] });
++		await callPromise;
++
++		assert.deepStrictEqual(
++			signals.filter(signal => signal.kind === 'client_tool_invoked').map(signal => ({ toolCallId: signal.toolCallId, parentToolCallId: signal.parentToolCallId })),
++			[{ toolCallId: 'tu_inner', parentToolCallId: 'toolu_parent' }],
++		);
++	});
++
+ 	test('setClientTools after materialize triggers yield-restart on next sendMessage with the new tool set', async () => {
+ 		const { agent, sdk } = createTestContext(disposables);
+ 		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
+diff --git a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
+index 5dd303748d372..edcb5ae6268a2 100644
+--- a/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
++++ b/src/vs/platform/agentHost/test/node/clientTools/claudeClientToolMcpServer.test.ts
+@@ -76,6 +76,17 @@ suite('claudeClientToolMcpServer / buildClientToolMcpServer', () => {
+ 		assert.deepStrictEqual(await callPromise, expected);
+ 	});
+ 
++	test('handler forwards the tool name and the runtime arguments to awaitResult', async () => {
++		const { sdk, recorded } = makeSdk();
++		const calls: { id: string; name: string; args: unknown }[] = [];
++		await buildClientToolMcpServer([tool({ name: 'echo' })], async (id, name, args) => {
++			calls.push({ id, name, args });
++			return { content: [] };
++		}, sdk);
++		await recorded[0]!.handler({ msg: 'hi' }, { _meta: { 'claudecode/toolUseId': 'tu_1' } });
++		assert.deepStrictEqual(calls, [{ id: 'tu_1', name: 'echo', args: { msg: 'hi' } }]);
++	});
++
+ 	test('handler returns an error result when SDK omits the tool_use_id meta field', async () => {
+ 		const { sdk, recorded } = makeSdk();
+ 		const registry = new PendingRequestRegistry<CallToolResult>();
+diff --git a/src/vs/platform/agentHost/test/node/mockAgent.ts b/src/vs/platform/agentHost/test/node/mockAgent.ts
+index b888346e968e7..c0e5fbe788b03 100644
+--- a/src/vs/platform/agentHost/test/node/mockAgent.ts
++++ b/src/vs/platform/agentHost/test/node/mockAgent.ts
+@@ -446,6 +446,9 @@ export class MockAgent implements IAgent {
+ 		this.removeActiveClientCalls.push({ chat, clientId });
+ 	}
+ 
++	/** Mutable so a test can model a runtime that announces its client tool invocations. */
++	drivesClientToolExecution = false;
++
+ 	onClientToolCallComplete(chat: URI, toolCallId: string, result: ToolCallResult, context?: IAgentChatContext): void {
+ 		this.clientToolCallCompleteCalls.push({ chat, toolCallId, result, context });
+ 	}
+
+From 9db6d1870dd2e3298146b8148bfe461c751ffec2 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 4 Sep 2026 14:47:24 -0400
+Subject: [PATCH 2/2] Answer a client tool invocation the host cannot run, and
+ reuse a parked one
+
+Two holes the admission path left open.
+
+A `client_tool_invoked` arriving with no active turn was logged and dropped,
+but the provider parks its deferred before firing the signal, so it waited
+until session disposal. It is now failed back through the same completion
+path the ownerless case uses.
+
+`registerAndFire` replaced an entry that was still parked, unlike `register`,
+which cancels the superseded deferred deliberately. Since the admission guard
+suppresses the duplicate execution, only one response is ever produced and it
+settled only the newer promise. A duplicate now awaits the parked request and
+does not fire again, so the single response settles both callers.
+---
+ .../common/pendingRequestRegistry.ts          | 12 ++++++++-
+ .../agentHost/node/agentSideEffects.ts        | 12 +++++++--
+ .../common/pendingRequestRegistry.test.ts     | 26 +++++++++++++++++++
+ .../test/node/agentSideEffects.test.ts        | 18 +++++++++++++
+ 4 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+index 6aca035e5341b..5fab48846eb82 100644
+--- a/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
++++ b/src/vs/platform/agentHost/common/pendingRequestRegistry.ts
+@@ -30,13 +30,23 @@ export class PendingRequestRegistry<TResult, TMeta = void> {
+ 	 */
+ 	private readonly _earlyResults = new Map<string, TResult>();
+ 
+-	/** Atomically park a deferred and optional metadata, then invoke `fire` to prevent synchronous responses racing registration. */
++	/**
++	 * Atomically park a deferred and optional metadata, then invoke `fire` so a
++	 * synchronous response cannot race registration.
++	 *
++	 * A duplicate call for a still-parked key awaits that request and does not
++	 * fire again, because only one response is produced and it must settle both.
++	 */
+ 	registerAndFire(key: string, fire: () => void, ...metadata: MetadataArgument<TMeta>): Promise<TResult> {
+ 		if (this._earlyResults.has(key)) {
+ 			const buffered = this._earlyResults.get(key) as TResult;
+ 			this._earlyResults.delete(key);
+ 			return Promise.resolve(buffered);
+ 		}
++		const existing = this._entries.get(key);
++		if (existing && !existing.deferred.isSettled) {
++			return existing.deferred.p;
++		}
+ 		const deferred = new DeferredPromise<TResult>();
+ 		this._entries.set(key, { deferred, metadata: metadata[0] as TMeta });
+ 		fire();
+diff --git a/src/vs/platform/agentHost/node/agentSideEffects.ts b/src/vs/platform/agentHost/node/agentSideEffects.ts
+index d97d49b5f470c..21261f183a0f2 100644
+--- a/src/vs/platform/agentHost/node/agentSideEffects.ts
++++ b/src/vs/platform/agentHost/node/agentSideEffects.ts
+@@ -753,8 +753,16 @@ export class AgentSideEffects extends Disposable {
+ 			return;
+ 		}
+ 		if (signal.kind === 'client_tool_invoked') {
+-			// No turn to attach the call to, so nothing can ever answer it.
+-			this._logService.warn(`[AgentSideEffects] Dropping client tool invocation ${signal.toolCallId} on ${sessionKey}: no active turn`);
++			// The provider parked a deferred before firing this, so it must be answered.
++			const message = localize('agentHost.clientTool.noTurn', "No active turn to run the tool \"{0}\".", signal.toolName);
++			this._logService.warn(`[AgentSideEffects] Failing client tool invocation ${signal.toolCallId} on ${sessionKey}: no active turn`);
++			this._notifyClientToolCallComplete(
++				sessionKey,
++				signal.chat.toString(),
++				signal.toolCallId,
++				{ success: false, pastTenseMessage: message, error: { message, code: CLIENT_TOOL_UNAVAILABLE_ERROR_CODE } },
++				'server-envelope',
++			);
+ 			return;
+ 		}
+ 		if (signal.kind === 'action') {
+diff --git a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+index 0cb3859cf07ec..ab48bece31f8e 100644
+--- a/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
++++ b/src/vs/platform/agentHost/test/common/pendingRequestRegistry.test.ts
+@@ -24,6 +24,32 @@ suite('PendingRequestRegistry', () => {
+ 		assert.strictEqual(await promise, true);
+ 	});
+ 
++	test('duplicate registerAndFire awaits the parked request, fires once, and one response settles both', async () => {
++		const registry = new PendingRequestRegistry<string>();
++		let fired = 0;
++
++		// The SDK re-invokes the same tool_use_id before the first is answered.
++		const first = registry.registerAndFire('tool_use_1', () => { fired++; });
++		const second = registry.registerAndFire('tool_use_1', () => { fired++; });
++
++		assert.strictEqual(fired, 1, 'the duplicate must not fire a second invocation');
++
++		// Only one response is ever produced, and it must settle both awaiters.
++		assert.strictEqual(registry.respond('tool_use_1', 'done'), true);
++		assert.strictEqual(await first, 'done');
++		assert.strictEqual(await second, 'done', 'the original invocation must not hang');
++	});
++
++	test('registerAndFire parks a fresh request once the previous one settled', async () => {
++		const registry = new PendingRequestRegistry<string>();
++		const first = registry.registerAndFire('k', () => { });
++		registry.respond('k', 'one');
++		assert.strictEqual(await first, 'one');
++
++		const second = registry.registerAndFire('k', () => { });
++		registry.respond('k', 'two');
++		assert.strictEqual(await second, 'two');
++	});
+ 	test('respond on an unknown key returns false; on a known key resolves the deferred and removes the entry', async () => {
+ 		const registry = new PendingRequestRegistry<string>();
+ 		assert.strictEqual(registry.respond('missing', 'x'), false);
+diff --git a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+index fcbd33b0dbe51..cf5e377f53e5b 100644
+--- a/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentSideEffects.test.ts
+@@ -7079,6 +7079,24 @@ suite('AgentSideEffects', () => {
+ 			assert.deepStrictEqual(executionRequests(), [{ toolCallId: 'tc-1', clientId: 'client-1' }]);
+ 		});
+ 
++		test('an invocation with no active turn is failed back to the provider', () => {
++			agent.drivesClientToolExecution = true;
++			setupSession();
++			disposables.add(sideEffects.registerProgressListener(agent));
++			// No turn to attach the call to, but the provider is already awaiting it.
++
++			invoke('tc-1', 'runTask', '{}');
++
++			assert.deepStrictEqual(
++				agent.clientToolCallCompleteCalls.map(call => ({
++					toolCallId: call.toolCallId,
++					success: call.result.success,
++					code: call.result.error?.code,
++				})),
++				[{ toolCallId: 'tc-1', success: false, code: 'toolUnavailable' }],
++				'the parked invocation must be answered rather than left waiting',
++			);
++		});
+ 		test('a call with no connected owner fails once and is forwarded once', () => {
+ 			agent.drivesClientToolExecution = true;
+ 			setupSession();

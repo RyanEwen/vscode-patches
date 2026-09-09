@@ -1,0 +1,219 @@
+From 216ccc9916b8a44a632aaebf70c0c98eada103b3 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 14 Aug 2026 16:56:59 -0400
+Subject: [PATCH] Agent host: anchor branch changes on the session baseline
+ checkpoint
+
+Branch Changes are diffed against the merge-base with the base branch,
+which assumes a session owns its branch. A session started on a
+long-lived shared branch therefore reports that branch's entire
+divergence: every session in the repository shows the same number, it
+grows with each commit whether or not any session touched it, and a
+session that edited two files can read as sixteen thousand insertions.
+
+Anchor the diff on the session's baseline checkpoint when one exists.
+That checkpoint is captured once per session per repository, so the
+diff becomes the session's own footprint. A session that does own its
+branch is unaffected, since its baseline is the branch point. Without a
+baseline (no checkpoints, non-git folder, capture failed) the base
+branch is still used.
+
+The anchor is resolved in one place and used by both the primary and
+per-repository diffs, so the branch changeset, the session-list chip
+and every path that derives the chip from that changeset agree. Commit
+and pull-request flows are untouched: they call the git service
+directly with the base branch.
+---
+ .../agentHost/common/agentHostGitService.ts   |  6 +++
+ .../node/agentHostChangesetService.ts         | 37 ++++++++++++------
+ .../agentHost/node/agentHostGitService.ts     | 11 +++---
+ .../node/agentHostChangesetService.test.ts    | 39 +++++++++++++++++++
+ 4 files changed, 77 insertions(+), 16 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/agentHostGitService.ts b/src/vs/platform/agentHost/common/agentHostGitService.ts
+index be5cfadaa082b..96c2bbe6154da 100644
+--- a/src/vs/platform/agentHost/common/agentHostGitService.ts
++++ b/src/vs/platform/agentHost/common/agentHostGitService.ts
+@@ -58,6 +58,12 @@ export interface IComputeSessionFileDiffsOptions {
+ 	 * which surfaces uncommitted work but no committed-on-branch work.
+ 	 */
+ 	readonly baseBranch?: string;
++	/**
++	 * Commit-ish to diff against, bypassing base-branch resolution. Set when
++	 * the caller already knows the anchor, such as a session's baseline
++	 * checkpoint.
++	 */
++	readonly baseCommit?: string;
+ }
+ 
+ /** Cheap repository facts used to decide whether a branch diff is safe to compute. */
+diff --git a/src/vs/platform/agentHost/node/agentHostChangesetService.ts b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+index 14833427920f3..0e449df1a4be8 100644
+--- a/src/vs/platform/agentHost/node/agentHostChangesetService.ts
++++ b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+@@ -34,7 +34,7 @@ import {
+ } from '../common/state/sessionState.js';
+ import { AgentHostStateManager, IAgentHostStateManager } from './agentHostStateManager.js';
+ import { IAgentConfigurationService } from './agentConfigurationService.js';
+-import { IAgentHostGitService, META_DIFF_BASE_BRANCH, resolveDiffBaseBranchName } from '../common/agentHostGitService.js';
++import { IAgentHostGitService, IComputeSessionFileDiffsOptions, META_DIFF_BASE_BRANCH, resolveDiffBaseBranchName } from '../common/agentHostGitService.js';
+ import { IAgentHostCheckpointService } from '../common/agentHostCheckpointService.js';
+ import { NodeWorkerDiffComputeService } from './diffComputeService.js';
+ import { computeSessionDiffs, computeTurnDiffs, computeUnionedDiffs, type IIncrementalDiffOptions, type ISessionDiffSource } from './sessionDiffAggregator.js';
+@@ -980,8 +980,8 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 					// instead of re-diffing the primary repo. Only supplied on the
+ 					// success path, where the session has its own working directories,
+ 					// so the branch changeset's primary repo == this primary repo and
+-					// both measure from the session base branch — identical result,
+-					// one fewer git diff per recompute.
++					// both resolve the same anchor — identical result, one fewer git
++					// diff per recompute.
+ 					if (isPrimary && primaryBranchDiffs) {
+ 						return primaryBranchDiffs;
+ 					}
+@@ -1030,17 +1030,35 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		this._stateManager.setSessionSummaryChanges(session, changesSummary);
+ 	}
+ 
++	/**
++	 * Options anchoring a repository's Branch Changes diff: the session's
++	 * baseline checkpoint when it has one, so a session on a long-lived shared
++	 * branch reports its own footprint rather than the branch's whole
++	 * divergence, and the base branch otherwise.
++	 */
++	private async _branchDiffAnchor(session: ProtocolURI, directory: URI, baseBranch: string | undefined): Promise<IComputeSessionFileDiffsOptions> {
++		try {
++			const baseCommit = await this._checkpointService.getBaselineCheckpoint(URI.parse(session), directory);
++			if (baseCommit) {
++				return { sessionUri: session, baseCommit };
++			}
++		} catch (err) {
++			this._logService.warn(`[AgentHostChangesetService] Failed to resolve the baseline checkpoint for ${session} in ${directory.toString()}; anchoring on base branch ${baseBranch ?? 'HEAD'}`, err);
++		}
++		return { sessionUri: session, baseBranch };
++	}
++
+ 	/**
+ 	 * Computes one git repository's branch diff for the multi-folder summary,
+ 	 * logging and returning `undefined` on any failure so a single repo never
+ 	 * fails the whole aggregate and an unavailable repo is counted as such (not
+-	 * as a spurious zero). Uses the same `computeSessionFileDiffs` primitive as
+-	 * the primary branch changeset, threading the resolved `baseBranch` so
+-	 * committed-on-branch work is counted (not just uncommitted).
++	 * as a spurious zero). Uses the same `computeSessionFileDiffs` primitive and
++	 * anchor as the primary branch changeset, so committed-on-branch work is
++	 * counted (not just uncommitted).
+ 	 */
+ 	private async _computeRepoBranchDiffs(session: ProtocolURI, repoRoot: URI, baseBranch: string | undefined): Promise<readonly ISessionFileDiff[] | undefined> {
+ 		try {
+-			const diffs = await this._gitService.computeSessionFileDiffs(repoRoot, { sessionUri: session, baseBranch });
++			const diffs = await this._gitService.computeSessionFileDiffs(repoRoot, await this._branchDiffAnchor(session, repoRoot, baseBranch));
+ 			if (!diffs) {
+ 				this._logService.error(`[AgentHostChangesetService] Git branch diff unavailable for multi-folder branch summary ${session} in repository ${repoRoot.toString()}; skipping that repository.`);
+ 				return undefined;
+@@ -1573,10 +1591,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		const baseBranch = await this._resolveBranchBaseBranch(session, db);
+ 
+ 		try {
+-			return await this._gitService.computeSessionFileDiffs(workingDirectoryUri, {
+-				sessionUri: session,
+-				baseBranch
+-			});
++			return await this._gitService.computeSessionFileDiffs(workingDirectoryUri, await this._branchDiffAnchor(session, workingDirectoryUri, baseBranch));
+ 		} catch (err) {
+ 			this._logService.warn(`[AgentHostChangesetService] git-driven ${kind} diff computation failed; falling back to edit-tracker`, err);
+ 			return undefined;
+diff --git a/src/vs/platform/agentHost/node/agentHostGitService.ts b/src/vs/platform/agentHost/node/agentHostGitService.ts
+index b8f7966bfac86..7487fcc7a8bcd 100644
+--- a/src/vs/platform/agentHost/node/agentHostGitService.ts
++++ b/src/vs/platform/agentHost/node/agentHostGitService.ts
+@@ -456,8 +456,9 @@ export class AgentHostGitService implements IAgentHostGitService {
+ 			return undefined;
+ 		}
+ 
+-		// Resolve the merge-base commit the Branch Changes diff is anchored on.
+-		const mergeBaseCommit = await this._resolveBranchMergeBaseCommit(repositoryRoot, options.baseBranch);
++		// The commit the Branch Changes diff is anchored on: a caller-supplied
++		// anchor when given, otherwise the merge-base with the base branch.
++		const anchorCommit = options.baseCommit ?? await this._resolveBranchMergeBaseCommit(repositoryRoot, options.baseBranch);
+ 
+ 		// Detect whether the working tree has any untracked files. If so we
+ 		// have to use the temp-index trick so the untracked content is
+@@ -471,17 +472,17 @@ export class AgentHostGitService implements IAgentHostGitService {
+ 
+ 		let rawDiffOutput: string | undefined;
+ 		if (!hasUntracked) {
+-			rawDiffOutput = await this._runGit(repositoryRoot, ['diff', '--raw', '--numstat', '--diff-filter=ADMR', '-z', mergeBaseCommit, '--']);
++			rawDiffOutput = await this._runGit(repositoryRoot, ['diff', '--raw', '--numstat', '--diff-filter=ADMR', '-z', anchorCommit, '--']);
+ 		} else {
+ 			const changedPaths = parseChangedPaths(statusOut);
+-			rawDiffOutput = await this._runWithTempIndex(repositoryRoot, mergeBaseCommit, changedPaths);
++			rawDiffOutput = await this._runWithTempIndex(repositoryRoot, anchorCommit, changedPaths);
+ 		}
+ 
+ 		if (rawDiffOutput === undefined) {
+ 			return undefined;
+ 		}
+ 
+-		return parseGitDiffRawNumstat(rawDiffOutput, repositoryRoot, options.sessionUri, mergeBaseCommit);
++		return parseGitDiffRawNumstat(rawDiffOutput, repositoryRoot, options.sessionUri, anchorCommit);
+ 	}
+ 
+ 	async resolveBranchBaselineCommit(workingDirectory: URI, baseBranch?: string): Promise<string | undefined> {
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+index b7ba37b5d6bdd..d7cb678e7fb71 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+@@ -20,6 +20,7 @@ import type { ChangesSummary } from '../../common/state/protocol/state.js';
+ import { IAgentHostChangesetSubscriptionService } from '../../common/agentHostChangesetSubscriptionService.js';
+ import { IAgentHostChangesetOperationService } from '../../common/agentHostChangesetOperationService.js';
+ import { NULL_CHECKPOINT_SERVICE, type IAgentHostCheckpointService } from '../../common/agentHostCheckpointService.js';
++import { type IComputeSessionFileDiffsOptions } from '../../common/agentHostGitService.js';
+ import { NULL_REVIEW_SERVICE } from '../../common/agentHostReviewService.js';
+ import { IAgentHostGitService } from '../../common/agentHostGitService.js';
+ import { ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
+@@ -1664,6 +1665,44 @@ suite('AgentHostChangesetService - multi-root turn changeset', () => {
+ 			}
+ 		}
+ 
++		test('branch changes are anchored on the session baseline, not the whole branch divergence', async () => {
++			const options: { baseBranch?: string; baseCommit?: string }[] = [];
++			const git = createNoopGitService();
++			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
++			git.computeSessionFileDiffs = async (_wd, opts: IComputeSessionFileDiffsOptions) => {
++				options.push({ baseBranch: opts.baseBranch, baseCommit: opts.baseCommit });
++				// A long-lived shared branch: its divergence from the base branch
++				// dwarfs anything this session did.
++				return opts.baseCommit
++					? [gitDiff('/wd/touched.ts', 4, 1)]
++					: [gitDiff('/wd/touched.ts', 4, 1), gitDiff('/wd/history.ts', 9000, 500)];
++			};
++			const checkpoint = { ...NULL_CHECKPOINT_SERVICE, getBaselineCheckpoint: async () => 'baseline-sha' } as IAgentHostCheckpointService;
++			const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git, checkpoint });
++
++			svc.refreshBranchChangeset(sessionStr);
++			const changes = await waitForSummaryChanges(stateManager);
++
++			assert.deepStrictEqual({
++				changes,
++				anchoredOnBaseline: options.some(o => o.baseCommit === 'baseline-sha'),
++			}, {
++				changes: { additions: 4, deletions: 1, files: 1 },
++				anchoredOnBaseline: true,
++			});
++		});
++
++		test('branch changes fall back to the base branch when the session has no baseline checkpoint', async () => {
++			const git = createNoopGitService();
++			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
++			git.computeSessionFileDiffs = async () => [gitDiff('/wd/a.ts', 2, 1)];
++			const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git, checkpoint: NULL_CHECKPOINT_SERVICE });
++
++			svc.refreshBranchChangeset(sessionStr);
++
++			assert.deepStrictEqual(await waitForSummaryChanges(stateManager), { additions: 2, deletions: 1, files: 1 });
++		});
++
+ 		test('sums every repository branch diff, not just the primary', async () => {
+ 			const git = createNoopGitService();
+ 			git.getRepositoryRoot = async wd => URI.parse(wd.toString());

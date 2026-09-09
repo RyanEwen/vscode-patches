@@ -1,0 +1,437 @@
+From dadb0820d69d40c12b2f6bfc9bc51e6117d61a56 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 13:55:34 -0400
+Subject: [PATCH 1/3] agentHost: distinguish a cancelled subscribe from a
+ missing resource
+
+A subscribe whose subscription was released while its snapshot was still
+resolving got rewrapped as `Resource not found: <uri>` and logged at error
+level, naming a resource that exists and was registered correctly. That made
+a client-side observation lifetime problem read as a host registration bug.
+
+Add `SubscriptionCancelledError`, a `ProtocolError` subclass thrown at every
+site that already signalled `Subscription cancelled`, and key the subscribe
+handler on it: the cancelled path logs at info and returns the cancellation
+message rather than a missing resource. A genuinely unknown resource keeps
+its code, message and error-level log.
+
+The error reuses the session-not-found code because the synced protocol has
+no cancellation code; a dedicated one would need a protocol change.
+---
+ .../agentHost/common/state/sessionProtocol.ts | 10 ++++
+ .../platform/agentHost/node/agentService.ts   |  6 +-
+ .../agentHost/node/protocolServerHandler.ts   | 14 ++++-
+ .../test/node/protocolServerHandler.test.ts   | 59 ++++++++++++++++++-
+ 4 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/state/sessionProtocol.ts b/src/vs/platform/agentHost/common/state/sessionProtocol.ts
+index 6c5c78f9fdeed..5e7433a62b3ec 100644
+--- a/src/vs/platform/agentHost/common/state/sessionProtocol.ts
++++ b/src/vs/platform/agentHost/common/state/sessionProtocol.ts
+@@ -143,6 +143,16 @@ export class ProtocolError extends Error {
+ 	}
+ }
+ 
++/**
++ * A subscription that was released before its snapshot resolved. Reuses the session-not-found
++ * code because the protocol has no cancellation code yet.
++ */
++export class SubscriptionCancelledError extends ProtocolError {
++	constructor(resource: string) {
++		super(AHP_SESSION_NOT_FOUND, `Subscription cancelled: ${resource}`);
++	}
++}
++
+ /**
+  * VS Code-specific extension: set the auth token on the server.
+  * Not yet part of the official protocol.
+diff --git a/src/vs/platform/agentHost/node/agentService.ts b/src/vs/platform/agentHost/node/agentService.ts
+index 4cbb70f842b2a..72e05e22070de 100644
+--- a/src/vs/platform/agentHost/node/agentService.ts
++++ b/src/vs/platform/agentHost/node/agentService.ts
+@@ -34,7 +34,7 @@ import type { CompletionsParams, CompletionsResult, CreateTerminalParams, Resolv
+ import type { AutomationCapabilities } from '../common/state/protocol/common/commands.js';
+ import type { FetchAutomationRunsParams, FetchAutomationRunsResult, ListAutomationTriggerDefinitionsParams, ListAutomationTriggerDefinitionsResult, RunAutomationParams, RunAutomationResult } from '../common/state/protocol/channels-automation/commands.js';
+ import type { InvokeChangesetOperationParams, InvokeChangesetOperationResult } from '../common/state/protocol/channels-changeset/commands.js';
+-import { AhpErrorCodes, AHP_SESSION_NOT_FOUND, ContentEncoding, JSON_RPC_INTERNAL_ERROR, ProtocolError, ResourceChangeType, ResourceType, ResourceWriteMode, type CreateResourceWatchParams, type CreateResourceWatchResult, type DirectoryEntry, type ResourceCopyParams, type ResourceCopyResult, type ResourceDeleteParams, type ResourceDeleteResult, type ResourceListResult, type ResourceMkdirParams, type ResourceMkdirResult, type ResourceMoveParams, type ResourceMoveResult, type ResourceReadResult, type ResourceResolveParams, type ResourceResolveResult, type ResourceWatchState, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot } from '../common/state/sessionProtocol.js';
++import { AhpErrorCodes, AHP_SESSION_NOT_FOUND, ContentEncoding, JSON_RPC_INTERNAL_ERROR, ProtocolError, ResourceChangeType, ResourceType, ResourceWriteMode, SubscriptionCancelledError, type CreateResourceWatchParams, type CreateResourceWatchResult, type DirectoryEntry, type ResourceCopyParams, type ResourceCopyResult, type ResourceDeleteParams, type ResourceDeleteResult, type ResourceListResult, type ResourceMkdirParams, type ResourceMkdirResult, type ResourceMoveParams, type ResourceMoveResult, type ResourceReadResult, type ResourceResolveParams, type ResourceResolveResult, type ResourceWatchState, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot } from '../common/state/sessionProtocol.js';
+ import { ChangesSummary, ChatInteractivity, ChatOriginKind, MessageAttachmentKind, type Annotation, type AnnotationEntry, type AnnotationOrigin, type AnnotationsState, type ChatOrigin, type Customization, type Message, type MessageAttachment, type MessageResourceAttachment, type TextRange } from '../common/state/protocol/state.js';
+ import type { ChatPendingMessageSetAction, ChatTurnStartedAction, SessionConfigChangedAction } from '../common/state/protocol/actions.js';
+ import { isAhpAutomationCatalogChannel, isAhpAutomationRunChannel, ISessionGitHubState, ISessionGitState, MessageKind, ResponsePartKind, SESSION_META_GITHUB_KEY, SESSION_META_GIT_KEY, SESSION_META_MULTI_ROOT_KEY, SESSION_META_SOURCE_CONTROL_KEY, AH_META_CREATED_BY_SESSION_DB_KEY, readSessionCreationReference, readSessionSpawnDepth, withSessionSpawnDepth, withSessionCreationReference, parseSessionCreationReference, SessionLifecycle, SessionStatus, ToolCallStatus, ToolResultContentType, TurnState, AH_META_WORKSPACELESS_DB_KEY, AH_META_EHCLI_ADOPTED_DB_KEY, AH_META_IS_ARCHIVED_DB_KEY, AH_META_IS_DONE_DB_KEY, AH_META_IS_READ_DB_KEY, buildChatUri, buildDefaultChatUri, buildResourceWatchChannelUri, buildSubagentChatUri, buildSubagentSessionUriPrefix, getErrorResponsePart, isAhpChatChannel, isChatReadOnly, isDefaultChatUri, isSubagentChatUri, isSubagentSession, needsSessionGitStateRefresh, parseChatUri, parseDefaultChatUri, parseRequiredSessionUriFromChatUri, parseResourceWatchChannelUri, parseSessionMultiRootMetadata, parseSubagentSessionUri, readSessionExternal, readSessionGitHubState, readSessionGitState, readSessionMultiRootMetadata, readSessionSourceControlState, readSessionWorkspaceless, withMessageRequestHiddenFromTranscript, withSessionExternal, withSessionGitHubState, withSessionGitState, withSessionMultiRootMetadata, withSessionSourceControlState, withSessionStatusFlag, withSessionWorkspaceless, withSessionEhcliAdopted, withSessionEhcliLastMigratedTurn, AH_META_EHCLI_LAST_TURN_DB_KEY, withSessionFolderPickerDecision, readSessionFolderPickerDecision, parseSessionFolderPickerDecision, SESSION_META_FOLDER_PICKER_KEY, readSessionEhcliAdoptable, type ISessionSourceControlState, type SessionConfigState, type SessionSummary, type ToolResultSubagentContent, type Turn } from '../common/state/sessionState.js';
+@@ -4162,7 +4162,7 @@ export class AgentService extends Disposable implements IAgentService {
+ 			const restoreSession = (session: URI) => this.restoreSession(session, joinedRestore => telemetry.restoreStarted(joinedRestore));
+ 			await this._sessionResidency.waitForRelease(resource);
+ 			if (this._store.isDisposed || (isActive && !isActive())) {
+-				throw new Error(`Subscription cancelled: ${resourceStr}`);
++				throw new SubscriptionCancelledError(resourceStr);
+ 			}
+ 			// Register after an in-flight release settles so a successful release
+ 			// can evict cached state and this subscribe reconstructs it. The
+@@ -4247,7 +4247,7 @@ export class AgentService extends Disposable implements IAgentService {
+ 				throw new Error(`Cannot subscribe to unknown resource: ${resourceStr}`);
+ 			}
+ 			if (this._store.isDisposed || (isActive && !isActive())) {
+-				throw new Error(`Subscription cancelled: ${resourceStr}`);
++				throw new SubscriptionCancelledError(resourceStr);
+ 			}
+ 			this._sessionResidency.touch(resource);
+ 			void this._sessionResidency.reconcile();
+diff --git a/src/vs/platform/agentHost/node/protocolServerHandler.ts b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+index bb8aed912d53f..232ad4138dc0a 100644
+--- a/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -42,6 +42,7 @@ import {
+ 	JSON_RPC_INTERNAL_ERROR,
+ 	JsonRpcErrorCodes,
+ 	ProtocolError,
++	SubscriptionCancelledError,
+ 	type AhpServerNotification,
+ 	type InitializeParams,
+ 	type JsonRpcResponse,
+@@ -109,6 +110,9 @@ function jsonRpcErrorFrom(id: number, err: unknown): JsonRpcResponse {
+ }
+ 
+ function shouldLogFailedRequest(method: string, params: unknown, err: unknown): boolean {
++	if (err instanceof SubscriptionCancelledError) {
++		return false;
++	}
+ 	if (!(err instanceof ProtocolError) || err.code !== AhpErrorCodes.NotFound || !isFileResourceRead(method, params)) {
+ 		return true;
+ 	}
+@@ -707,7 +711,7 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+ 			return this._agentService.subscribe(URI.parse(channel), clientId, isActive);
+ 		}
+ 		if (isActive && !isActive()) {
+-			throw new Error(`Subscription cancelled: ${channel}`);
++			throw new SubscriptionCancelledError(channel);
+ 		}
+ 		const snapshot = this._stateManager.getSnapshot(channel);
+ 		if (!snapshot) {
+@@ -906,7 +910,7 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+ 					() => client.subscriptions.get(classified.uri) === pendingSubscription,
+ 				);
+ 				if (client.subscriptions.get(classified.uri) !== pendingSubscription) {
+-					throw new Error(`Subscription cancelled: ${key}`);
++					throw new SubscriptionCancelledError(key);
+ 				}
+ 				this._clearClientToolCallDisconnectTimeout(client.clientId, classified.uri);
+ 				return snapshot;
+@@ -1423,7 +1427,7 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+ 					() => client.subscriptions.get(classified.uri) === pendingSubscription,
+ 				);
+ 				if (client.subscriptions.get(classified.uri) !== pendingSubscription) {
+-					throw new Error(`Subscription cancelled: ${params.channel}`);
++					throw new SubscriptionCancelledError(params.channel);
+ 				}
+ 				client.subscriptions.set(classified.uri, classified);
+ 				this._clearClientToolCallDisconnectTimeout(client.clientId, classified.uri);
+@@ -1435,6 +1439,10 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+ 				if (!pendingSubscription.active && client.subscriptions.get(classified.uri) === pendingSubscription) {
+ 					client.subscriptions.delete(classified.uri);
+ 				}
++				if (err instanceof SubscriptionCancelledError) {
++					this._logService.info(`[ProtocolServer] Subscribe cancelled by client: ${params.channel}`);
++					throw err;
++				}
+ 				if (err instanceof ProtocolError) {
+ 					throw err;
+ 				}
+diff --git a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+index c9ac211b8829a..4dc4ab7fb311b 100644
+--- a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
++++ b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+@@ -22,7 +22,7 @@ import type { AutomationCapabilities, Implementation } from '../../common/state/
+ import type { FetchAutomationRunsParams, FetchAutomationRunsResult, ListAutomationTriggerDefinitionsParams, ListAutomationTriggerDefinitionsResult, RunAutomationParams, RunAutomationResult } from '../../common/state/protocol/channels-automation/commands.js';
+ import { ActionType, type ActionEnvelope, type ChatAction, type ClientAnnotationsAction, type ClientAutomationAction, type ClientAutomationRunAction, type ClientChangesetAction, type IRootConfigChangedAction, type ProgressParams, type SessionAction, type TerminalAction } from '../../common/state/sessionActions.js';
+ import { PROTOCOL_VERSION } from '../../common/state/protocol/version/registry.js';
+-import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, JSON_RPC_INTERNAL_ERROR, JsonRpcErrorCodes, ProtocolError, AhpErrorCodes, AHP_UNSUPPORTED_PROTOCOL_VERSION, AHP_SESSION_NOT_FOUND, type AhpNotification, type InitializeResult, type ProtocolMessage, type ReconnectResult, type ResourceListResult, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot, type SubscribeResult } from '../../common/state/sessionProtocol.js';
++import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, JSON_RPC_INTERNAL_ERROR, JsonRpcErrorCodes, ProtocolError, SubscriptionCancelledError, AhpErrorCodes, AHP_UNSUPPORTED_PROTOCOL_VERSION, AHP_SESSION_NOT_FOUND, type AhpNotification, type InitializeResult, type ProtocolMessage, type ReconnectResult, type ResourceListResult, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot, type SubscribeResult } from '../../common/state/sessionProtocol.js';
+ import { AUTOMATION_CATALOG_URI, MessageKind, ResponsePartKind, SessionStatus, ChangesetStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, buildChatUri, buildDefaultChatUri, readSessionExternal, readSessionWorkspaceless, withSessionExternal, withSessionWorkspaceless, type SessionSummary } from '../../common/state/sessionState.js';
+ import type { SessionAddedParams, SessionSummaryChangedParams } from '../../common/state/protocol/notifications.js';
+ import type { IProtocolServer, IProtocolTransport } from '../../common/state/sessionTransport.js';
+@@ -88,10 +88,15 @@ class MockProtocolServer implements IProtocolServer {
+ 
+ class CountingLogService extends NullLogService {
+ 	errorCount = 0;
++	readonly infoMessages: string[] = [];
+ 
+ 	override error(_message: string, ..._args: unknown[]): void {
+ 		this.errorCount++;
+ 	}
++
++	override info(message: string, ..._args: unknown[]): void {
++		this.infoMessages.push(message);
++	}
+ }
+ 
+ class FailingAgentHostFileSystemProvider extends AgentHostFileSystemProvider {
+@@ -239,7 +244,7 @@ class MockAgentService implements IAgentService {
+ 		this.subscribeCalls.push({ resource: resource.toString(), clientId });
+ 		await (this.subscribeBarriers.get(resource.toString())?.p ?? this.subscribeBarrier?.p);
+ 		if (isActive && !isActive()) {
+-			throw new Error(`Subscription cancelled: ${resource.toString()}`);
++			throw new SubscriptionCancelledError(resource.toString());
+ 		}
+ 		const snapshot = this._stateManager.getSnapshot(resource.toString());
+ 		if (!snapshot) {
+@@ -1143,6 +1148,56 @@ suite('ProtocolServerHandler', () => {
+ 		assert.strictEqual(actionsWhilePending.length, 1);
+ 	});
+ 
++	test('cancelled subscribe reports cancellation, not a missing resource', async () => {
++		stateManager.createSession(makeSessionSummary());
++		agentService.subscribeBarrier = new DeferredPromise<void>();
++		const transport = connectClient('client-cancelled-subscribe');
++		transport.sent.length = 0;
++		logService.infoMessages.length = 0;
++		const responsePromise = waitForResponse(transport, 2);
++
++		transport.simulateMessage(request(2, 'subscribe', { channel: sessionUri }));
++		await Promise.resolve();
++		transport.simulateMessage(notification('unsubscribe', { channel: sessionUri }));
++		await agentService.subscribeBarrier.complete();
++		const resp = await responsePromise as { error?: { code: number; message: string } };
++
++		assert.deepStrictEqual({
++			code: resp.error?.code,
++			message: resp.error?.message,
++			errorCount: logService.errorCount,
++			infoMessages: logService.infoMessages,
++		}, {
++			code: AHP_SESSION_NOT_FOUND,
++			message: `Subscription cancelled: ${sessionUri}`,
++			errorCount: 0,
++			infoMessages: [`[ProtocolServer] Subscribe cancelled by client: ${sessionUri}`],
++		});
++	});
++
++	test('subscribe to an unknown resource still fails as a missing resource', async () => {
++		const missingUri = 'copilot:/missing-session';
++		const transport = connectClient('client-unknown-subscribe');
++		transport.sent.length = 0;
++		logService.infoMessages.length = 0;
++		const responsePromise = waitForResponse(transport, 2);
++
++		transport.simulateMessage(request(2, 'subscribe', { channel: missingUri }));
++		const resp = await responsePromise as { error?: { code: number; message: string } };
++
++		assert.deepStrictEqual({
++			code: resp.error?.code,
++			message: resp.error?.message,
++			errorCount: logService.errorCount,
++			infoMessages: logService.infoMessages,
++		}, {
++			code: AHP_SESSION_NOT_FOUND,
++			message: `Resource not found: ${missingUri}`,
++			errorCount: 1,
++			infoMessages: [],
++		});
++	});
++
+ 	test('cancelled subscribe does not clean up a newer subscribe from the same client', async () => {
+ 		stateManager.createSession(makeSessionSummary());
+ 		agentService.subscribeBarrier = new DeferredPromise<void>();
+
+From 58cf74cc77539525892ec523f54cabc5cec6d85b Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 14:23:50 -0400
+Subject: [PATCH 2/3] agentHost: keep the cancelled-subscribe log accurate
+ under host disposal
+
+`AgentService.subscribe` raises `SubscriptionCancelledError` when its store is
+disposed as well as when the caller's subscription goes inactive, so naming the
+client in the log made the same kind of unsupported claim this branch exists to
+remove. Drop the attribution and log the neutral fact. The three handler-side
+throw sites are client driven, but the one log line sees all five, so neutral
+wording is the only phrasing accurate at every one of them.
+
+Cover the reported production path at the service level too: a subscribe parked
+on a pending subagent chat, cancelled before that chat materializes. The handler
+test reaches that throw site through a mock, so it had no direct coverage.
+---
+ .../agentHost/node/protocolServerHandler.ts   |  2 +-
+ .../agentHost/test/node/agentService.test.ts  | 31 ++++++++++++++++++-
+ .../test/node/protocolServerHandler.test.ts   |  2 +-
+ 3 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/protocolServerHandler.ts b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+index 232ad4138dc0a..2489a7dd3d43d 100644
+--- a/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -1440,7 +1440,7 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+ 					client.subscriptions.delete(classified.uri);
+ 				}
+ 				if (err instanceof SubscriptionCancelledError) {
+-					this._logService.info(`[ProtocolServer] Subscribe cancelled by client: ${params.channel}`);
++					this._logService.info(`[ProtocolServer] Subscribe cancelled: ${params.channel}`);
+ 					throw err;
+ 				}
+ 				if (err instanceof ProtocolError) {
+diff --git a/src/vs/platform/agentHost/test/node/agentService.test.ts b/src/vs/platform/agentHost/test/node/agentService.test.ts
+index 57b83d6f59e4e..f266e2624fe41 100644
+--- a/src/vs/platform/agentHost/test/node/agentService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentService.test.ts
+@@ -59,7 +59,7 @@ import { buildGitBlobUri } from '../../node/gitDiffContent.js';
+ import { buildBranchChangesetUri, buildSessionChangesetUri, buildUncommittedChangesetUri } from '../../common/changesetUri.js';
+ import { type ICopilotApiService, type ICopilotApiServiceRequestOptions, type ICopilotUtilityChatCompletionRequest } from '../../node/shared/copilotApiService.js';
+ import { getWorktreesRoot, WorktreeIsolation, WORKTREE_META_REPOSITORY_ROOT } from '../../node/shared/worktreeIsolation.js';
+-import { AhpErrorCodes, AHP_SESSION_NOT_FOUND, ContentEncoding, JSON_RPC_INTERNAL_ERROR, ProtocolError } from '../../common/state/sessionProtocol.js';
++import { AhpErrorCodes, AHP_SESSION_NOT_FOUND, ContentEncoding, JSON_RPC_INTERNAL_ERROR, ProtocolError, SubscriptionCancelledError } from '../../common/state/sessionProtocol.js';
+ import type { IAgentServerToolHost } from '../../common/agentServerTools.js';
+ import { SessionServerToolName } from '../../common/serverToolNames.js';
+ import { buildMcpChannel } from '../../node/shared/mcpCustomizationController.js';
+@@ -11335,6 +11335,35 @@ suite('AgentService (node dispatcher)', () => {
+ 			assert.strictEqual(snapshot.resource, subagentUri);
+ 		});
+ 
++		test('a subscription cancelled while its subagent chat is still pending rejects as cancelled', async () => {
++			registerTestAgentProvider(service, copilotAgent);
++			const session = await service.createSession({ provider: 'copilot' });
++			const parentChat = buildDefaultChatUri(session.toString());
++			startParentTurn(session, 'turn-1');
++
++			copilotAgent.fireProgress({
++				kind: 'action', resource: URI.parse(parentChat),
++				action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 'tc-sub', toolName: 'task', displayName: 'Task', contributor: undefined, _meta: { toolKind: 'subagent', language: undefined } },
++			});
++			copilotAgent.fireProgress({
++				kind: 'action', resource: URI.parse(parentChat),
++				action: { type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 'tc-sub', invocationMessage: 'Delegating...', toolInput: undefined, confirmed: ToolCallConfirmationReason.NotNeeded },
++			});
++
++			const subagentUri = buildSubagentChatUri(session.toString(), 'tc-sub');
++			let isActive = true;
++			const subscribePromise = service.subscribe(URI.parse(subagentUri), 'client-cancelled', () => isActive);
++			let settled = false;
++			void subscribePromise.then(() => { settled = true; }, () => { settled = true; });
++			await timeout(0);
++			assert.strictEqual(settled, false, 'subscribe should be parked on the pending subagent chat, past the release-wait check');
++
++			isActive = false;
++			copilotAgent.fireProgress({ kind: 'subagent_started', chat: URI.parse(parentChat), toolCallId: 'tc-sub', agentName: 'explore', agentDisplayName: 'Explore', agentDescription: 'Explores' });
++
++			await assert.rejects(subscribePromise, (err: unknown) => err instanceof SubscriptionCancelledError);
++		});
++
+ 		test('subscribe to an announced subagent chat that never spawns eventually rejects instead of hanging', () => {
+ 			return runWithFakedTimers({ useFakeTimers: true }, async () => {
+ 				registerTestAgentProvider(service, copilotAgent);
+diff --git a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+index 4dc4ab7fb311b..34ace72519850 100644
+--- a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
++++ b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+@@ -1171,7 +1171,7 @@ suite('ProtocolServerHandler', () => {
+ 			code: AHP_SESSION_NOT_FOUND,
+ 			message: `Subscription cancelled: ${sessionUri}`,
+ 			errorCount: 0,
+-			infoMessages: [`[ProtocolServer] Subscribe cancelled by client: ${sessionUri}`],
++			infoMessages: [`[ProtocolServer] Subscribe cancelled: ${sessionUri}`],
+ 		});
+ 	});
+ 
+
+From 18cf909f1fe691c9ff71d8c2b9161272bcfd7526 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 2 Sep 2026 14:53:51 -0400
+Subject: [PATCH 3/3] agentHost: report a cancelled subscribe before an unknown
+ resource
+
+The unknown-resource check ran first, so a subscribe that was both cancelled and
+whose resource never materialized still reported `Cannot subscribe to unknown
+resource` at error level. The pending subagent chat path reaches that state
+whenever its wait times out after the client already released the subscription,
+which is the misleading message this branch exists to remove.
+
+Test cancellation first. A live subscription is unaffected: with the caller
+still active and the store not disposed the cancellation check is false and
+control falls through to the same unknown-resource throw as before, so only the
+cancelled-and-missing case changes.
+---
+ .../platform/agentHost/node/agentService.ts   |  6 +--
+ .../agentHost/test/node/agentService.test.ts  | 53 +++++++++++++++++++
+ 2 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/agentService.ts b/src/vs/platform/agentHost/node/agentService.ts
+index 72e05e22070de..24ca87f1d1fb2 100644
+--- a/src/vs/platform/agentHost/node/agentService.ts
++++ b/src/vs/platform/agentHost/node/agentService.ts
+@@ -4243,12 +4243,12 @@ export class AgentService extends Disposable implements IAgentService {
+ 					}
+ 				}
+ 			}
+-			if (!snapshot) {
+-				throw new Error(`Cannot subscribe to unknown resource: ${resourceStr}`);
+-			}
+ 			if (this._store.isDisposed || (isActive && !isActive())) {
+ 				throw new SubscriptionCancelledError(resourceStr);
+ 			}
++			if (!snapshot) {
++				throw new Error(`Cannot subscribe to unknown resource: ${resourceStr}`);
++			}
+ 			this._sessionResidency.touch(resource);
+ 			void this._sessionResidency.reconcile();
+ 
+diff --git a/src/vs/platform/agentHost/test/node/agentService.test.ts b/src/vs/platform/agentHost/test/node/agentService.test.ts
+index f266e2624fe41..7b1b245b09e2d 100644
+--- a/src/vs/platform/agentHost/test/node/agentService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentService.test.ts
+@@ -11388,6 +11388,59 @@ suite('AgentService (node dispatcher)', () => {
+ 				await assert.rejects(subscribePromise, /Cannot subscribe to unknown resource/);
+ 			});
+ 		});
++
++		test('a cancelled subscribe whose subagent chat never materializes reports cancellation, not an unknown resource', () => {
++			return runWithFakedTimers({ useFakeTimers: true }, async () => {
++				registerTestAgentProvider(service, copilotAgent);
++				const session = await service.createSession({ provider: 'copilot' });
++				const parentChat = buildDefaultChatUri(session.toString());
++				startParentTurn(session, 'turn-1');
++
++				copilotAgent.fireProgress({
++					kind: 'action', resource: URI.parse(parentChat),
++					action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 'tc-sub', toolName: 'task', displayName: 'Task', contributor: undefined, _meta: { toolKind: 'subagent', language: undefined } },
++				});
++				copilotAgent.fireProgress({
++					kind: 'action', resource: URI.parse(parentChat),
++					action: { type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 'tc-sub', invocationMessage: 'Delegating...', toolInput: undefined, confirmed: ToolCallConfirmationReason.NotNeeded },
++				});
++
++				const subagentUri = buildSubagentChatUri(session.toString(), 'tc-sub');
++				let isActive = true;
++				const subscribePromise = service.subscribe(URI.parse(subagentUri), 'client-cancelled', () => isActive);
++				let settled = false;
++				void subscribePromise.then(() => { settled = true; }, () => { settled = true; });
++				await timeout(0);
++				assert.strictEqual(settled, false, 'subscribe should be parked on the pending subagent chat that never spawns');
++
++				isActive = false;
++				await assert.rejects(subscribePromise, (err: unknown) => err instanceof SubscriptionCancelledError);
++			});
++		});
++
++		test('a live subscription whose subagent chat never materializes still reports an unknown resource', () => {
++			return runWithFakedTimers({ useFakeTimers: true }, async () => {
++				registerTestAgentProvider(service, copilotAgent);
++				const session = await service.createSession({ provider: 'copilot' });
++				const parentChat = buildDefaultChatUri(session.toString());
++				startParentTurn(session, 'turn-1');
++
++				copilotAgent.fireProgress({
++					kind: 'action', resource: URI.parse(parentChat),
++					action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 'tc-sub', toolName: 'task', displayName: 'Task', contributor: undefined, _meta: { toolKind: 'subagent', language: undefined } },
++				});
++				copilotAgent.fireProgress({
++					kind: 'action', resource: URI.parse(parentChat),
++					action: { type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 'tc-sub', invocationMessage: 'Delegating...', toolInput: undefined, confirmed: ToolCallConfirmationReason.NotNeeded },
++				});
++
++				const subagentUri = buildSubagentChatUri(session.toString(), 'tc-sub');
++				await assert.rejects(
++					service.subscribe(URI.parse(subagentUri), 'client-live', () => true),
++					/Cannot subscribe to unknown resource/,
++				);
++			});
++		});
+ 	});
+ 
+ 	// ---- peer-chat catalog persistence (B2: orchestrator-owned) ---------

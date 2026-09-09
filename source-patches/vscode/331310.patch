@@ -1,0 +1,372 @@
+From cba4995ea4c21673afc3b873779f1d6a5fa03e69 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 16:25:10 -0400
+Subject: [PATCH 1/5] Complete the response for the turn that ended
+
+isCompleteObs lives on the chat session, so both turn-end paths complete
+whichever response is current rather than the one belonging to the turn that
+ended. When two turns overlap, the outgoing turn closes the incoming turn's
+response and every later progress batch is dropped into it, leaving the turn
+rendered empty with no stop button.
+
+Measured against a dev container: with a text-only turn the preempted turn
+ends ~500ms before the next turn's request is created and everything renders,
+but a turn ending tool calls trails it by ~5ms and sixteen progress batches
+were discarded.
+
+The response now records the turn that claims it, and an end signal from any
+other turn is ignored. A response nothing has claimed is still completed by
+whichever turn ends, so sequential turns are unchanged.
+
+The rule is extracted as a predicate so it can be tested without standing up
+a chat session, as unwrapSessionLoadErrorMessage in the same file is.
+---
+ .../agentHost/agentHostSessionHandler.ts      | 37 ++++++++++++++++++-
+ .../completionAppliesToResponse.test.ts       | 30 +++++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+ create mode 100644 src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 0e16beea20f14..9043102165881 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -602,6 +602,16 @@ function snapshotInvocationToAdopt(opts: IObserveTurnOptions, toolCallId: string
+ // Chat session
+ // =============================================================================
+ 
++/**
++ * Whether a turn ending should complete the response, given the turn that owns
++ * it. A response with no owner yet is completed by whichever turn ends, which
++ * is the ordinary sequential case; once a turn has claimed the response, only
++ * that turn may close it.
++ */
++export function completionAppliesToResponse(responseTurnId: string | undefined, endingTurnId: string): boolean {
++	return responseTurnId === undefined || responseTurnId === endingTurnId;
++}
++
+ class AgentHostChatSession extends Disposable implements IChatSession {
+ 	readonly progressObs = observableValue<IChatProgress[]>('agentHostProgress', []);
+ 	readonly isCompleteObs = observableValue<boolean>('agentHostComplete', true);
+@@ -690,6 +700,9 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 		return this._register(disposable);
+ 	}
+ 
++	/** The turn whose output the current response is rendering, once one claims it. */
++	private _responseTurnId: string | undefined;
++
+ 	/**
+ 	 * Appends new progress items to the observable. Used by the reconnection
+ 	 * flow to stream ongoing state changes into the chat UI.
+@@ -706,6 +719,25 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 		this.isCompleteObs.set(true, undefined);
+ 	}
+ 
++	/**
++	 * Marks the response as complete on behalf of `turnId`, ignoring the signal
++	 * when a later turn already owns the response.
++	 *
++	 * `isCompleteObs` belongs to the session, not to a turn, so a turn that ends
++	 * after its successor has started would otherwise close the successor's
++	 * response and every subsequent {@link appendProgress} would be dropped into
++	 * it. Turns are ordinarily sequential; they overlap when one turn is
++	 * preempted by another, and a turn ending tool calls can trail the next
++	 * turn's start by a few milliseconds.
++	 */
++	completeTurn(turnId: string): void {
++		if (!completionAppliesToResponse(this._responseTurnId, turnId)) {
++			this._logService.trace(`[AgentHost] ignoring turn ${turnId} completion; response belongs to ${this._responseTurnId}`);
++			return;
++		}
++		this.isCompleteObs.set(true, undefined);
++	}
++
+ 	/**
+ 	 * Called by the session handler when a server-initiated turn starts.
+ 	 * Resets the progress observable and signals listeners to create a new
+@@ -715,6 +747,7 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 	 */
+ 	startServerRequest(turnId: string, prompt: string, variableData?: IChatRequestVariableData, options?: IStartServerRequestOptions): void {
+ 		this._logService.info('[AgentHost] Server-initiated request started');
++		this._responseTurnId = turnId;
+ 		transaction(tx => {
+ 			this.progressObs.set([], tx);
+ 			this.isCompleteObs.set(false, tx);
+@@ -2701,7 +2734,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 			turnId,
+ 			sink: parts => chatSession.appendProgress(parts),
+ 			cancellationToken: cts.token,
+-			onTurnEnded: () => chatSession.isCompleteObs.set(true, undefined),
++			onTurnEnded: () => chatSession.completeTurn(turnId),
+ 		}));
+ 	}
+ 
+@@ -2847,7 +2880,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 				onTurnEnded: (lastTurn) => {
+ 					store.dispose();
+ 					this._clientDispatchedTurnIds.delete(turnId);
+-					this._activeSessions.get(request.sessionResource)?.isCompleteObs.set(true, undefined);
++					this._activeSessions.get(request.sessionResource)?.completeTurn(turnId);
+ 					resolve(lastTurn);
+ 				},
+ 				onFileEdits: (tc) => {
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+new file mode 100644
+index 0000000000000..937442284b59c
+--- /dev/null
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+@@ -0,0 +1,30 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
++import { completionAppliesToResponse } from '../../../browser/agentSessions/agentHost/agentHostSessionHandler.js';
++
++suite('completionAppliesToResponse', () => {
++
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('a turn ending closes the response it owns, and only that one', () => {
++		assert.deepStrictEqual({
++			// Sequential case: nothing has claimed the response, so the turn that
++			// ends completes it.
++			unclaimed: completionAppliesToResponse(undefined, 'turn-1'),
++			owner: completionAppliesToResponse('turn-2', 'turn-2'),
++			// A preempted turn ending after its successor started must not close
++			// the successor's response — every later progress batch would be
++			// dropped into a completed response and the turn would render empty.
++			predecessor: completionAppliesToResponse('turn-2', 'turn-1'),
++		}, {
++			unclaimed: true,
++			owner: true,
++			predecessor: false,
++		});
++	});
++});
+
+From 5c889591d4a3556655ad6db5b8937b484aa19081 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 16:42:30 -0400
+Subject: [PATCH 2/5] Release the claim when the response completes
+
+Review feedback: holding the claim past the response it describes would
+suppress every later completion. A client-dispatched turn never claims a
+response, so after one server-initiated turn finished, the next client turn's
+completion would be ignored and its response would stay open.
+
+Completing now releases the claim, so the next turn to claim or complete owns
+the response.
+---
+ .../agentSessions/agentHost/agentHostSessionHandler.ts   | 7 +++++++
+ .../agentSessions/completionAppliesToResponse.test.ts    | 9 +++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 9043102165881..04b3f4de763c1 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -716,6 +716,7 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 	 * Marks the active turn as complete.
+ 	 */
+ 	complete(): void {
++		this._responseTurnId = undefined;
+ 		this.isCompleteObs.set(true, undefined);
+ 	}
+ 
+@@ -729,12 +730,18 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 	 * it. Turns are ordinarily sequential; they overlap when one turn is
+ 	 * preempted by another, and a turn ending tool calls can trail the next
+ 	 * turn's start by a few milliseconds.
++	 *
++	 * Completing releases the claim, so the response a later turn renders into
++	 * is owned by whichever turn claims it next. Holding the claim past the
++	 * response it describes would suppress the completion of every subsequent
++	 * client-dispatched turn, which never claims one.
+ 	 */
+ 	completeTurn(turnId: string): void {
+ 		if (!completionAppliesToResponse(this._responseTurnId, turnId)) {
+ 			this._logService.trace(`[AgentHost] ignoring turn ${turnId} completion; response belongs to ${this._responseTurnId}`);
+ 			return;
+ 		}
++		this._responseTurnId = undefined;
+ 		this.isCompleteObs.set(true, undefined);
+ 	}
+ 
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+index 937442284b59c..0b2dd535806dc 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+@@ -27,4 +27,13 @@ suite('completionAppliesToResponse', () => {
+ 			predecessor: false,
+ 		});
+ 	});
++
++	test('a released claim lets the next turn complete its own response', () => {
++		// Completing releases the claim. A client-dispatched turn never claims
++		// one, so a claim held past its own response would suppress every
++		// later completion and leave the response open forever.
++		const afterRelease = completionAppliesToResponse(undefined, 'turn-3');
++
++		assert.strictEqual(afterRelease, true);
++	});
+ });
+
+From 2ff7e36366cd7eea4963c03b117df684b0f6b9bb Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 17 Aug 2026 20:45:21 -0400
+Subject: [PATCH 3/5] Scope the reconnect path's completion to its turn as well
+
+The reconnect path re-observes the active turn and called complete() when
+it ended, unconditionally. A turn preempted by a promoted one while the
+window was away would therefore close the promoted turn's response on the
+way out, and release its claim, which is the defect this change exists to
+prevent. It now completes on behalf of the turn it observed, like the other
+two sites.
+---
+ .../agentSessions/agentHost/agentHostSessionHandler.ts        | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 04b3f4de763c1..70b2d1c50006b 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -4842,7 +4842,9 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 			seedEmittedLengths,
+ 			initialResponsePartCount,
+ 			onTurnEnded: () => {
+-				chatSession.complete();
++				// The re-observed turn may have been superseded by a promoted one
++				// while this window was away; only the response's owner closes it.
++				chatSession.completeTurn(turnId);
+ 				reconnectStore.dispose();
+ 			},
+ 		}));
+
+From 93f42285d03df2f7f21d28630bdcabf069c7042a Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:54:33 -0400
+Subject: [PATCH 4/5] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ .../agentHost/agentHostSessionHandler.ts      | 25 +++++--------------
+ .../completionAppliesToResponse.test.ts       | 11 +++-----
+ 2 files changed, 9 insertions(+), 27 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 70b2d1c50006b..00d5f3d9740f7 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -604,9 +604,8 @@ function snapshotInvocationToAdopt(opts: IObserveTurnOptions, toolCallId: string
+ 
+ /**
+  * Whether a turn ending should complete the response, given the turn that owns
+- * it. A response with no owner yet is completed by whichever turn ends, which
+- * is the ordinary sequential case; once a turn has claimed the response, only
+- * that turn may close it.
++ * it. An unclaimed response is completed by whichever turn ends; once claimed,
++ * only that turn may close it.
+  */
+ export function completionAppliesToResponse(responseTurnId: string | undefined, endingTurnId: string): boolean {
+ 	return responseTurnId === undefined || responseTurnId === endingTurnId;
+@@ -721,20 +720,9 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 	}
+ 
+ 	/**
+-	 * Marks the response as complete on behalf of `turnId`, ignoring the signal
+-	 * when a later turn already owns the response.
+-	 *
+-	 * `isCompleteObs` belongs to the session, not to a turn, so a turn that ends
+-	 * after its successor has started would otherwise close the successor's
+-	 * response and every subsequent {@link appendProgress} would be dropped into
+-	 * it. Turns are ordinarily sequential; they overlap when one turn is
+-	 * preempted by another, and a turn ending tool calls can trail the next
+-	 * turn's start by a few milliseconds.
+-	 *
+-	 * Completing releases the claim, so the response a later turn renders into
+-	 * is owned by whichever turn claims it next. Holding the claim past the
+-	 * response it describes would suppress the completion of every subsequent
+-	 * client-dispatched turn, which never claims one.
++	 * Marks the response complete on behalf of `turnId`, ignoring the signal when a
++	 * later turn already owns it. `isCompleteObs` is session-scoped, so a turn
++	 * ending after its successor started would otherwise close the wrong response.
+ 	 */
+ 	completeTurn(turnId: string): void {
+ 		if (!completionAppliesToResponse(this._responseTurnId, turnId)) {
+@@ -4842,8 +4830,7 @@ export class AgentHostSessionHandler extends Disposable implements IChatSessionC
+ 			seedEmittedLengths,
+ 			initialResponsePartCount,
+ 			onTurnEnded: () => {
+-				// The re-observed turn may have been superseded by a promoted one
+-				// while this window was away; only the response's owner closes it.
++				// Only the response's owner closes it; this turn may have been superseded while away.
+ 				chatSession.completeTurn(turnId);
+ 				reconnectStore.dispose();
+ 			},
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+index 0b2dd535806dc..d4ad439b370db 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/completionAppliesToResponse.test.ts
+@@ -13,13 +13,10 @@ suite('completionAppliesToResponse', () => {
+ 
+ 	test('a turn ending closes the response it owns, and only that one', () => {
+ 		assert.deepStrictEqual({
+-			// Sequential case: nothing has claimed the response, so the turn that
+-			// ends completes it.
++			// Sequential case: nothing has claimed the response.
+ 			unclaimed: completionAppliesToResponse(undefined, 'turn-1'),
+ 			owner: completionAppliesToResponse('turn-2', 'turn-2'),
+-			// A preempted turn ending after its successor started must not close
+-			// the successor's response — every later progress batch would be
+-			// dropped into a completed response and the turn would render empty.
++			// A preempted turn must not close its successor's response.
+ 			predecessor: completionAppliesToResponse('turn-2', 'turn-1'),
+ 		}, {
+ 			unclaimed: true,
+@@ -29,9 +26,7 @@ suite('completionAppliesToResponse', () => {
+ 	});
+ 
+ 	test('a released claim lets the next turn complete its own response', () => {
+-		// Completing releases the claim. A client-dispatched turn never claims
+-		// one, so a claim held past its own response would suppress every
+-		// later completion and leave the response open forever.
++		// Completing releases the claim; a client-dispatched turn never claims one.
+ 		const afterRelease = completionAppliesToResponse(undefined, 'turn-3');
+ 
+ 		assert.strictEqual(afterRelease, true);
+
+From df5bc1552234b762e5f4e61cf00a3792ca8b756d Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 21:22:43 -0400
+Subject: [PATCH 5/5] Remove the response completion this turn scoping orphaned
+
+`completeTurn` replaced the only caller of `complete`, and the class is
+not exported and does not carry the method on `IChatSession`, so nothing
+can reach it. The `_responseTurnId` reset added inside it was already
+unreachable.
+---
+ .../agentSessions/agentHost/agentHostSessionHandler.ts     | 7 -------
+ 1 file changed, 7 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+index 00d5f3d9740f7..2ed00929bb970 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts
+@@ -711,13 +711,6 @@ class AgentHostChatSession extends Disposable implements IChatSession {
+ 		this.progressObs.set([...current, ...items], undefined);
+ 	}
+ 
+-	/**
+-	 * Marks the active turn as complete.
+-	 */
+-	complete(): void {
+-		this._responseTurnId = undefined;
+-		this.isCompleteObs.set(true, undefined);
+-	}
+ 
+ 	/**
+ 	 * Marks the response complete on behalf of `turnId`, ignoring the signal when a

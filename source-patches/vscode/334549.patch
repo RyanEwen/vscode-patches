@@ -1,0 +1,136 @@
+From ee80c2f1033cba367803826467250ebd1d6c2c99 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 4 Sep 2026 12:29:50 -0400
+Subject: [PATCH 1/2] Do not mark a denied subagent tool call as a subagent
+
+Subagent-ness is taken from the tool name, so a denied `Agent` or `Task`
+call still has a subagent marker attached to its result. On restore that
+marker registers a subagent chat whose transcript can never exist, because
+nothing was ever spawned.
+
+`is_error` is already computed immediately above the push and was simply not
+consulted. Successful calls are unaffected.
+---
+ .../node/claude/claudeReplayMapper.ts         |  3 ++-
+ .../test/node/claudeReplayMapper.test.ts      | 22 +++++++++++++++++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+index 5522564e786fd..1513859996b52 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+@@ -436,7 +436,8 @@ class ReplayBuilder {
+ 			.filter((c): c is { type: ToolResultContentType.Text; text: string } => c.type === ToolResultContentType.Text)
+ 			.map(c => c.text)
+ 			.join('\n');
+-		if (isSubagent) {
++		// A denied or failed call spawned nothing, so it has no transcript to link.
++		if (isSubagent && !isError) {
+ 			content.push({
+ 				type: ToolResultContentType.Subagent,
+ 				resource: buildSubagentSessionUri(this._session.toString(), previousState.toolCallId),
+diff --git a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+index 3cb068acebf8f..f1d78791f7672 100644
+--- a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+@@ -279,6 +279,28 @@ suite('claudeReplayMapper', () => {
+ 		}
+ 	});
+ 
++	test('Fixture 5c: a denied Agent tool_use produces no subagent marker', () => {
++		const messages: SessionMessage[] = [
++			makeUser('u1', 'spawn subagent'),
++			makeAssistantToolUse('a1', 'tu1', 'Agent', { description: 'do thing' }),
++			makeUserToolResult('synthetic1', 'tu1', 'auto mode cannot determine the safety of Agent right now', true),
++		];
++
++		const turns = mapSessionMessagesToTurns(messages, session, logService);
++
++		const toolCallPart = turns[0].responseParts.find(p => p.kind === ResponsePartKind.ToolCall);
++		assert.ok(toolCallPart && toolCallPart.kind === ResponsePartKind.ToolCall);
++		if (toolCallPart.kind === ResponsePartKind.ToolCall) {
++			assert.strictEqual(toolCallPart.toolCall._meta?.toolKind, 'subagent', 'the tool is still a subagent by name');
++			if (toolCallPart.toolCall.status === ToolCallStatus.Completed) {
++				assert.strictEqual(toolCallPart.toolCall.success, false);
++				const hasSubagentMarker = toolCallPart.toolCall.content?.some(c => c.type === ToolResultContentType.Subagent) ?? false;
++				assert.strictEqual(hasSubagentMarker, false, 'a denied call spawned nothing, so it has no transcript to link');
++			} else {
++				assert.fail(`expected Completed status, got ${toolCallPart.toolCall.status}`);
++			}
++		}
++	});
+ 	test('Fixture 6: tail Turn with orphan tool_use is Cancelled', () => {
+ 		const messages: SessionMessage[] = [
+ 			makeUser('u1', 'do work'),
+
+From 19ab57cd67cdefe3f2d3f6e3d1e48bece9d62d02 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 4 Sep 2026 13:25:53 -0400
+Subject: [PATCH 2/2] Suppress the subagent marker only for a call that never
+ spawned
+
+`is_error` also covers a subagent that started and then failed, and those
+children have real transcripts. Keying on it alone hid every failed
+subagent on restore.
+
+The SDK stamps `agentId: <hex>` on the tool_result of a call that actually
+spawned, which is what `scanTranscriptForAgentIds` already keys on, so a
+pre-spawn denial is the case with an error and no agentId.
+---
+ .../node/claude/claudeReplayMapper.ts          |  6 ++++--
+ .../test/node/claudeReplayMapper.test.ts       | 18 ++++++++++++++++++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+index 1513859996b52..07b660b6a1407 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeReplayMapper.ts
+@@ -22,6 +22,7 @@ import {
+ 	type ToolResultContent,
+ 	type Turn,
+ } from '../../common/state/protocol/state.js';
++import { SUBAGENT_ID_SUFFIX_REGEX } from './claudeSubagentRegistry.js';
+ import { buildSubagentSessionUri } from '../../common/state/sessionState.js';
+ import { readToolCallMeta } from '../../common/meta/agentToolCallMeta.js';
+ import { formatGenericToolInput } from '../../common/streamingToolCallDisplay.js';
+@@ -436,8 +437,9 @@ class ReplayBuilder {
+ 			.filter((c): c is { type: ToolResultContentType.Text; text: string } => c.type === ToolResultContentType.Text)
+ 			.map(c => c.text)
+ 			.join('\n');
+-		// A denied or failed call spawned nothing, so it has no transcript to link.
+-		if (isSubagent && !isError) {
++		// The SDK stamps an agentId only once a subagent exists; a denial never gets one.
++		const spawned = !isError || SUBAGENT_ID_SUFFIX_REGEX.test(resultText);
++		if (isSubagent && spawned) {
+ 			content.push({
+ 				type: ToolResultContentType.Subagent,
+ 				resource: buildSubagentSessionUri(this._session.toString(), previousState.toolCallId),
+diff --git a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+index f1d78791f7672..bb3cc867711f7 100644
+--- a/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeReplayMapper.test.ts
+@@ -301,6 +301,24 @@ suite('claudeReplayMapper', () => {
+ 			}
+ 		}
+ 	});
++
++	test('Fixture 5d: an Agent that spawned and then failed keeps its subagent marker', () => {
++		const messages: SessionMessage[] = [
++			makeUser('u1', 'spawn subagent'),
++			makeAssistantToolUse('a1', 'tu1', 'Agent', { description: 'do thing' }),
++			makeUserToolResult('synthetic1', 'tu1', 'agentId: a1b2c3d4 (use SendMessage) the subagent ran and then failed', true),
++		];
++
++		const turns = mapSessionMessagesToTurns(messages, session, logService);
++
++		const toolCallPart = turns[0].responseParts.find(p => p.kind === ResponsePartKind.ToolCall);
++		assert.ok(toolCallPart && toolCallPart.kind === ResponsePartKind.ToolCall);
++		if (toolCallPart.kind === ResponsePartKind.ToolCall && toolCallPart.toolCall.status === ToolCallStatus.Completed) {
++			assert.strictEqual(toolCallPart.toolCall.success, false);
++			const hasSubagentMarker = toolCallPart.toolCall.content?.some(c => c.type === ToolResultContentType.Subagent) ?? false;
++			assert.strictEqual(hasSubagentMarker, true, 'a subagent that ran still has a transcript, even when it failed');
++		}
++	});
+ 	test('Fixture 6: tail Turn with orphan tool_use is Cancelled', () => {
+ 		const messages: SessionMessage[] = [
+ 			makeUser('u1', 'do work'),

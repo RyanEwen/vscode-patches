@@ -1,0 +1,106 @@
+From d2560176e587c295b4c5650270b9e95ecd9df83f Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Sat, 22 Aug 2026 10:32:33 -0400
+Subject: [PATCH] agentHost: retire the optimistic turn start on the first
+ backend action
+
+The client holds its own chat/turnStarted in _pendingActions until the
+backend echoes it with the originating clientSeq, which the agent host
+does not send. The start stays pending for the whole turn, and
+_recomputeOptimistic replays it over confirmed state on every action,
+resetting activeTurn to a fresh empty turn. The UI reads the optimistic
+state, so a streaming response renders nothing until completion moves
+the turn into turns[] and the whole reply appears at once.
+
+Promote the pending start on the first backend action naming the turn
+rather than only on a terminal one.
+---
+ .../common/state/agentSubscription.ts         | 18 ++++++-----
+ .../test/common/agentSubscription.test.ts     | 31 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/state/agentSubscription.ts b/src/vs/platform/agentHost/common/state/agentSubscription.ts
+index 0ae471a3f5662..9c25fa7178fda 100644
+--- a/src/vs/platform/agentHost/common/state/agentSubscription.ts
++++ b/src/vs/platform/agentHost/common/state/agentSubscription.ts
+@@ -482,28 +482,30 @@ export class ChatStateSubscription extends BaseAgentSubscription<ChatState> {
+ 				this._confirmedApply(envelope.action);
+ 			}
+ 		} else if (!envelope.rejectionReason) {
+-			this._promotePendingTurnStartIfTerminal(envelope.action);
++			this._promotePendingTurnStart(envelope.action);
+ 			this._confirmedApply(envelope.action);
+ 		}
+ 		this._recomputeOptimistic();
+ 	}
+ 
+-	private _promotePendingTurnStartIfTerminal(action: StateAction): void {
+-		// A backend-originated terminal turn action may arrive without the clientSeq
+-		// that would normally confirm our optimistic turn start. Promote that start
+-		// first so the terminal action can close it instead of leaving it pending.
++	/**
++	 * Confirms an optimistic turn start from the first backend action naming its
++	 * turn, since a backend-originated action may arrive without our clientSeq.
++	 */
++	private _promotePendingTurnStart(action: StateAction): void {
+ 		if (!isChatAction(action)) {
+ 			return;
+ 		}
+-		if (action.type !== ActionType.ChatTurnComplete && action.type !== ActionType.ChatTurnCancelled && action.type !== ActionType.ChatError) {
++		const turnId = 'turnId' in action ? action.turnId : undefined;
++		if (turnId === undefined) {
+ 			return;
+ 		}
+-		const index = this._pendingActions.findIndex(p => p.action.type === ActionType.ChatTurnStarted && p.action.turnId === action.turnId);
++		const index = this._pendingActions.findIndex(p => p.action.type === ActionType.ChatTurnStarted && p.action.turnId === turnId);
+ 		if (index === -1) {
+ 			return;
+ 		}
+ 		const [{ action: pendingAction }] = this._pendingActions.splice(index, 1);
+-		if (this._confirmedState && (!this._confirmedState.activeTurn || this._confirmedState.activeTurn.id !== action.turnId)) {
++		if (this._confirmedState && (!this._confirmedState.activeTurn || this._confirmedState.activeTurn.id !== turnId)) {
+ 			this._confirmedState = this._applyReducer(this._confirmedState, pendingAction);
+ 		}
+ 	}
+diff --git a/src/vs/platform/agentHost/test/common/agentSubscription.test.ts b/src/vs/platform/agentHost/test/common/agentSubscription.test.ts
+index c7b4b5b9fa4f8..4109d382728d6 100644
+--- a/src/vs/platform/agentHost/test/common/agentSubscription.test.ts
++++ b/src/vs/platform/agentHost/test/common/agentSubscription.test.ts
+@@ -730,6 +730,37 @@ suite('ChatStateSubscription', () => {
+ 			turns: [{ id: 'turn-1', state: TurnState.Complete }],
+ 		});
+ 	});
++
++	test('streamed response parts stay visible while the optimistic turn start is pending', () => {
++		const sub = createSub();
++		sub.handleSnapshot(makeChatState(chatUri), 0);
++
++		sub.applyOptimistic({
++			type: ActionType.ChatTurnStarted,
++			turnId: 'turn-1',
++			startedAt: '2025-01-01T00:00:00.000Z',
++			message: { text: 'hello', origin: { kind: MessageKind.User } },
++		});
++
++		sub.receiveEnvelope(makeEnvelope(
++			{
++				type: ActionType.ChatResponsePart,
++				turnId: 'turn-1',
++				part: { kind: ResponsePartKind.Markdown, id: 'part-1', content: '' },
++			},
++			1,
++			undefined,
++		));
++		sub.receiveEnvelope(makeEnvelope(
++			{ type: ActionType.ChatDelta, turnId: 'turn-1', partId: 'part-1', content: 'streamed' },
++			2,
++			undefined,
++		));
++
++		assert.deepStrictEqual((sub.value as ChatState | undefined)?.activeTurn?.responseParts, [
++			{ kind: ResponsePartKind.Markdown, id: 'part-1', content: 'streamed' },
++		]);
++	});
+ });
+ 
+ // TerminalStateSubscription

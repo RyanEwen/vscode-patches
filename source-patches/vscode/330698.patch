@@ -1,0 +1,292 @@
+From 49384545092781e266dfc8c6ae574291b65cb89f Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 13:37:42 -0400
+Subject: [PATCH 1/4] Delete the Claude transcript when a chat is disposed
+
+Disposing a chat tore down its live SDK session and dropped its backing,
+but left the transcript on disk. Nothing ever removed it, so a session
+the user deleted reappeared the next time the list was built.
+
+Delete the SDK session as part of dispose, which is what the Copilot
+agent already does. `truncateChat` makes this exact call, so the
+capability is not new.
+
+This is safe because every `disposeChat` caller means to destroy the
+chat: rollback of a half-created chat or session, session teardown, and
+an explicit chat delete. Teardown that must resume later goes through
+`releaseChat`, which is untouched.
+
+A transcript that cannot be removed is logged and swallowed rather than
+failing the dispose: the chat is already out of the catalog by that
+point, so rejecting would strand the caller with a chat it cannot
+address.
+---
+ .../agentHost/node/claude/claudeAgent.ts      | 26 +++++++++++++------
+ .../agentHost/test/node/claudeAgent.test.ts   | 26 +++++++++++++++++++
+ 2 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index 6c28556a625a7..b12fce3fee433 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -1612,11 +1612,14 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 	 * it waits for any in-flight {@link _resolveOrResumeChatSessionLocked} or
+ 	 * {@link sendMessage} to finish before tearing down — prevents
+ 	 * use-after-dispose if a send is concurrently in progress. The durable
+-	 * chat catalog is owned by the orchestrator now, so this only drops the
+-	 * live session and its provider backing data. There is no separate
+-	 * session-level finalization hook: the trace context keyed on the chat's
+-	 * own `resource` (the configuration scope, for a session's primary chat)
+-	 * is released right here, once, when that exact chat is disposed.
++	 * chat catalog is owned by the orchestrator now, so this drops the live
++	 * session, its provider backing data and the SDK transcript. There is no
++	 * separate session-level finalization hook: the trace context keyed on the
++	 * chat's own `resource` (the configuration scope, for a session's primary
++	 * chat) is released right here, once, when that exact chat is disposed.
++	 *
++	 * Deleting the transcript is safe because every caller means to destroy the
++	 * chat; teardown that must resume later goes through {@link _releaseChat}.
+ 	 */
+ 	private async _disposeChat(chat: URI, operationContext: URI | IAgentChatContext): Promise<void> {
+ 		const chatKey = chat.toString();
+@@ -1626,14 +1629,21 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 			if (target) {
+ 				await this._disposeLiveSession(target);
+ 			}
++			const sdkSessionId = this._chatBackings.get(chatKey)?.sdkSessionId;
+ 			this._chatBackings.delete(chatKey);
+ 			this._chatConfigScopes.delete(chatKey);
+ 			this._pruneActiveClientHandlesForChat(chat);
+ 			this._otelService.releaseSessionTraceContext(initialContext.resource.toString());
++			if (sdkSessionId !== undefined) {
++				try {
++					await this._sdkService.deleteSession(sdkSessionId);
++				} catch (err) {
++					// Best-effort: the chat is already gone from the catalog, so a
++					// stranded transcript must not fail the dispose.
++					this._logService.warn(`[Claude:${sdkSessionId}] Failed to delete the transcript on dispose`, err);
++				}
++			}
+ 		});
+-		// The Claude SDK exposes no delete-chat RPC, so the forked /
+-		// fresh transcript is left on disk; without a catalog entry it is never
+-		// resumed again.
+ 	}
+ 
+ 	private async _releaseChat(chat: URI, operationContext: URI | IAgentChatContext): Promise<void> {
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index aa093bd0ce65a..bd5d1e2e360c4 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -9427,6 +9427,32 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		});
+ 	});
+ 
++	test('disposeChat deletes the chat\'s SDK transcript; a failed delete still disposes', async () => {
++		const { agent, sdk } = createTestContext(disposables);
++		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
++
++		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
++		const kept = URI.parse(buildChatUri(created.session.toString(), 'chat-1'));
++		const stranded = URI.parse(buildChatUri(created.session.toString(), 'chat-2'));
++		const keptResult = await agent.chats.createChat(kept, created.session, { ...resolvedChatOptions() });
++		const strandedResult = await agent.chats.createChat(stranded, created.session, { ...resolvedChatOptions() });
++
++		await agent.chats.disposeChat(kept, chatContext(kept));
++
++		// The chat is out of the catalog by the time the SDK is asked, so a
++		// transcript that cannot be removed must not fail the dispose.
++		sdk.deleteSessionRejection = new Error('sdk unavailable');
++		await agent.chats.disposeChat(stranded, chatContext(stranded));
++
++		assert.deepStrictEqual({
++			deleted: sdk.deleteSessionCalls,
++			remaining: listAdditionalChats(agent, created.session),
++		}, {
++			deleted: [AgentSession.id(keptResult!.backingSession!), AgentSession.id(strandedResult!.backingSession!)],
++			remaining: [],
++		});
++	});
++
+ 	test('createChat resolves every chat the same way, whatever role the host gives it', async () => {
+ 		// One creation algorithm: the chat a session starts with and an
+ 		// additional chat are created by the same call with the same resolved
+
+From b23438e1a0091169713a299f9c8e4f492f46cbfc Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 14:26:34 -0400
+Subject: [PATCH 2/4] Skip transcript deletion for a provisional chat
+
+A provisional chat has an `sdkSessionId` but never reached the SDK, so
+there is no transcript to delete. Asking for one is not just a no-op: it
+awaits `_getSdk()`, which can trigger the multi-second SDK download that
+provisional creation exists to avoid, on a path as ordinary as rolling
+back a half-created chat.
+
+Skip the delete when the chat is not pipeline-ready, matching how
+`truncateChat` short-circuits the same case, and read that flag before
+the live session is torn down since teardown clears the pipeline.
+
+Observed in practice as repeated "Session <id> not found in any project
+directory" warnings whenever the GC disposed an empty unsubscribed
+session.
+---
+ .../platform/agentHost/node/claude/claudeAgent.ts  |  8 +++++++-
+ .../agentHost/test/node/claudeAgent.test.ts        | 14 +++++++++++++-
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index b12fce3fee433..db26cb72c8bc6 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -1620,16 +1620,22 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 	 *
+ 	 * Deleting the transcript is safe because every caller means to destroy the
+ 	 * chat; teardown that must resume later goes through {@link _releaseChat}.
++	 * A provisional chat is skipped: it never reached the SDK, so it has no
++	 * transcript, and asking to delete one would pull in the SDK that
++	 * provisional creation deliberately avoids.
+ 	 */
+ 	private async _disposeChat(chat: URI, operationContext: URI | IAgentChatContext): Promise<void> {
+ 		const chatKey = chat.toString();
+ 		const initialContext = this._resolveChatContext(chat, operationContext);
+ 		await this._sessionSequencer.queue(initialContext.sequencerKey, async () => {
+ 			const target = this._findChatByUri(chatKey);
++			// Read before tearing the live session down, since that clears the
++			// pipeline this asks about.
++			const isProvisional = target !== undefined && !target.isPipelineReady;
+ 			if (target) {
+ 				await this._disposeLiveSession(target);
+ 			}
+-			const sdkSessionId = this._chatBackings.get(chatKey)?.sdkSessionId;
++			const sdkSessionId = isProvisional ? undefined : this._chatBackings.get(chatKey)?.sdkSessionId;
+ 			this._chatBackings.delete(chatKey);
+ 			this._chatConfigScopes.delete(chatKey);
+ 			this._pruneActiveClientHandlesForChat(chat);
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index bd5d1e2e360c4..e8cdf0550e301 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -9427,17 +9427,29 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		});
+ 	});
+ 
+-	test('disposeChat deletes the chat\'s SDK transcript; a failed delete still disposes', async () => {
++	test('disposeChat deletes a materialized chat\'s SDK transcript, leaves a provisional chat alone, and survives a failed delete', async () => {
+ 		const { agent, sdk } = createTestContext(disposables);
+ 		await agent.authenticate(GITHUB_COPILOT_PROTECTED_RESOURCE.resource, 'tok');
+ 
+ 		const created = await createSession(agent, { workingDirectories: [URI.file('/work')] });
+ 		const kept = URI.parse(buildChatUri(created.session.toString(), 'chat-1'));
+ 		const stranded = URI.parse(buildChatUri(created.session.toString(), 'chat-2'));
++		const provisional = URI.parse(buildChatUri(created.session.toString(), 'chat-3'));
+ 		const keptResult = await agent.chats.createChat(kept, created.session, { ...resolvedChatOptions() });
+ 		const strandedResult = await agent.chats.createChat(stranded, created.session, { ...resolvedChatOptions() });
++		await agent.chats.createChat(provisional, created.session, { ...resolvedChatOptions() });
++
++		// Only a chat that reached the SDK has a transcript to delete, so
++		// materialize the two that are expected to be deleted and leave the third
++		// provisional.
++		for (const [chat, result] of [[kept, keptResult], [stranded, strandedResult]] as const) {
++			const sdkSessionId = AgentSession.id(result!.backingSession!);
++			sdk.nextQueryMessages = [makeSystemInitMessage(sdkSessionId), makeResultSuccess(sdkSessionId)];
++			await agent.chats.sendMessage(chat, 'hi', undefined, undefined, 'turn-1', undefined, undefined, chatContext(chat));
++		}
+ 
+ 		await agent.chats.disposeChat(kept, chatContext(kept));
++		await agent.chats.disposeChat(provisional, chatContext(provisional));
+ 
+ 		// The chat is out of the catalog by the time the SDK is asked, so a
+ 		// transcript that cannot be removed must not fail the dispose.
+
+From 1535422bc68d922f725f52904d3ca04679fb024c Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Tue, 18 Aug 2026 14:57:14 -0400
+Subject: [PATCH 3/4] Cut the comments to the repository limits
+
+The guidelines allow 1-2 short sentences of JSDoc and at most one line
+inline. The reasoning belongs in the commit message and the pull request,
+which is where it already is.
+---
+ src/vs/platform/agentHost/node/claude/claudeAgent.ts    | 6 ++----
+ src/vs/platform/agentHost/test/node/claudeAgent.test.ts | 7 ++-----
+ 2 files changed, 4 insertions(+), 9 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index db26cb72c8bc6..4ab0fe806a132 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -1629,8 +1629,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		const initialContext = this._resolveChatContext(chat, operationContext);
+ 		await this._sessionSequencer.queue(initialContext.sequencerKey, async () => {
+ 			const target = this._findChatByUri(chatKey);
+-			// Read before tearing the live session down, since that clears the
+-			// pipeline this asks about.
++			// Read before the teardown below, which clears the pipeline this asks about.
+ 			const isProvisional = target !== undefined && !target.isPipelineReady;
+ 			if (target) {
+ 				await this._disposeLiveSession(target);
+@@ -1644,8 +1643,7 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 				try {
+ 					await this._sdkService.deleteSession(sdkSessionId);
+ 				} catch (err) {
+-					// Best-effort: the chat is already gone from the catalog, so a
+-					// stranded transcript must not fail the dispose.
++					// Best-effort: a stranded transcript must not fail the dispose.
+ 					this._logService.warn(`[Claude:${sdkSessionId}] Failed to delete the transcript on dispose`, err);
+ 				}
+ 			}
+diff --git a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+index e8cdf0550e301..622c5cd7830e5 100644
+--- a/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/claudeAgent.test.ts
+@@ -9439,9 +9439,7 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		const strandedResult = await agent.chats.createChat(stranded, created.session, { ...resolvedChatOptions() });
+ 		await agent.chats.createChat(provisional, created.session, { ...resolvedChatOptions() });
+ 
+-		// Only a chat that reached the SDK has a transcript to delete, so
+-		// materialize the two that are expected to be deleted and leave the third
+-		// provisional.
++		// Only a chat that reached the SDK has a transcript, so leave the third provisional.
+ 		for (const [chat, result] of [[kept, keptResult], [stranded, strandedResult]] as const) {
+ 			const sdkSessionId = AgentSession.id(result!.backingSession!);
+ 			sdk.nextQueryMessages = [makeSystemInitMessage(sdkSessionId), makeResultSuccess(sdkSessionId)];
+@@ -9451,8 +9449,7 @@ suite('ClaudeAgent — Phase 11 customizations', () => {
+ 		await agent.chats.disposeChat(kept, chatContext(kept));
+ 		await agent.chats.disposeChat(provisional, chatContext(provisional));
+ 
+-		// The chat is out of the catalog by the time the SDK is asked, so a
+-		// transcript that cannot be removed must not fail the dispose.
++		// A transcript that cannot be removed must not fail the dispose.
+ 		sdk.deleteSessionRejection = new Error('sdk unavailable');
+ 		await agent.chats.disposeChat(stranded, chatContext(stranded));
+ 
+
+From 8784f4ac211d9cb27c1a1f86b004246c224b92ad Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 20 Aug 2026 22:10:09 -0400
+Subject: [PATCH 4/4] Wait for the subprocess to exit before deleting the
+ transcript
+
+Aborting only signals the SDK subprocess. Disposing without waiting for
+it left a window where the dying process could perform its final flush
+after deleteSession had removed the JSONL, recreating the file this
+change exists to remove. _removeAllTurns already awaits
+shutdownLiveQuery for the same reason, so do the same here.
+---
+ src/vs/platform/agentHost/node/claude/claudeAgent.ts | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/vs/platform/agentHost/node/claude/claudeAgent.ts b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+index 4ab0fe806a132..fcbc86401396c 100644
+--- a/src/vs/platform/agentHost/node/claude/claudeAgent.ts
++++ b/src/vs/platform/agentHost/node/claude/claudeAgent.ts
+@@ -1317,6 +1317,8 @@ export class ClaudeAgent extends Disposable implements IAgent {
+ 		} else {
+ 			session.abort();
+ 		}
++		// Wait for the subprocess to exit so its flush cannot recreate the transcript.
++		await session.shutdownLiveQuery();
+ 		this._deleteSession(session);
+ 	}
+ 

@@ -1,0 +1,176 @@
+From 8f6464b5ff119473f7db8fcb170bda9fa8630916 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 20:26:57 -0400
+Subject: [PATCH 1/2] Register a subscription before awaiting its snapshot
+
+A client subscribes to a channel and dispatches actions on it immediately
+afterwards over the same connection, without waiting for the subscribe
+response. The handler registered the subscription only after awaiting
+`IAgentService.subscribe`, so any envelope emitted during that await was
+routed to nobody.
+
+The client therefore never received the echo of its own write-ahead
+action. For a chat turn that means `chat/turnStarted` never comes back,
+the renderer never installs the turn observer, and the response renders
+as an empty bubble with correct metadata while every later envelope
+(deltas, tool calls, turn completion) arrives and is ignored. The state
+itself is untouched, so reloading the window shows the whole response.
+
+Register before the await, and drop the registration if the subscribe
+rejects. The two branches above already register synchronously before
+returning; this one was the outlier.
+
+Observed on a dev container, where the websocket hop widens the window:
+subscribe and dispatch landed 1ms apart and the echo was lost; a run
+where they landed 2ms apart was fine.
+---
+ .../agentHost/node/protocolServerHandler.ts   |  8 ++++++-
+ .../test/node/protocolServerHandler.test.ts   | 24 +++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/node/protocolServerHandler.ts b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+index d97a4551f52e4..acf3d8a4fe7c6 100644
+--- a/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -1324,15 +1324,21 @@ export class ProtocolServerHandler extends Disposable {
+ 					},
+ 				};
+ 			}
++			// Register before awaiting the snapshot. A client dispatches actions
++			// immediately after `subscribe` on the same connection, and any
++			// envelope emitted during the await would otherwise be routed to
++			// nobody: the client never sees its own action echoed, so a
++			// write-ahead turn is never observed and its response never renders.
++			client.subscriptions.set(classified.uri, classified);
+ 			try {
+ 				const snapshot = await this._agentService.subscribe(URI.parse(params.channel), client.clientId);
+-				client.subscriptions.set(classified.uri, classified);
+ 				this._clearClientToolCallDisconnectTimeout(client.clientId, classified.uri);
+ 				// `IStateSnapshot` is widened with `ChatState` (see sessionProtocol.ts);
+ 				// the generated wire `Snapshot` union does not list it yet. The value
+ 				// is JSON over the wire, so narrowing at this boundary is safe.
+ 				return { snapshot: snapshot as SubscribeResult['snapshot'] };
+ 			} catch (err) {
++				client.subscriptions.delete(classified.uri);
+ 				if (err instanceof ProtocolError) {
+ 					throw err;
+ 				}
+diff --git a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+index 00fa11c237796..6a76156b0b08b 100644
+--- a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
++++ b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+@@ -831,6 +831,30 @@ suite('ProtocolServerHandler', () => {
+ 		assert.strictEqual(result.snapshot.resource.toString(), sessionUri.toString());
+ 	});
+ 
++	test('an action dispatched while subscribe is still resolving is still echoed', async () => {
++		stateManager.createSession(makeSessionSummary());
++		stateManager.dispatchServerAction(sessionUri, { type: ActionType.SessionReady, });
++
++		const transport = connectClient('client-1');
++		transport.sent.length = 0;
++
++		// A client subscribes and dispatches on the same connection without
++		// waiting for the subscribe response, so the envelope is emitted while
++		// the snapshot is still resolving.
++		agentService.subscribeBarrier = new DeferredPromise<void>();
++		transport.simulateMessage(request(1, 'subscribe', { channel: defaultChatUri }));
++		transport.simulateMessage(notification('dispatchAction', {
++			channel: defaultChatUri,
++			clientSeq: 1,
++			action: { type: ActionType.ChatTurnStarted, turnId: 'turn-1', startedAt: '2025-01-01T00:00:00.000Z', message: { text: 'hi', origin: { kind: MessageKind.User } } },
++		}));
++		agentService.subscribeBarrier.complete();
++		await new Promise(resolve => setTimeout(resolve, 0));
++
++		const echoed = transport.sent.some(m => (m as { params?: { action?: { type?: string } } }).params?.action?.type === ActionType.ChatTurnStarted);
++		assert.strictEqual(echoed, true, 'turnStarted must be echoed to the client that dispatched it');
++	});
++
+ 	test('client action is dispatched and echoed', () => {
+ 		stateManager.createSession(makeSessionSummary());
+ 		stateManager.dispatchServerAction(sessionUri, { type: ActionType.SessionReady, });
+
+From a5227b6acc55ce8b957a72239d31246913c68914 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 13 Aug 2026 20:32:33 -0400
+Subject: [PATCH 2/2] Address self-review: condense comments, guard
+ re-subscribe, pin the turn id
+
+Applies the review patterns already raised on the earlier PRs in this
+series.
+
+Comments: the inline explanation ran to five lines, well past the
+one-line limit for comments inside a method; the test carried a
+three-line version of the same. Both condensed.
+
+Re-subscribe: deleting the subscription when `subscribe` rejects removed
+a pre-existing valid subscription if the client was already subscribed to
+that channel. Only remove the entry this call added.
+
+Assertion: matching on action type alone would pass for any echoed
+turnStarted. Assert the echoed turn ids instead, so the test proves the
+client's own action came back.
+---
+ .../platform/agentHost/node/protocolServerHandler.ts  | 11 +++++------
+ .../agentHost/test/node/protocolServerHandler.test.ts | 11 ++++++-----
+ 2 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/protocolServerHandler.ts b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+index acf3d8a4fe7c6..a7590db3eeddc 100644
+--- a/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ b/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -1324,11 +1324,8 @@ export class ProtocolServerHandler extends Disposable {
+ 					},
+ 				};
+ 			}
+-			// Register before awaiting the snapshot. A client dispatches actions
+-			// immediately after `subscribe` on the same connection, and any
+-			// envelope emitted during the await would otherwise be routed to
+-			// nobody: the client never sees its own action echoed, so a
+-			// write-ahead turn is never observed and its response never renders.
++			// Register before the await: a client dispatches on the same connection immediately after subscribing.
++			const wasSubscribed = client.subscriptions.has(classified.uri);
+ 			client.subscriptions.set(classified.uri, classified);
+ 			try {
+ 				const snapshot = await this._agentService.subscribe(URI.parse(params.channel), client.clientId);
+@@ -1338,7 +1335,9 @@ export class ProtocolServerHandler extends Disposable {
+ 				// is JSON over the wire, so narrowing at this boundary is safe.
+ 				return { snapshot: snapshot as SubscribeResult['snapshot'] };
+ 			} catch (err) {
+-				client.subscriptions.delete(classified.uri);
++				if (!wasSubscribed) {
++					client.subscriptions.delete(classified.uri);
++				}
+ 				if (err instanceof ProtocolError) {
+ 					throw err;
+ 				}
+diff --git a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+index 6a76156b0b08b..090d789e3ab01 100644
+--- a/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
++++ b/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+@@ -838,9 +838,7 @@ suite('ProtocolServerHandler', () => {
+ 		const transport = connectClient('client-1');
+ 		transport.sent.length = 0;
+ 
+-		// A client subscribes and dispatches on the same connection without
+-		// waiting for the subscribe response, so the envelope is emitted while
+-		// the snapshot is still resolving.
++		// Dispatch lands while the subscribe snapshot is still resolving.
+ 		agentService.subscribeBarrier = new DeferredPromise<void>();
+ 		transport.simulateMessage(request(1, 'subscribe', { channel: defaultChatUri }));
+ 		transport.simulateMessage(notification('dispatchAction', {
+@@ -851,8 +849,11 @@ suite('ProtocolServerHandler', () => {
+ 		agentService.subscribeBarrier.complete();
+ 		await new Promise(resolve => setTimeout(resolve, 0));
+ 
+-		const echoed = transport.sent.some(m => (m as { params?: { action?: { type?: string } } }).params?.action?.type === ActionType.ChatTurnStarted);
+-		assert.strictEqual(echoed, true, 'turnStarted must be echoed to the client that dispatched it');
++		const echoed = transport.sent
++			.map(m => (m as { params?: { action?: { type?: string; turnId?: string } } }).params?.action)
++			.filter(a => a?.type === ActionType.ChatTurnStarted)
++			.map(a => a?.turnId);
++		assert.deepStrictEqual(echoed, ['turn-1'], 'the dispatched turnStarted must be echoed back to its originating client');
+ 	});
+ 
+ 	test('client action is dispatched and echoed', () => {
