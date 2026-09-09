@@ -1,15 +1,5 @@
-From f09f9c0b7efa7f116cc57e9e3c5151d95f7c5eb0 Mon Sep 17 00:00:00 2001
-From: Ryan Ewen <ryan.ewen@gmail.com>
-Date: Wed, 9 Sep 2026 18:06:19 -0400
-Subject: [PATCH] Fix agent host labels in Language Models management
-
----
- .../chatManagement/chatModelsViewModel.ts     | 23 ++++++++--
- .../chatModelsViewModel.test.ts               | 44 +++++++++++++++++++
- 2 files changed, 64 insertions(+), 3 deletions(-)
-
 diff --git a/src/vs/workbench/contrib/chat/browser/chatManagement/chatModelsViewModel.ts b/src/vs/workbench/contrib/chat/browser/chatManagement/chatModelsViewModel.ts
-index 24c23a02120c5..dcd29245cbaf0 100644
+index 24c23a02120..d704527da8c 100644
 --- a/src/vs/workbench/contrib/chat/browser/chatManagement/chatModelsViewModel.ts
 +++ b/src/vs/workbench/contrib/chat/browser/chatManagement/chatModelsViewModel.ts
 @@ -3,6 +3,8 @@
@@ -29,6 +19,22 @@ index 24c23a02120c5..dcd29245cbaf0 100644
  	vendor: ILanguageModelProviderDescriptor;
  	group: ILanguageModelsProviderGroup;
  	sourceId?: string;
+@@ -461,13 +464,13 @@ export class ChatModelsViewModel extends Disposable {
+ 		const models: ILanguageModel[] = [];
+ 		const languageModelsGroups = this.languageModelsService.getLanguageModelGroups(vendor.vendor);
+ 		for (const group of languageModelsGroups) {
+-			const defaultProvider: ILanguageModelProvider = {
++			const defaultProvider = this.withAgentHostIdentity({
+ 				group: group.group ?? {
+ 					vendor: vendor.vendor,
+ 					name: vendor.displayName
+ 				},
+ 				vendor
+-			};
++			}, vendor.vendor);
+ 			if (group.status) {
+ 				this.languageModelGroupStatuses.push({
+ 					provider: defaultProvider,
 @@ -490,7 +493,7 @@ export class ChatModelsViewModel extends Disposable {
  				const sourcePresentation = metadata.modelGroup?.sourceId
  					? languageModelSourcePresentationRegistry.get(metadata.vendor, metadata.modelGroup.sourceId)
@@ -38,30 +44,47 @@ index 24c23a02120c5..dcd29245cbaf0 100644
  					vendor,
  					group: {
  						vendor: metadata.modelGroup.id,
-@@ -498,7 +501,21 @@ export class ChatModelsViewModel extends Disposable {
+@@ -498,11 +501,11 @@ export class ChatModelsViewModel extends Disposable {
  					},
  					sourceId: metadata.modelGroup.sourceId,
  					sourcePresentation,
 -				} satisfies ILanguageModelProvider : defaultProvider;
 +				} satisfies ILanguageModelProvider : { ...defaultProvider };
-+				const sessionType = metadata.targetChatSessionType;
-+				if (sessionType && isAgentHostTarget(sessionType)) {
-+					// Preserve the host identity when grouping by the underlying model provider.
-+					const agentLabel = isLocalAgentHostTarget(sessionType)
-+						? localize('manageModels.localAgentHost', "{0} [Local]", vendor.displayName)
-+						: vendor.displayName;
-+					provider.group = {
-+						...provider.group,
-+						name: metadata.modelGroup
-+							? localize('manageModels.agentHostGroup', "{0} — {1}", provider.group.name, agentLabel)
-+							: agentLabel,
-+					};
-+					provider.sessionType = sessionType;
-+				}
  				models.push({
  					identifier,
  					metadata,
-@@ -547,7 +564,7 @@ export class ChatModelsViewModel extends Disposable {
+-					provider,
++					provider: this.withAgentHostIdentity(provider, metadata.targetChatSessionType, !!metadata.modelGroup),
+ 					hidden: this.languageModelsService.isModelHidden(identifier),
+ 				});
+ 			}
+@@ -510,6 +513,25 @@ export class ChatModelsViewModel extends Disposable {
+ 		this.languageModels.push(...models.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name)));
+ 	}
+ 
++	private withAgentHostIdentity(provider: ILanguageModelProvider, sessionType: string | undefined, hasModelGroup = false): ILanguageModelProvider {
++		if (!sessionType || !isAgentHostTarget(sessionType)) {
++			return provider;
++		}
++		const agentLabel = isLocalAgentHostTarget(sessionType)
++			? localize('manageModels.localAgentHost', "{0} [Local]", provider.vendor.displayName)
++			: provider.vendor.displayName;
++		return {
++			...provider,
++			group: {
++				...provider.group,
++				name: hasModelGroup
++					? localize('manageModels.agentHostGroup', "{0}: {1}", provider.group.name, agentLabel)
++					: agentLabel,
++			},
++			sessionType,
++		};
++	}
++
+ 	getModelsForGroup(group: ILanguageModelProviderEntry | ILanguageModelGroupEntry): ILanguageModel[] {
+ 		if (isLanguageModelProviderEntry(group)) {
+ 			return this.languageModels.filter(m =>
+@@ -547,7 +569,7 @@ export class ChatModelsViewModel extends Disposable {
  	}
  
  	private getProviderGroupId(provider: ILanguageModelProvider): string {
@@ -71,10 +94,18 @@ index 24c23a02120c5..dcd29245cbaf0 100644
  
  	toggleCollapsed(viewModelEntry: IViewModelEntry): void {
 diff --git a/src/vs/workbench/contrib/chat/test/browser/chatManagement/chatModelsViewModel.test.ts b/src/vs/workbench/contrib/chat/test/browser/chatManagement/chatModelsViewModel.test.ts
-index 34cb940c1846f..f9541203cffca 100644
+index 34cb940c184..c106ff10bf7 100644
 --- a/src/vs/workbench/contrib/chat/test/browser/chatManagement/chatModelsViewModel.test.ts
 +++ b/src/vs/workbench/contrib/chat/test/browser/chatManagement/chatModelsViewModel.test.ts
-@@ -379,6 +379,50 @@ suite('ChatModelsViewModel', () => {
+@@ -8,6 +8,7 @@ import { IAction } from '../../../../../../base/common/actions.js';
+ import { Codicon } from '../../../../../../base/common/codicons.js';
+ import { Emitter, Event } from '../../../../../../base/common/event.js';
+ import { IDisposable } from '../../../../../../base/common/lifecycle.js';
++import Severity from '../../../../../../base/common/severity.js';
+ import { observableValue } from '../../../../../../base/common/observable.js';
+ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
+ import { IModelsControlManifest, ILanguageModelChatMetadata, ILanguageModelChatMetadataAndIdentifier, ILanguageModelChatProvider, ILanguageModelChatSelector, ILanguageModelsGroup, ILanguageModelsService, IUserFriendlyLanguageModel, ILanguageModelProviderDescriptor } from '../../../common/languageModels.js';
+@@ -379,6 +380,93 @@ suite('ChatModelsViewModel', () => {
  		});
  	});
  
@@ -111,13 +142,56 @@ index 34cb940c1846f..f9541203cffca 100644
 +				visibleAfterCollapse: model.filter('').filter(entry => entry.type === 'model').map(entry => entry.model.identifier),
 +				filteredIds: model.filter('@provider:"Codex [WSL: Ubuntu]"').filter(entry => entry.type === 'model').map(entry => entry.model.identifier),
 +			}, {
-+				labels: modelGroup ? ['ChatGPT — Codex [Local]', 'ChatGPT — Codex [WSL: Ubuntu]'] : ['Codex [Local]', 'Codex [WSL: Ubuntu]'],
++				labels: modelGroup ? ['ChatGPT: Codex [Local]', 'ChatGPT: Codex [WSL: Ubuntu]'] : ['Codex [Local]', 'Codex [WSL: Ubuntu]'],
 +				groupCount: 2,
 +				localIds: [`${local}:gpt-5.5`, `${local}:gpt-5.6`],
 +				remoteIds: [`${remote}:gpt-5.5`, `${remote}:gpt-5.6`],
 +				hidden: [`${local}:gpt-5.5`, `${local}:gpt-5.6`],
 +				visibleAfterCollapse: [`${remote}:gpt-5.5`, `${remote}:gpt-5.6`],
 +				filteredIds: [`${remote}:gpt-5.5`, `${remote}:gpt-5.6`],
++			});
++		});
++	}
++
++	for (const withModels of [false, true]) {
++		test(`preserves host identity in provider error groups (with models: ${withModels})`, async () => {
++			const service = new MockLanguageModelsService();
++			const local = 'agent-host-codex';
++			const remote = 'remote-hex-77736c3a5562756e7475-codex';
++			const vendors = [[local, 'Codex'], [remote, 'Codex [WSL: Ubuntu]'], ['custom', 'Custom']];
++			for (const [vendor, displayName] of vendors) {
++				service.addVendor({ vendor, displayName, managementCommand: undefined, when: undefined, configuration: undefined });
++				const group = Object.freeze({ vendor, name: displayName });
++				service.getLanguageModelGroups(vendor).push({
++					group, modelIdentifiers: [], status: { message: `${vendor} failed`, severity: Severity.Error },
++				});
++				if (withModels) {
++					service.addModel(vendor, `${vendor}:model`, {
++						extension: new ExtensionIdentifier('test'), id: 'model', name: 'Model', family: 'test', version: '1', vendor,
++						maxInputTokens: 8192, maxOutputTokens: 4096, isDefaultForLocation: {}, targetChatSessionType: vendor,
++					});
++				}
++			}
++			const model = store.add(new ChatModelsViewModel(service));
++			await model.refresh();
++			const entries = [...model.filter('')];
++			const groups = entries.filter(isLanguageModelProviderEntry);
++			const localGroup = groups.find(group => group.vendorEntry.vendor.vendor === local)!;
++			model.toggleCollapsed(localGroup);
++			assert.deepStrictEqual({
++				groups: groups.map(group => ({ label: group.label, sessionType: group.vendorEntry.sessionType, models: model.getModelsForGroup(group).length })),
++				statuses: entries.filter(entry => entry.type === 'status').map(entry => entry.message).sort(),
++				collapsed: model.filter('').filter(isLanguageModelProviderEntry).filter(group => group.collapsed).map(group => group.label),
++				originalLabels: vendors.map(([vendor]) => service.getLanguageModelGroups(vendor)[0].group?.name),
++			}, {
++				groups: [
++					{ label: 'Codex [Local]', sessionType: local, models: withModels ? 1 : 0 },
++					{ label: 'Codex [WSL: Ubuntu]', sessionType: remote, models: withModels ? 1 : 0 },
++					{ label: 'Custom', sessionType: undefined, models: withModels ? 1 : 0 },
++				],
++				statuses: vendors.map(([vendor]) => `${vendor} failed`).sort(),
++				collapsed: ['Codex [Local]'],
++				originalLabels: vendors.map(([, displayName]) => displayName),
 +			});
 +		});
 +	}

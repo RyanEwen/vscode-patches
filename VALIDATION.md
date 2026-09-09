@@ -18,3 +18,10 @@ Documentation follow-up:
 - Synthetic empty/healthy/missing conversation fixtures passed without reading real session transcripts.
 - Public repository links were written and verified on 61 PR descriptions and 21 issue bodies.
 - The model-label installer and bundle regression checks passed again after consolidating its local path and backups.
+
+PR #335363 review follow-up:
+
+- Source revision `4f5b23ed9924f76e95f6eb772e5a5f3736456efc`: Node 24.18.0 transpilation succeeded and the focused `chatModelsViewModel` suite passed all 49 tests.
+- Both original Windows VS Code 1.136.1 build a44adf7f53 bundles reproduce the missing status-only host label. Revised transformations pass status-only and status-with-model identity, ordinary provider, immutability, and existing visibility checks. Source tests also verify collapse isolation.
+- Both transformed bundles passed syntax validation. Package checks cover the refreshed source snapshot and archived installer revision.
+- The earlier installer is retained in `archive/patcher-snapshots/model-host-labels-before-status-identity.cjs`. Existing installations require undo/apply as documented. No live installed bundle was changed or reloaded in this follow-up.

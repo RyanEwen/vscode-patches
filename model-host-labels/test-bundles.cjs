@@ -21,6 +21,42 @@ for (const relative of relativeFiles) {
   const backup = path.join(__dirname,'backup-a44adf7f53',relative);
   const before = fs.readFileSync(fs.existsSync(backup) ? backup : path.join(appRoot,relative),'utf8');
   const after = transformBundle(before);
+  for (const withModels of [false,true]) {
+    const vendors = [
+      {vendor:'agent-host-codex',displayName:'Codex'},
+      {vendor:'remote-hex-77736c3a5562756e7475-codex',displayName:'Codex [WSL: Ubuntu]'},
+      {vendor:'ordinary',displayName:'Ordinary'},
+    ];
+    const groups = new Map(vendors.map(v => [v.vendor,[{
+      group:Object.freeze({vendor:v.vendor,name:v.displayName}),
+      modelIdentifiers:withModels?[v.vendor+':model']:[],
+      status:{message:'Failed to load models',severity:3},
+    }]]));
+    const service = {
+      getLanguageModelGroups:v => groups.get(v),
+      lookupLanguageModel:id => {
+        const vendor = vendors.find(v => id === v.vendor+':model').vendor;
+        return {vendor,targetChatSessionType:vendor,id,name:id};
+      },
+      isModelHidden:() => false,
+    };
+    const oldModel = makeModel(before,service), newModel = makeModel(after,service);
+    for (const vendor of vendors) {oldModel.addVendorModels(vendor);newModel.addVendorModels(vendor);}
+    assert.equal(oldModel.languageModelGroupStatuses[0].provider.group.name,'Codex','Original bundle reproduces the missing status label');
+    assert.deepEqual(newModel.languageModelGroupStatuses.map(({provider,status}) => ({
+      name:provider.group.name,sessionType:provider.sessionType,status,
+    })),vendors.map((vendor,index) => ({
+      name:index === 0?'Codex [Local]':vendor.displayName,
+      sessionType:index < 2?vendor.vendor:undefined,
+      status:{message:'Failed to load models',severity:3},
+    })));
+    assert.equal(new Set(newModel.languageModelGroupStatuses.map(s => newModel.getProviderGroupId(s.provider))).size,3);
+    for (const [index,vendor] of vendors.entries()) {
+      const statusProvider = newModel.languageModelGroupStatuses[index].provider;
+      assert.equal(groups.get(vendor.vendor)[0].group.name,vendor.displayName,'Service-owned status group must remain unchanged');
+      if (withModels) assert.equal(newModel.getProviderGroupId(statusProvider),newModel.getProviderGroupId(newModel.languageModels[index].provider),'Status and ungrouped model must share their host identity');
+    }
+  }
   for (const grouped of [true,false]) {
     const local='agent-host-codex', remote='remote-hex-77736c3a5562756e7475-codex';
     const vendors=[{vendor:local,displayName:'Codex'},{vendor:remote,displayName:'Codex [WSL: Ubuntu]'}];
@@ -34,7 +70,7 @@ for (const relative of relativeFiles) {
     assert.equal(newModel.languageModels.length,4);
     assert.equal(new Set(newModel.languageModels.map(m=>newModel.getProviderGroupId(m.provider))).size,2);
     if(grouped) assert.equal(new Set(oldModel.languageModels.map(m=>oldModel.getProviderGroupId(m.provider))).size,1,'Original bundle reproduces the merged host groups');
-    const expected=grouped?['ChatGPT — Codex [Local]','ChatGPT — Codex [WSL: Ubuntu]']:['Codex [Local]','Codex [WSL: Ubuntu]'];
+    const expected=grouped?['ChatGPT: Codex [Local]','ChatGPT: Codex [WSL: Ubuntu]']:['Codex [Local]','Codex [WSL: Ubuntu]'];
     assert.deepEqual([...new Set(newModel.languageModels.map(m=>m.provider.group.name))],expected);
     const localGroup={id:newModel.getProviderGroupId(newModel.languageModels[0].provider),hidden:false};
     newModel.toggleGroupHidden(localGroup);
@@ -43,5 +79,5 @@ for (const relative of relativeFiles) {
     assert.equal(newModel.languageModels[0].identifier,local+':a');
   }
   assert.throws(()=>transformBundle(after),/already contains/);
-  console.log('PASS: '+relative+' (original reproduces bug; patched labels, host identity, visibility isolation, immutability, and reapply guard)');
+  console.log('PASS: '+relative+' (original reproduces bug; patched model/status labels, host identity, visibility isolation, immutability, ordinary providers, and reapply guard)');
 }

@@ -2,6 +2,8 @@
 
 Snapshots of all 61 RyanEwen PRs found in microsoft/vscode and microsoft/agent-host-protocol on 2026-09-09. Closed and merged proposals are retained for reference. These are separate proposals, **not a series to apply together**. Follow the upstream PR for current status and revisions.
 
+PR #335363 was refreshed after review to include host identity for provider error groups. Its detail page records the updated head.
+
 | PR | State at snapshot | Patch and installer mapping |
 |---|---|---|
 | [microsoft/vscode#335363: Preserve agent host identity in Manage Language Models](https://github.com/microsoft/vscode/pull/335363) | OPEN | [Details](docs/patches/vscode-335363.md) |

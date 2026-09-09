@@ -1151,7 +1151,7 @@
   "prs": [
     {
       "headRefName": "fix/model-management-host-labels",
-      "headRefOid": "f09f9c0b7efa7f116cc57e9e3c5151d95f7c5eb0",
+      "headRefOid": "4f5b23ed9924f76e95f6eb772e5a5f3736456efc",
       "number": 335363,
       "state": "OPEN",
       "title": "Preserve agent host identity in Manage Language Models",

@@ -820,4 +820,4 @@ Target: **agenthost**. [Patcher source](patch-vscode-fixes.mjs#L3411). Upstream:
 
 ## model-host-labels
 
-Distinguish local and remote model registrations in Manage Language Models. [Build-specific installer and rollback](model-host-labels/README.md). [PR #335363](https://github.com/microsoft/vscode/pull/335363).
+Distinguish local and remote model registrations and provider error groups in Manage Language Models. Status-only groups retain host labels and session identity. [Build-specific installer, revision upgrade, and rollback](model-host-labels/README.md). [PR #335363](https://github.com/microsoft/vscode/pull/335363).

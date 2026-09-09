@@ -16,11 +16,8 @@ function replaceOnce(text, from, to) {
 }
 function transformBundle(source) {
   if (source.includes(marker)) throw new Error('Bundle already contains the patch.');
-  source = replaceOnce(source,
-    'let r={group:n.group??{vendor:e.vendor,name:e.displayName},vendor:e};n.status&&',
-    'let r={group:n.group??{vendor:e.vendor,name:e.displayName},vendor:e};{const H=e.vendor;if(H.startsWith("agent-host-")||H.startsWith("remote-")){r.group={...r.group,name:e.displayName+(H.startsWith("agent-host-")?" [Local]":"")};r.sessionType=H}}n.status&&');
   const from = 'sourcePresentation:l}:r;t.push({identifier:a,metadata:c,provider:u,hidden:this.languageModelsService.isModelHidden(a)})';
-  const to = 'sourcePresentation:l}:{...r};' + marker + '{const H=c.targetChatSessionType;if(H&&(H.startsWith("agent-host-")||H.startsWith("remote-"))){const L=u.vendor.displayName+(H.startsWith("agent-host-")?" [Local]":"");u.group={...u.group,name:c.modelGroup?u.group.name+": "+L:L};u.sessionType=H}}t.push({identifier:a,metadata:c,provider:u,hidden:this.languageModelsService.isModelHidden(a)})';
+  const to = 'sourcePresentation:l}:{...r};' + marker + '{const H=c.targetChatSessionType;if(H&&(H.startsWith("agent-host-")||H.startsWith("remote-"))){const L=u.vendor.displayName+(H.startsWith("agent-host-")?" [Local]":"");u.group={...u.group,name:c.modelGroup?u.group.name+" — "+L:L};u.sessionType=H}}t.push({identifier:a,metadata:c,provider:u,hidden:this.languageModelsService.isModelHidden(a)})';
   source = replaceOnce(source, from, to);
   return replaceOnce(source,
     'getProviderGroupId(e){return`${e.group.vendor}-${e.group.name}-${e.sourceId??"configured"}`}',
