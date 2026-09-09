@@ -1,0 +1,271 @@
+{
+  "updated": "2026-09-09",
+  "epics": [
+    {
+      "repo": "microsoft/vscode",
+      "number": 333174,
+      "title": "Agent host: the external-harness chat surface has two root causes, not sixteen defects",
+      "url": "https://github.com/microsoft/vscode/issues/333174"
+    }
+  ],
+  "issues": [
+    {
+      "number": 334764,
+      "state": "OPEN",
+      "title": "Forked Skill subagents are invisible: no correlation handle from the tool call to the agent id",
+      "url": "https://github.com/microsoft/vscode/issues/334764",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": []
+    },
+    {
+      "number": 334631,
+      "state": "OPEN",
+      "title": "Agent host renders nothing for a skill that runs in a subagent",
+      "url": "https://github.com/microsoft/vscode/issues/334631",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": []
+    },
+    {
+      "number": 334575,
+      "state": "OPEN",
+      "title": "Agent host: a local slash command's output is never shown, leaving an empty turn",
+      "url": "https://github.com/microsoft/vscode/issues/334575",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": []
+    },
+    {
+      "number": 334423,
+      "state": "OPEN",
+      "title": "Agent host: a slash command is never executed when the turn carries host context",
+      "url": "https://github.com/microsoft/vscode/issues/334423",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": []
+    },
+    {
+      "number": 333931,
+      "state": "OPEN",
+      "title": "Agent host: a subagent's tool call is never executed and its turn is never closed, so the chat spins forever",
+      "url": "https://github.com/microsoft/vscode/issues/333931",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334072"
+      ]
+    },
+    {
+      "number": 333665,
+      "state": "OPEN",
+      "title": "Agent host: file watches fail with ENOPRO in a remote window, because the host is handed vscode-remote URIs it cannot resolve",
+      "url": "https://github.com/microsoft/vscode/issues/333665",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/333683"
+      ]
+    },
+    {
+      "number": 333180,
+      "state": "CLOSED",
+      "title": "Agent host (Codex): every auto-approved action posts its approval rationale into the transcript",
+      "url": "https://github.com/microsoft/vscode/issues/333180",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": []
+    },
+    {
+      "number": 333174,
+      "state": "OPEN",
+      "title": "Agent host: the external-harness chat surface has two root causes, not sixteen defects",
+      "url": "https://github.com/microsoft/vscode/issues/333174",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334559",
+        "https://github.com/microsoft/vscode/pull/334549",
+        "https://github.com/microsoft/vscode/pull/334311",
+        "https://github.com/microsoft/vscode/pull/334146",
+        "https://github.com/microsoft/vscode/pull/334145",
+        "https://github.com/microsoft/vscode/pull/334136",
+        "https://github.com/microsoft/vscode/pull/334132",
+        "https://github.com/microsoft/vscode/pull/334131",
+        "https://github.com/microsoft/vscode/pull/334127",
+        "https://github.com/microsoft/vscode/pull/334072",
+        "https://github.com/microsoft/vscode/pull/334066",
+        "https://github.com/microsoft/vscode/pull/334053",
+        "https://github.com/microsoft/vscode/pull/334049",
+        "https://github.com/microsoft/vscode/pull/334048",
+        "https://github.com/microsoft/vscode/pull/334047",
+        "https://github.com/microsoft/vscode/pull/334044",
+        "https://github.com/microsoft/vscode/pull/334040",
+        "https://github.com/microsoft/vscode/pull/334038",
+        "https://github.com/microsoft/vscode/pull/334037",
+        "https://github.com/microsoft/vscode/pull/334034",
+        "https://github.com/microsoft/vscode/pull/334011",
+        "https://github.com/microsoft/vscode/pull/334010",
+        "https://github.com/microsoft/vscode/pull/334008",
+        "https://github.com/microsoft/vscode/pull/334005",
+        "https://github.com/microsoft/vscode/pull/334002",
+        "https://github.com/microsoft/vscode/pull/333919",
+        "https://github.com/microsoft/vscode/pull/333683",
+        "https://github.com/microsoft/vscode/pull/332122",
+        "https://github.com/microsoft/vscode/pull/332075",
+        "https://github.com/microsoft/vscode/pull/332055",
+        "https://github.com/microsoft/vscode/pull/331885",
+        "https://github.com/microsoft/vscode/pull/331872",
+        "https://github.com/microsoft/vscode/pull/331871",
+        "https://github.com/microsoft/vscode/pull/331569",
+        "https://github.com/microsoft/vscode/pull/331527",
+        "https://github.com/microsoft/vscode/pull/331408",
+        "https://github.com/microsoft/vscode/pull/331396",
+        "https://github.com/microsoft/vscode/pull/331349",
+        "https://github.com/microsoft/vscode/pull/331345",
+        "https://github.com/microsoft/vscode/pull/331300",
+        "https://github.com/microsoft/vscode/pull/331145",
+        "https://github.com/microsoft/vscode/pull/330933",
+        "https://github.com/microsoft/vscode/pull/330785",
+        "https://github.com/microsoft/vscode/pull/330730",
+        "https://github.com/microsoft/vscode/pull/330709",
+        "https://github.com/microsoft/vscode/pull/330698",
+        "https://github.com/microsoft/vscode/pull/330684",
+        "https://github.com/microsoft/vscode/pull/330683"
+      ]
+    },
+    {
+      "number": 332087,
+      "state": "OPEN",
+      "title": "Agent host: responses render only at turn end because the optimistic turn start is never retired",
+      "url": "https://github.com/microsoft/vscode/issues/332087",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334011",
+        "https://github.com/microsoft/vscode/pull/332122"
+      ]
+    },
+    {
+      "number": 332073,
+      "state": "OPEN",
+      "title": "Agent host: a Claude session shows nothing more once the parent resumes after a background subagent",
+      "url": "https://github.com/microsoft/vscode/issues/332073",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334072",
+        "https://github.com/microsoft/vscode/pull/332075",
+        "https://github.com/microsoft/vscode/pull/331872"
+      ]
+    },
+    {
+      "number": 332047,
+      "state": "OPEN",
+      "title": "Agent host: restored Claude sessions lose their slash commands, skills and agents until the next message",
+      "url": "https://github.com/microsoft/vscode/issues/332047",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/332055"
+      ]
+    },
+    {
+      "number": 331987,
+      "state": "OPEN",
+      "title": "Agent host client tool is cancelled when the derived request collection reads empty for a tick",
+      "url": "https://github.com/microsoft/vscode/issues/331987",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": []
+    },
+    {
+      "number": 331595,
+      "state": "OPEN",
+      "title": "Agent host: a replayed client tool from a subagent is handled on the parent chat after a restart",
+      "url": "https://github.com/microsoft/vscode/issues/331595",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330746"
+      ]
+    },
+    {
+      "number": 331568,
+      "state": "OPEN",
+      "title": "A pasted image renders as a broken thumbnail when its attachment has no contentType",
+      "url": "https://github.com/microsoft/vscode/issues/331568",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331569"
+      ]
+    },
+    {
+      "number": 331526,
+      "state": "CLOSED",
+      "title": "Agent host cannot read project-scope customizations in a remote window: slash commands are missing until the first turn",
+      "url": "https://github.com/microsoft/vscode/issues/331526",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331527"
+      ]
+    },
+    {
+      "number": 331347,
+      "state": "OPEN",
+      "title": "Pasted images are labelled unsupported in Claude sessions even though the model receives them",
+      "url": "https://github.com/microsoft/vscode/issues/331347",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331396"
+      ]
+    },
+    {
+      "number": 331289,
+      "state": "OPEN",
+      "title": "Agent host: after a client reconnects, new client tool calls are still attributed to the disconnected client and fail immediately",
+      "url": "https://github.com/microsoft/vscode/issues/331289",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331300",
+        "https://github.com/microsoft/vscode/pull/330933",
+        "https://github.com/microsoft/vscode/pull/330775",
+        "https://github.com/microsoft/vscode/pull/330746",
+        "https://github.com/microsoft/vscode/pull/330730",
+        "https://github.com/microsoft/vscode/pull/330684",
+        "https://github.com/microsoft/vscode/pull/330683"
+      ]
+    },
+    {
+      "number": 331138,
+      "state": "CLOSED",
+      "title": "Slash commands never submit when the resolved command has no readable content",
+      "url": "https://github.com/microsoft/vscode/issues/331138",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331145"
+      ]
+    },
+    {
+      "number": 330979,
+      "state": "OPEN",
+      "title": "Sessions are filtered out of the list in a remote window: working directories are compared without unwrapping their agent-host URIs",
+      "url": "https://github.com/microsoft/vscode/issues/330979",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331349"
+      ]
+    },
+    {
+      "number": 330941,
+      "state": "OPEN",
+      "title": "Session list change counts show the whole branch divergence, not the session's changes",
+      "url": "https://github.com/microsoft/vscode/issues/330941",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331345",
+        "https://github.com/microsoft/vscode/pull/330942"
+      ]
+    },
+    {
+      "number": 330899,
+      "state": "OPEN",
+      "title": "Agent host: client tools execute off the stream-mapper ready rather than the SDK invocation",
+      "url": "https://github.com/microsoft/vscode/issues/330899",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330933",
+        "https://github.com/microsoft/vscode/pull/330730",
+        "https://github.com/microsoft/vscode/pull/330684",
+        "https://github.com/microsoft/vscode/pull/330683"
+      ]
+    }
+  ]
+}

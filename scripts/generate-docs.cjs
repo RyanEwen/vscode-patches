@@ -1,0 +1,42 @@
+const fs=require('node:fs'),path=require('node:path'),{pathToFileURL}=require('node:url');
+const root=path.resolve(__dirname,'..');
+const write=(p,s)=>{fs.mkdirSync(path.dirname(path.join(root,p)),{recursive:true});fs.writeFileSync(path.join(root,p),s);};
+(async()=>{
+ const catalog=JSON.parse(fs.readFileSync(path.join(root,'catalog.json'),'utf8'));
+ const upstream=JSON.parse(fs.readFileSync(path.join(root,'upstream.json'),'utf8'));
+ const {FIXES}=await import(pathToFileURL(path.join(root,'patch-vscode-fixes.mjs')));
+ const source=fs.readFileSync(path.join(root,'patch-vscode-fixes.mjs'),'utf8');
+ const blocks=[...source.matchAll(/\n\t\{\n\t\tid: '([^']+)'/g)];
+ const epicLinks=upstream.epics.map(e=>`[${e.repo}#${e.number}](${e.url})`).join(', ');
+ const newFixes=[];let index='# Individual patch documentation\n\nOne page per maintained patcher entry. The tracker is '+epicLinks+'. [Issue and PR relationship index](../UPSTREAM.md).\n\n| Patch | Target | Purpose |\n|---|---|---|\n';
+ for(const entry of FIXES){
+  const prior=catalog.fixes.find(f=>f.id===entry.id)||{};
+  const i=blocks.findIndex(b=>b[1]===entry.id);if(i<0)throw Error('Cannot locate '+entry.id);
+  const end=i+1<blocks.length?blocks[i+1].index:source.indexOf('\n];',blocks[i].index);
+  const block=source.slice(blocks[i].index,end);
+  const references=[...new Set([...block.matchAll(/#(\d{3,6})\b/g)].map(m=>Number(m[1])))];
+  const line=source.slice(0,blocks[i].index).split('\n').length+1;
+  const f={...prior,id:entry.id,target:entry.target,title:entry.title,line,references,prs:catalog.prs.filter(p=>references.includes(p.number)).map(p=>p.url)};
+  newFixes.push(f);
+  const related=[...new Set([...(f.prs||[]),...(f.relatedPullRequests||[])])];
+  const issues=upstream.issues.filter(i=>references.includes(i.number)||i.relatedPullRequests.some(p=>related.includes(p)));
+  const rationale=block.split(/\n/).filter(l=>/^\s*\/\//.test(l)).map(l=>l.replace(/^\s*\/\/ ?/,'')).slice(0,16).join('\n').trim();
+  const entryMentions=FIXES.filter(other=>other.id!==f.id&&block.includes(other.id)).map(other=>other.id);
+  let doc=`# ${f.id}\n\n${f.title}.\n\n## Implementation\n\n- Target: **${f.target}** bundle.\n- [Current implementation](../../patch-vscode-fixes.mjs#L${line}).\n- [Full catalog](../../CATALOG.md#${f.id}).\n- Status: local installed-bundle workaround; upstream proposal status is tracked separately.\n\n`;
+  if(rationale)doc+='## Rationale recorded with the patch\n\n'+rationale+'\n\n';
+  doc+='## Upstream references\n\nTracking epic: '+epicLinks+'.\n\n';
+  if(references.length)doc+='References explicitly recorded in the implementation:\n\n'+references.map(n=>{const known=catalog.prs.find(p=>p.number===n)||upstream.issues.find(i=>i.number===n);return `- [${known?.repo||'microsoft/vscode'}#${n}](${known?.url||'https://github.com/microsoft/vscode/issues/'+n})${known?': '+known.title:''}`;}).join('\n')+'\n\n';
+  if(related.length)doc+='Related proposals (topic mappings are not claims of exact patch equivalence):\n\n'+related.map(url=>{const p=catalog.prs.find(p=>p.url===url);return `- [${p?p.repo+'#'+p.number:url.split('/').pop()}](${url})${p?': '+p.title+' — **'+p.state+'** at the recorded snapshot. [Source/details](../patches/'+p.repo.split('/')[1]+'-'+p.number+'.md).':''}`;}).join('\n')+'\n\n';
+  if(issues.length)doc+='Related issue reports:\n\n'+issues.filter(i=>i.number!==333174).map(i=>`- [${i.repo}#${i.number}](${i.url}): ${i.title}`).join('\n')+'\n\n';
+  if(!references.length&&!related.length)doc+='No specific upstream issue or PR is recorded for this entry yet. Keep it marked local-only until that mapping has been verified.\n\n';
+  doc+='## Applying and maintaining\n\nInspect the target build before applying:\n\n```sh\nnode patch-vscode-fixes.mjs --status --only '+f.id+' --target "/path/to/bundle.js"\n```\n\nAn exact structural match is required. A missing site is not proof of an upstream fix. Read adjacent implementation comments for coupled entries before selecting a partial fix set. The combined patcher backs up and restores entire bundles; see the [usage and rollback instructions](../../README.md#using-the-combined-patcher).\n\n';
+  if(entryMentions.length)doc+='Other entries mentioned in this implementation (review for dependencies): '+entryMentions.map(id=>`[\`${id}\`](${id}.md)`).join(', ')+'.\n\n';
+  doc+='Validation: [publication checks and limits](../../VALIDATION.md), [live-bundle test inputs](../../tests/live/README.md). A per-entry live regression result was not newly established by this documentation pass.\n\nWhen changing this fix, record the tested build, update related references, run the applicable regression checks, regenerate this page, and update the public-link section in its issue/PR. See [MAINTAINING.md](../../MAINTAINING.md).\n';
+  write('docs/fixes/'+f.id+'.md',doc);index+=`| [\`${f.id}\`](${f.id}.md) | ${f.target} | ${f.title.replaceAll('|','\\|')} |\n`;
+ }
+ catalog.fixes=newFixes;write('catalog.json',JSON.stringify(catalog,null,2)+'\n');write('docs/fixes/README.md',index);
+ let graph='# Upstream tracking and relationships\n\n## Epic\n\n'+upstream.epics.map(e=>`- [${e.repo}#${e.number}](${e.url}): ${e.title}`).join('\n')+'\n\n## Protocol work\n\n'+catalog.prs.filter(p=>p.repo==='microsoft/agent-host-protocol').map(p=>`- [#${p.number}](${p.url}): ${p.title} — [source/details](patches/agent-host-protocol-${p.number}.md)`).join('\n')+'\n\n## Issues\n\n| Issue | State at snapshot | Related source proposals |\n|---|---|---|\n';
+ for(const i of upstream.issues)graph+=`| [${i.repo}#${i.number}: ${i.title.replaceAll('|','\\|')}](${i.url}) | ${i.state} | ${i.relatedPullRequests.map(u=>'[#'+u.split('/').pop()+']('+u+')').join(', ')} |\n`;
+ graph+='\n[All 61 PR source snapshots](../SOURCE-PATCHES.md) · [All patcher entries](fixes/README.md). Relationships reflect explicit references and documented topic mappings, not a promise that each workaround implements an entire PR.\n';write('docs/UPSTREAM.md',graph);
+ console.log('Generated '+newFixes.length+' per-fix pages and upstream relationship index.');
+})().catch(e=>{console.error(e);process.exitCode=1;});

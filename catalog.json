@@ -7,7 +7,10 @@
       "title": "a client tool runs with empty input when its arguments never streamed",
       "line": 61,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330684"
+      ]
     },
     {
       "id": "session-list",
@@ -20,7 +23,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331349"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "session-list-remote-project-root",
@@ -32,7 +36,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/334145"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "embedded-attachment-content-type",
@@ -44,7 +49,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331569"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "client-tool-buffer",
@@ -52,7 +58,10 @@
       "title": "a client tool result is dropped when it arrives before the SDK asks for it",
       "line": 182,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330730"
+      ]
     },
     {
       "id": "client-tool-error",
@@ -60,7 +69,10 @@
       "title": "a client tool error reaches the model as an empty result",
       "line": 204,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330709"
+      ]
     },
     {
       "id": "replay-args",
@@ -68,7 +80,10 @@
       "title": "client tool MCP handler forwards tool name and args",
       "line": 229,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330746"
+      ]
     },
     {
       "id": "replay-route",
@@ -76,7 +91,10 @@
       "title": "client tool wiring routes through the replay-aware awaiter",
       "line": 247,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330746"
+      ]
     },
     {
       "id": "replay-turnid",
@@ -84,7 +102,10 @@
       "title": "session stashes the active turn id",
       "line": 256,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330746"
+      ]
     },
     {
       "id": "replay-seen",
@@ -92,7 +113,10 @@
       "title": "session records which tool calls actually streamed, and under which turn",
       "line": 266,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330746"
+      ]
     },
     {
       "id": "replay-drive",
@@ -102,7 +126,10 @@
       "references": [
         318456
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/330746"
+      ]
     },
     {
       "id": "steering-pending",
@@ -110,7 +137,8 @@
       "title": "the pipeline only receives the steering id, not the message",
       "line": 332,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "steering-buffer",
@@ -118,7 +146,8 @@
       "title": "a steering message is forgotten once it is queued",
       "line": 341,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "steering-hold",
@@ -126,7 +155,8 @@
       "title": "the pending bubble is cleared when the queue hands the message over",
       "line": 362,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "steering-promote",
@@ -134,7 +164,8 @@
       "title": "a steering message never becomes its own turn",
       "line": 372,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "steering-drain",
@@ -142,7 +173,8 @@
       "title": "a steering message the SDK never echoes leaves its bubble behind on abort",
       "line": 415,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "client-tool-single-trigger",
@@ -154,6 +186,10 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/330933"
+      ],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334146",
+        "https://github.com/microsoft/vscode/pull/330933"
       ]
     },
     {
@@ -162,7 +198,10 @@
       "title": "the session list re-derives the chip from the branch for inactive sessions",
       "line": 449,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331345"
+      ]
     },
     {
       "id": "slash-resolve-harness",
@@ -175,7 +214,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331145"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "slash-resolve-prompts",
@@ -183,7 +223,8 @@
       "title": "the prompts service resolver rejects on an unreadable slash command",
       "line": 516,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "slash-consumer-sessions",
@@ -191,7 +232,8 @@
       "title": "the session send path dereferences a prompt file that may be absent",
       "line": 536,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "slash-consumer-widget",
@@ -199,7 +241,8 @@
       "title": "the chat widget dereferences a prompt file that may be absent",
       "line": 552,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "slash-consumer-widget-header",
@@ -207,7 +250,8 @@
       "title": "the chat widget applies header metadata from an absent prompt file",
       "line": 569,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "client-tool-owner-recency",
@@ -219,7 +263,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331300"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "native-model-vision",
@@ -230,6 +275,9 @@
         331396
       ],
       "prs": [
+        "https://github.com/microsoft/vscode/pull/331396"
+      ],
+      "relatedPullRequests": [
         "https://github.com/microsoft/vscode/pull/331396"
       ]
     },
@@ -244,7 +292,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331408"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "consumed-message-settles-sent",
@@ -257,7 +306,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331408"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "consumed-message-sync-reconcile",
@@ -271,7 +321,8 @@
       "prs": [
         "https://github.com/microsoft/vscode/pull/334002",
         "https://github.com/microsoft/vscode/pull/331408"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "consumed-message-sync-arg",
@@ -283,7 +334,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331408"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "steer-preempt-not-error",
@@ -295,7 +347,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/330785"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "toolcall-progress-emit",
@@ -303,7 +356,11 @@
       "title": "a long tool call reports nothing while it runs",
       "line": 770,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/agent-host-protocol/pull/405",
+        "https://github.com/microsoft/vscode/pull/334131"
+      ]
     },
     {
       "id": "toolcall-progress-reduce",
@@ -311,7 +368,11 @@
       "title": "the client has nowhere to record tool call progress",
       "line": 804,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/agent-host-protocol/pull/405",
+        "https://github.com/microsoft/vscode/pull/334131"
+      ]
     },
     {
       "id": "toolcall-progress-reduce-host",
@@ -319,7 +380,11 @@
       "title": "the agent host does not know the progress action either",
       "line": 818,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/agent-host-protocol/pull/405",
+        "https://github.com/microsoft/vscode/pull/334131"
+      ]
     },
     {
       "id": "toolcall-progress-render",
@@ -327,7 +392,11 @@
       "title": "a running tool call renders no progress",
       "line": 832,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/agent-host-protocol/pull/405",
+        "https://github.com/microsoft/vscode/pull/334131"
+      ]
     },
     {
       "id": "session-delete",
@@ -339,7 +408,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/330698"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "remote-window-authority-init",
@@ -347,7 +417,8 @@
       "title": "the in-window agent host claims to be local in a remote window",
       "line": 884,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "remote-window-authority-fs",
@@ -355,7 +426,8 @@
       "title": "the agent host filesystem registers under the local authority",
       "line": 903,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "remote-window-authority-session",
@@ -363,7 +435,8 @@
       "title": "the session handler is told the host is local",
       "line": 914,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "remote-window-authority-map",
@@ -373,7 +446,8 @@
       "references": [
         332791
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "workspace-folder-uses-real-remote",
@@ -381,7 +455,8 @@
       "title": "opening a session folder yields a window that can resolve nothing",
       "line": 951,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "session-workspace-folder-real-remote",
@@ -389,7 +464,8 @@
       "title": "a session workspace keeps the agent host authority its folders cannot resolve",
       "line": 993,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "subagent-completion-when-idle",
@@ -397,7 +473,10 @@
       "title": "a background subagent that finishes after its turn stays running",
       "line": 1029,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331872"
+      ]
     },
     {
       "id": "sdk-initiated-turn",
@@ -407,7 +486,8 @@
       "references": [
         332073
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "subagent-inactive-resume",
@@ -417,7 +497,8 @@
       "references": [
         332073
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "replay-user-prompt-only",
@@ -425,7 +506,10 @@
       "title": "restored messages show context the user never typed",
       "line": 1152,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/331885"
+      ]
     },
     {
       "id": "local-command-output-visible",
@@ -435,7 +519,8 @@
       "references": [
         334575
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "agenthost-require-global",
@@ -443,7 +528,8 @@
       "title": "the bundle is ESM, so later entries have no require for node builtins",
       "line": 1210,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "resume-missing-conversation-starts-fresh",
@@ -451,7 +537,8 @@
       "title": "cancelling a skill-subagent turn bricks a new chat permanently",
       "line": 1227,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "result-error-subtypes-surface",
@@ -459,7 +546,8 @@
       "title": "hitting a turn, budget or retry cap renders as a successful empty turn",
       "line": 1288,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "result-usage-any-subtype",
@@ -467,7 +555,8 @@
       "title": "a turn that stops at a cap reports none of the tokens it spent",
       "line": 1328,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "toolcall-hidden-respects-liveness",
@@ -475,7 +564,8 @@
       "title": "a tool card is hidden when its call completes, even when its work is still running",
       "line": 1344,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "claude-turn-reports-activity",
@@ -483,7 +573,10 @@
       "title": "the Claude provider never reports chat activity, so a silent turn looks dead",
       "line": 1382,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334742"
+      ]
     },
     {
       "id": "activity-clears-when-the-turn-results",
@@ -491,7 +584,10 @@
       "title": "the liveness row needs a real end signal, not an empty queue",
       "line": 1461,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334742"
+      ]
     },
     {
       "id": "turn-prune-anchor-missing-is-loud",
@@ -499,7 +595,8 @@
       "title": "restoring a checkpoint at a turn with no database row silently prunes nothing",
       "line": 1480,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "router-drop-is-loud",
@@ -507,7 +604,8 @@
       "title": "every SDK message with no resolvable turn id is discarded with no log at all",
       "line": 1519,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "slash-command-single-block",
@@ -515,7 +613,8 @@
       "title": "a slash command is never expanded because the host appends context as a second block",
       "line": 1548,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "session-chip-scope-v2",
@@ -527,7 +626,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/331345"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "session-scope-counts-other-sessions-work",
@@ -535,7 +635,8 @@
       "title": "a session is credited with every uncommitted change in the folder",
       "line": 1613,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "keyed-item-transient-empty",
@@ -543,7 +644,8 @@
       "title": "a momentarily empty collection tears down live keyed items",
       "line": 1666,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "client-tool-stale-self-abort",
@@ -551,7 +653,8 @@
       "title": "a client tool abandons itself when only its label changes",
       "line": 1689,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "cold-chat-customizations",
@@ -561,7 +664,10 @@
       "references": [
         332047
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/332055"
+      ]
     },
     {
       "id": "subagent-spawn-turn",
@@ -573,7 +679,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/332075"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "subagent-resume-anchor",
@@ -585,7 +692,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/332075"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "subagent-resumed-output",
@@ -597,7 +705,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/332075"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "optimistic-turn-start-masks-streaming",
@@ -607,7 +716,10 @@
       "references": [
         332087
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/332122"
+      ]
     },
     {
       "id": "chat-turnstarted-idempotent",
@@ -617,7 +729,11 @@
       "references": [
         332087
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/agent-host-protocol/pull/433",
+        "https://github.com/microsoft/vscode/pull/334011"
+      ]
     },
     {
       "id": "truncation-retire-stranded",
@@ -625,7 +741,10 @@
       "title": "a stranded optimistic truncation is replayed forever and blanks the transcript",
       "line": 1903,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334040"
+      ]
     },
     {
       "id": "plugin-read-surface-errors",
@@ -633,7 +752,10 @@
       "title": "a filesystem the host cannot address looks exactly like an absent file",
       "line": 1978,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334034"
+      ]
     },
     {
       "id": "client-tool-no-host-confirm",
@@ -647,7 +769,8 @@
       "prs": [
         "https://github.com/microsoft/vscode/pull/334037",
         "https://github.com/microsoft/vscode/pull/330683"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "client-tool-ownerless-fail-map-start",
@@ -655,7 +778,10 @@
       "title": "the stream mapper does not record that a client tool call has no owner",
       "line": 2097,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334044"
+      ]
     },
     {
       "id": "nested-subagent-spawn-recorded",
@@ -663,7 +789,8 @@
       "title": "a subagent spawned by another subagent never gets a chat, so its work never renders",
       "line": 2138,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "client-tool-ownerless-fail-map-stop",
@@ -671,7 +798,10 @@
       "title": "a client tool call no window can run is never failed",
       "line": 2164,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334044"
+      ]
     },
     {
       "id": "client-tool-ownerless-fail-subagent",
@@ -679,7 +809,10 @@
       "title": "a subagent client tool call no window can run is never failed",
       "line": 2198,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334044"
+      ]
     },
     {
       "id": "client-tool-ownerless-fail-session",
@@ -687,7 +820,10 @@
       "title": "the SDK handler for a failed client tool call still parks forever",
       "line": 2234,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334044"
+      ]
     },
     {
       "id": "client-tool-ownerless-fail-permission",
@@ -699,6 +835,9 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/334037"
+      ],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334044"
       ]
     },
     {
@@ -707,7 +846,10 @@
       "title": "adding or removing a workspace folder from a container window is rejected by the host",
       "line": 2320,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334005"
+      ]
     },
     {
       "id": "remote-folders-at-session-create",
@@ -715,7 +857,10 @@
       "title": "a session created from the chat handler in a container window gets no working directories at all",
       "line": 2375,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334048"
+      ]
     },
     {
       "id": "subagent-observation-lifetime",
@@ -725,7 +870,10 @@
       "references": [
         333931
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334072"
+      ]
     },
     {
       "id": "steer-keeps-tool-attribution",
@@ -733,7 +881,10 @@
       "title": "a tool still running when a steer lands never completes",
       "line": 2513,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334008"
+      ]
     },
     {
       "id": "skill-subagent-result-visible",
@@ -741,7 +892,8 @@
       "title": "a skill that runs in a subagent works for minutes and the turn renders empty",
       "line": 2575,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "queue-settles-by-correlation",
@@ -749,7 +901,8 @@
       "title": "the queue drifts because one result settles one entry, however many it consumed",
       "line": 2656,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "clearpending-spares-background-subagent",
@@ -761,6 +914,9 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/334559"
+      ],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334559"
       ]
     },
     {
@@ -769,7 +925,10 @@
       "title": "a pruned external session leaves its data directory behind forever",
       "line": 2738,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334010"
+      ]
     },
     {
       "id": "peer-chat-unavailable-subagent",
@@ -779,7 +938,8 @@
       "references": [
         334312
       ],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "denied-subagent-no-phantom-chat",
@@ -787,7 +947,10 @@
       "title": "a denied Agent call is still recorded as a subagent, creating a chat that can never exist",
       "line": 2809,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334549"
+      ]
     },
     {
       "id": "codex-progress-not-output-host",
@@ -795,7 +958,10 @@
       "title": "MCP progress narration is persisted as the tool result",
       "line": 2830,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334053"
+      ]
     },
     {
       "id": "codex-progress-not-output-client",
@@ -803,7 +969,10 @@
       "title": "a running MCP call shows no progress, and a stale one becomes its past-tense label",
       "line": 2888,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334053"
+      ]
     },
     {
       "id": "subscribe-cancelled-not-missing",
@@ -811,7 +980,10 @@
       "title": "a client cancelling a subscribe is reported as a missing resource, at error level",
       "line": 2970,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334066"
+      ]
     },
     {
       "id": "client-tool-handler-never-throws",
@@ -819,7 +991,10 @@
       "title": "a rejected client-tool wait escapes the MCP handler as a bare \"Canceled\"",
       "line": 3042,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334038"
+      ]
     },
     {
       "id": "pending-register-shares-deferred",
@@ -827,7 +1002,10 @@
       "title": "a second wait on one pending request cancels the first waiter",
       "line": 3095,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334146"
+      ]
     },
     {
       "id": "register-and-fire-reuses-parked",
@@ -838,6 +1016,9 @@
         334146
       ],
       "prs": [
+        "https://github.com/microsoft/vscode/pull/334146"
+      ],
+      "relatedPullRequests": [
         "https://github.com/microsoft/vscode/pull/334146"
       ]
     },
@@ -851,6 +1032,9 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/334743"
+      ],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334743"
       ]
     },
     {
@@ -859,7 +1043,10 @@
       "title": "removing one steering message must not drop the others",
       "line": 3193,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334743"
+      ]
     },
     {
       "id": "steering-list-turnstarted",
@@ -867,7 +1054,10 @@
       "title": "a steering message auto-started as a turn must leave the list",
       "line": 3212,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334743"
+      ]
     },
     {
       "id": "steering-list-merge",
@@ -875,7 +1065,10 @@
       "title": "the per-chat projection drops the steering list",
       "line": 3232,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334743"
+      ]
     },
     {
       "id": "steering-list-projection",
@@ -883,7 +1076,10 @@
       "title": "only one steering bubble is projected into the chat model",
       "line": 3246,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334743"
+      ]
     },
     {
       "id": "steering-list-removal-detect",
@@ -891,7 +1087,10 @@
       "title": "the sidebar retires the previous steering bubble whenever the id changes",
       "line": 3259,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/334743"
+      ]
     },
     {
       "id": "activity-row-survives-content",
@@ -903,7 +1102,8 @@
       ],
       "prs": [
         "https://github.com/microsoft/vscode/pull/334742"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "chat-input-default-permission-mode",
@@ -917,7 +1117,8 @@
       "prs": [
         "https://github.com/microsoft/vscode/pull/334814",
         "https://github.com/microsoft/vscode/pull/334087"
-      ]
+      ],
+      "relatedPullRequests": []
     },
     {
       "id": "replay-keeps-local-command-output",
@@ -925,7 +1126,8 @@
       "title": "a slash command's output is dropped on replay, so a restart empties the turn",
       "line": 3345,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "discovery-suppression-loud",
@@ -933,7 +1135,8 @@
       "title": "discovery suppresses two thirds of sessions and never says which are which",
       "line": 3382,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     },
     {
       "id": "stale-peer-chat-backing-ignored",
@@ -941,7 +1144,8 @@
       "title": "a session that once had a peer chat is hidden from the list forever",
       "line": 3411,
       "references": [],
-      "prs": []
+      "prs": [],
+      "relatedPullRequests": []
     }
   ],
   "prs": [
