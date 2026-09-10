@@ -5,7 +5,7 @@ the queue drifts because one result settles one entry, however many it consumed.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2656).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2657).
 - [Full catalog](../../CATALOG.md#queue-settles-by-correlation).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ the stream mapper does not record that a client tool call has no owner.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2097).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2098).
 - [Full catalog](../../CATALOG.md#client-tool-ownerless-fail-map-start).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

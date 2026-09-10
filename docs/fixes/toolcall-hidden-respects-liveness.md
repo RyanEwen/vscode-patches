@@ -5,7 +5,7 @@ a tool card is hidden when its call completes, even when its work is still runni
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1344).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1345).
 - [Full catalog](../../CATALOG.md#toolcall-hidden-respects-liveness).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

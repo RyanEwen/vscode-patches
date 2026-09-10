@@ -5,7 +5,7 @@ adding or removing a workspace folder from a container window is rejected by the
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2320).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2321).
 - [Full catalog](../../CATALOG.md#remote-working-directory-actions).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

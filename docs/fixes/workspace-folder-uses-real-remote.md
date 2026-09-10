@@ -5,7 +5,7 @@ opening a session folder yields a window that can resolve nothing.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L951).
+- [Current implementation](../../patch-vscode-fixes.mjs#L952).
 - [Full catalog](../../CATALOG.md#workspace-folder-uses-real-remote).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

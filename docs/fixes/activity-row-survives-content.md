@@ -5,7 +5,7 @@ the liveness row disappears the moment a turn produces anything.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3277).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3278).
 - [Full catalog](../../CATALOG.md#activity-row-survives-content).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

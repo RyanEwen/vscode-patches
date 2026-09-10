@@ -5,7 +5,7 @@ the pending bubble is cleared when the queue hands the message over.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L362).
+- [Current implementation](../../patch-vscode-fixes.mjs#L363).
 - [Full catalog](../../CATALOG.md#steering-hold).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a running tool call renders no progress.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L832).
+- [Current implementation](../../patch-vscode-fixes.mjs#L833).
 - [Full catalog](../../CATALOG.md#toolcall-progress-render).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

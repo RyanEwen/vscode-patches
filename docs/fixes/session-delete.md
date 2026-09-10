@@ -5,7 +5,7 @@ deleting a Claude session does not delete the transcript.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L852).
+- [Current implementation](../../patch-vscode-fixes.mjs#L853).
 - [Full catalog](../../CATALOG.md#session-delete).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

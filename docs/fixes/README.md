@@ -106,3 +106,4 @@ One page per maintained patcher entry. The tracker is [microsoft/vscode#333174](
 | [`replay-keeps-local-command-output`](replay-keeps-local-command-output.md) | agenthost | a slash command's output is dropped on replay, so a restart empties the turn |
 | [`discovery-suppression-loud`](discovery-suppression-loud.md) | agenthost | discovery suppresses two thirds of sessions and never says which are which |
 | [`stale-peer-chat-backing-ignored`](stale-peer-chat-backing-ignored.md) | agenthost | a session that once had a peer chat is hidden from the list forever |
+| [`codex-steering-resolved-input`](codex-steering-resolved-input.md) | agenthost | steering with attached context stays pending after Codex consumes it |

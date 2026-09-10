@@ -5,7 +5,7 @@ the bundle is ESM, so later entries have no require for node builtins.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1210).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1211).
 - [Full catalog](../../CATALOG.md#agenthost-require-global).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -1,0 +1,221 @@
+From 3d6d2c336fb65bb4db776bc237b1beabe87a9f49 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Thu, 10 Sep 2026 15:58:56 -0400
+Subject: [PATCH] Fix Codex steering acknowledgement with attachment context
+
+---
+ .../agentHost/node/codex/codexAgent.ts        |  28 +++--
+ .../test/node/codex/codexAgent.test.ts        | 103 +++++++++++++++++-
+ 2 files changed, 121 insertions(+), 10 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+index 57cc1ef22d673..01fa865a91115 100644
+--- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
++++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+@@ -519,6 +519,11 @@ interface ICodexTargetChat {
+ 	readonly configurationResource: URI;
+ }
+ 
++interface ICodexPendingSteering {
++	readonly pendingMessage: PendingMessage;
++	readonly inputText: string;
++}
++
+ interface ICodexSession {
+ 	/** Caller-facing session id used in the `codex:/<id>` URI; may differ from the codex thread id. */
+ 	readonly sessionId: string;
+@@ -630,7 +635,7 @@ interface ICodexSession {
+ 	 * `steering_consumed` signal) on turn completion, abort, dispose, or a
+ 	 * `turn/steer` rejection so the chat UI's pending bubble never sticks.
+ 	 */
+-	readonly pendingSteeringFlips: Map<string, PendingMessage>;
++	readonly pendingSteeringFlips: Map<string, ICodexPendingSteering>;
+ 	/**
+ 	 * Client-provided tool definitions for this session, keyed by the
+ 	 * contributing workbench client. The merged set is registered with codex
+@@ -3016,16 +3021,16 @@ export class CodexAgent extends Disposable implements IAgent {
+ 	}
+ 
+ 	/**
+-	 * Pop the buffered steering message whose text matches the echoed
++	 * Pop the buffered steering message whose resolved input text matches the echoed
+ 	 * `userMessage` content. Matching by content (not FIFO) keeps the
+ 	 * mapping correct when several steering messages with different texts
+ 	 * are in flight.
+ 	 */
+ 	private _takeMatchingPendingSteering(session: ICodexSession, text: string): PendingMessage | undefined {
+-		for (const [id, msg] of session.pendingSteeringFlips) {
+-			if (msg.message.text === text) {
++		for (const [id, steering] of session.pendingSteeringFlips) {
++			if (steering.inputText === text) {
+ 				session.pendingSteeringFlips.delete(id);
+-				return msg;
++				return steering.pendingMessage;
+ 			}
+ 		}
+ 		return undefined;
+@@ -3548,7 +3553,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			acceptedForSession: parent.acceptedForSession,
+ 			handledGuardianReviews: new Set<string>(),
+ 			pendingGuardianReviewCards: new Set<string>(),
+-			pendingSteeringFlips: new Map<string, PendingMessage>(),
++			pendingSteeringFlips: new Map<string, ICodexPendingSteering>(),
+ 			clientToolSet,
+ 			pendingClientToolCalls: new PendingRequestRegistry<ToolCallResult>(),
+ 			pendingUserInputs: new PendingRequestRegistry<ICodexUserInputResult>(),
+@@ -4675,7 +4680,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			acceptedForSession: new Set<string>(),
+ 			handledGuardianReviews: new Set<string>(),
+ 			pendingGuardianReviewCards: new Set<string>(),
+-			pendingSteeringFlips: new Map<string, PendingMessage>(),
++			pendingSteeringFlips: new Map<string, ICodexPendingSteering>(),
+ 			clientToolSet,
+ 			pendingClientToolCalls: new PendingRequestRegistry<ToolCallResult>(),
+ 			pendingUserInputs: new PendingRequestRegistry<ICodexUserInputResult>(),
+@@ -4991,7 +4996,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			acceptedForSession: new Set<string>(),
+ 			handledGuardianReviews: new Set<string>(),
+ 			pendingGuardianReviewCards: new Set<string>(),
+-			pendingSteeringFlips: new Map<string, PendingMessage>(),
++			pendingSteeringFlips: new Map<string, ICodexPendingSteering>(),
+ 			clientToolSet,
+ 			pendingClientToolCalls: new PendingRequestRegistry<ToolCallResult>(),
+ 			pendingUserInputs: new PendingRequestRegistry<ICodexUserInputResult>(),
+@@ -5956,7 +5961,12 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		const threadId = session.threadId;
+ 		// Buffer so the codex `userMessage` echo can promote this into a
+ 		// visible turn (see {@link _handleSteeredUserMessage}).
+-		session.pendingSteeringFlips.set(steeringMessage.id, steeringMessage);
++		session.pendingSteeringFlips.set(steeringMessage.id, {
++			pendingMessage: steeringMessage,
++			// Match the text actually sent, including attachment context. Keep the
++			// original message for presentation and resolve attachments only once.
++			inputText: extractUserInputText(input),
++		});
+ 		void conn.client.request<'turn/steer'>('turn/steer', {
+ 			threadId,
+ 			input: input.slice(),
+diff --git a/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
+index 6d4e7745a8a8b..d2a6e0fc3e463 100644
+--- a/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
+@@ -14,10 +14,12 @@ import { AgentChatMigrationDeferred, AgentSession, CODEX_AGENT_PROVIDER_ID, type
+ import { AgentSystemNotificationKind, toAgentSystemNotificationMeta } from '../../../common/meta/agentSystemNotificationMeta.js';
+ import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
+ import { CustomizationEnablementKind, CustomizationType, McpServerStatus, type McpServerCustomization } from '../../../common/state/protocol/channels-session/state.js';
+-import { buildDefaultChatUri, parseRequiredSessionUriFromChatUri, ResponsePartKind } from '../../../common/state/sessionState.js';
++import { buildDefaultChatUri, parseRequiredSessionUriFromChatUri, ResponsePartKind, MessageAttachmentKind, MessageKind, type MessageAttachment, type PendingMessage } from '../../../common/state/sessionState.js';
+ import { AgentHostStateManager } from '../../../node/agentHostStateManager.js';
+ import { getCustomizationEnablementKey, type CustomizationEnablementResolution, type ICustomizationEnablementTarget } from '../../../node/agentHostCustomizationEnablementService.js';
+ import { CodexAgent } from '../../../node/codex/codexAgent.js';
++import { extractUserInputText } from '../../../node/codex/codexMapAppServerEvents.js';
++import type { UserInput } from '../../../node/codex/protocol/generated/v2/UserInput.js';
+ import { CodexClientCustomizationStore, type ICodexClientPlugin } from '../../../node/codex/codexClientCustomizations.js';
+ import type { ICodexMcpServerConfigJson, ICodexMcpServerEntry } from '../../../node/codex/codexMcpServers.js';
+ import type { ItemGuardianApprovalReviewCompletedNotification } from '../../../node/codex/protocol/generated/v2/ItemGuardianApprovalReviewCompletedNotification.js';
+@@ -149,6 +151,105 @@ function emptyHarness(): ICodexConversationResolverHarness {
+ 
+ suite('CodexAgent', () => {
+ 
++	suite('steering input correlation', () => {
++		function createHarness() {
++			const sessionUri = AgentSession.uri(CODEX_AGENT_PROVIDER_ID, 'steering-session');
++			const session = {
++				threadId: 'thread',
++				currentAppTurnId: 'turn',
++				pendingSteeringFlips: new Map<string, { readonly pendingMessage: PendingMessage; readonly inputText: string }>(),
++			};
++			const inputs: UserInput[][] = [];
++			const harness = {
++				_sessions: new Map([[AgentSession.id(sessionUri), session]]),
++				_resolveConversationSession: () => sessionUri,
++				_connection: {
++					kind: 'ready',
++					client: {
++						request: (_method: string, params: { input: UserInput[] }) => {
++							inputs.push(params.input);
++							return Promise.resolve({});
++						},
++					},
++				},
++			};
++			const methods = CodexAgent.prototype as unknown as {
++				setPendingMessages(this: typeof harness, chat: URI, steering: PendingMessage, queued: readonly PendingMessage[]): void;
++				_takeMatchingPendingSteering(steeringSession: typeof session, text: string): PendingMessage | undefined;
++			};
++			return {
++				send: (pending: PendingMessage) => methods.setPendingMessages.call(harness, URI.parse(buildDefaultChatUri(sessionUri.toString())), pending, []),
++				take: (text: string) => methods._takeMatchingPendingSteering(session, text),
++				inputs,
++				pendingIds: () => [...session.pendingSteeringFlips.keys()],
++			};
++		}
++
++		function message(id: string, attachments?: readonly MessageAttachment[]): PendingMessage {
++			return { id, message: { text: 'Please check this', origin: { kind: MessageKind.User }, attachments } };
++		}
++
++		function browserPages(text: string): MessageAttachment {
++			return { type: MessageAttachmentKind.Simple, label: 'Browser Pages', modelRepresentation: text };
++		}
++
++		test('matches plain steering and ignores duplicate echoes', () => {
++			const h = createHarness();
++			const pending = message('plain');
++			h.send(pending);
++			h.send(pending);
++			assert.strictEqual(h.inputs.length, 1, 'pending state synchronization must not send the same steer twice');
++			assert.strictEqual(h.take(extractUserInputText(h.inputs[0])), pending);
++			assert.strictEqual(h.take(pending.message.text), undefined);
++		});
++
++		test('matches expanded browser context while preserving the original UI message', () => {
++			const h = createHarness();
++			const pending = message('browser', [browserPages('Shared browser page context')]);
++			h.send(pending);
++			const echo = extractUserInputText(h.inputs[0]);
++			assert.strictEqual(echo, 'Please check this\n\nShared browser page context');
++			assert.strictEqual(h.take(pending.message.text), undefined, 'raw prompt is not the input Codex consumed');
++			assert.strictEqual(h.take(echo), pending, 'presentation must retain the original message and attachments');
++		});
++
++		test('distinguishes equal prompts with different attachments and out-of-order echoes', () => {
++			const h = createHarness();
++			const first = message('first', [browserPages('First page')]);
++			const second = message('second', [browserPages('Second page')]);
++			h.send(first);
++			h.send(second);
++			assert.strictEqual(h.take(extractUserInputText(h.inputs[1])), second);
++			assert.deepStrictEqual(h.pendingIds(), ['first']);
++			assert.strictEqual(h.take(extractUserInputText(h.inputs[0])), first);
++			assert.deepStrictEqual(h.pendingIds(), []);
++		});
++
++		test('unrelated and duplicate echoes leave other pending steering untouched', () => {
++			const h = createHarness();
++			const first = message('first', [browserPages('First page')]);
++			const second = message('second', [browserPages('Second page')]);
++			h.send(first);
++			h.send(second);
++			assert.strictEqual(h.take('Unrelated turn opener'), undefined);
++			const echo = extractUserInputText(h.inputs[0]);
++			assert.strictEqual(h.take(echo), first);
++			assert.strictEqual(h.take(echo), undefined);
++			assert.deepStrictEqual(h.pendingIds(), ['second']);
++		});
++
++		test('matches the captured transport input without resolving mutated attachment context again', () => {
++			const h = createHarness();
++			const attachment = { type: MessageAttachmentKind.Simple, label: 'Browser Pages', modelRepresentation: 'Original page' } satisfies MessageAttachment;
++			const pending = message('changed', [attachment]);
++			h.send(pending);
++			const echo = extractUserInputText(h.inputs[0]);
++			attachment.modelRepresentation = 'Updated page';
++			assert.strictEqual(h.take(echo), pending);
++		});
++	});
++
++
+ 	ensureNoDisposablesAreLeakedInTestSuite();
+ 
+ 	test('ignores guardian review outcome warnings handled by structured events', () => {

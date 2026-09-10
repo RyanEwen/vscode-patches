@@ -3,8 +3,8 @@
 Public source patches, installed-bundle patchers, and regression scripts for RyanEwen's VS Code and agent-host-protocol work.
 
 - **[Individual patch docs](docs/fixes/README.md)** · **[Epics, issues and PR relationships](docs/UPSTREAM.md)** · **[Maintenance workflow](MAINTAINING.md)**.
-- **[Patcher catalog](CATALOG.md):** 102 current bundle-patcher entries, plus the model-host-label installer.
-- **[Source patch index](SOURCE-PATCHES.md):** snapshots and upstream links for 61 PRs, including closed and merged proposals.
+- **[Patcher catalog](CATALOG.md):** 103 current bundle-patcher entries, plus the model-host-label installer.
+- **[Source patch index](SOURCE-PATCHES.md):** snapshots and upstream links for 62 PRs, including closed and merged proposals.
 - **[Model host labels](model-host-labels/README.md):** Windows VS Code 1.136.1 workaround for duplicate-looking model groups.
 - **[Historical revisions](archive/README.md):** 14 patcher snapshots.
 - **[Standalone legacy patchers](legacy/README.md)** and **[live-bundle regression scripts](tests/live/README.md)**.

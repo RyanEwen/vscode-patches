@@ -36,6 +36,7 @@
  * multi-megabyte bundle.
  */
 import fs from 'node:fs';
+import { transformCodexSteeringInput } from './patchers/codex-steering-input.mjs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -3444,6 +3445,19 @@ const FIXES = [
 		build: (m, meta, backingKey, workspacelessKey) =>
 			`return{chatBacking:(__ahStaleBacking=>!1)(${meta}[${backingKey}]),`
 				+ `hostCreated:${meta}[${workspacelessKey}]!==void 0}`,
+	},
+	{
+		id: 'codex-steering-resolved-input',
+		target: 'agenthost',
+		title: 'steering with attached context stays pending after Codex consumes it',
+		// Match the consumed echo against the exact resolved text sent to Codex.
+		// Browser context, selected files and embedded text extend the raw prompt.
+		// Preserve the original PendingMessage for the visible turn, and wait for
+		// the actual userMessage echo rather than treating turn/steer success as ingestion.
+		// Upstream: #335547 fixes #335546. Source: [PR snapshot](../../source-patches/vscode/335547.patch).
+		unpatched: /^(?=[\s\S]*pendingSteeringFlips\.set\()[\s\S]+$/,
+		patched: /__ahSteeringInputText/,
+		build: text => transformCodexSteeringInput(text),
 	},
 ];
 

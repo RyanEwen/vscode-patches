@@ -10,6 +10,16 @@
   ],
   "issues": [
     {
+      "number": 335546,
+      "state": "OPEN",
+      "title": "Agent Host: Codex steering with attached context stays pending after consumption",
+      "url": "https://github.com/microsoft/vscode/issues/335546",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/335547"
+      ]
+    },
+    {
       "number": 334764,
       "state": "OPEN",
       "title": "Forked Skill subagents are invisible: no correlation handle from the tool call to the agent id",

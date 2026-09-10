@@ -5,7 +5,7 @@ the in-window agent host claims to be local in a remote window.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L884).
+- [Current implementation](../../patch-vscode-fixes.mjs#L885).
 - [Full catalog](../../CATALOG.md#remote-window-authority-init).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

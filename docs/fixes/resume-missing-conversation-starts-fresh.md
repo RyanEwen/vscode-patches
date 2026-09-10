@@ -5,7 +5,7 @@ cancelling a skill-subagent turn bricks a new chat permanently.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1227).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1228).
 - [Full catalog](../../CATALOG.md#resume-missing-conversation-starts-fresh).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

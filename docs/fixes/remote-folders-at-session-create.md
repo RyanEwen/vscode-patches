@@ -5,7 +5,7 @@ a session created from the chat handler in a container window gets no working di
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2375).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2376).
 - [Full catalog](../../CATALOG.md#remote-folders-at-session-create).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

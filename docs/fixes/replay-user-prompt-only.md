@@ -5,7 +5,7 @@ restored messages show context the user never typed.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1152).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1153).
 - [Full catalog](../../CATALOG.md#replay-user-prompt-only).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

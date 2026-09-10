@@ -5,7 +5,7 @@ a pasted image renders as a broken thumbnail.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L153).
+- [Current implementation](../../patch-vscode-fixes.mjs#L154).
 - [Full catalog](../../CATALOG.md#embedded-attachment-content-type).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

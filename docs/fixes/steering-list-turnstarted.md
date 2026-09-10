@@ -5,7 +5,7 @@ a steering message auto-started as a turn must leave the list.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3212).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3213).
 - [Full catalog](../../CATALOG.md#steering-list-turnstarted).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

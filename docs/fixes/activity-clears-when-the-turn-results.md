@@ -5,7 +5,7 @@ the liveness row needs a real end signal, not an empty queue.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1461).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1462).
 - [Full catalog](../../CATALOG.md#activity-clears-when-the-turn-results).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

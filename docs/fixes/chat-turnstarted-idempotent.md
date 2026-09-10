@@ -5,7 +5,7 @@ a replayed turn start keeps rebuilding the turn empty, so the response never str
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1855).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1856).
 - [Full catalog](../../CATALOG.md#chat-turnstarted-idempotent).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

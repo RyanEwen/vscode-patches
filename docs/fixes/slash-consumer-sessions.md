@@ -5,7 +5,7 @@ the session send path dereferences a prompt file that may be absent.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L536).
+- [Current implementation](../../patch-vscode-fixes.mjs#L537).
 - [Full catalog](../../CATALOG.md#slash-consumer-sessions).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -1,11 +1,12 @@
 # Source patches
 
-Snapshots of all 61 RyanEwen PRs found in microsoft/vscode and microsoft/agent-host-protocol on 2026-09-09. Closed and merged proposals are retained for reference. These are separate proposals, **not a series to apply together**. Follow the upstream PR for current status and revisions.
+Snapshots of 62 RyanEwen PRs found in microsoft/vscode and microsoft/agent-host-protocol through 2026-09-10. Closed and merged proposals are retained for reference. These are separate proposals, **not a series to apply together**. Follow the upstream PR for current status and revisions.
 
 PR #335363 was refreshed after review to include host identity for provider error groups. Its detail page records the updated head.
 
 | PR | State at snapshot | Patch and installer mapping |
 |---|---|---|
+| [microsoft/vscode#335547: Fix Codex steering acknowledgement with attached context](https://github.com/microsoft/vscode/pull/335547) | OPEN | [Details](docs/patches/vscode-335547.md) |
 | [microsoft/vscode#335363: Preserve agent host identity in Manage Language Models](https://github.com/microsoft/vscode/pull/335363) | OPEN | [Details](docs/patches/vscode-335363.md) |
 | [microsoft/vscode#334814: Seed new chat-input sessions from the remembered session-config picks](https://github.com/microsoft/vscode/pull/334814) | OPEN | [Details](docs/patches/vscode-334814.md) |
 | [microsoft/vscode#334743: Keep every pending steering message instead of only the last](https://github.com/microsoft/vscode/pull/334743) | OPEN | [Details](docs/patches/vscode-334743.md) |
@@ -67,3 +68,7 @@ PR #335363 was refreshed after review to include host identity for provider erro
 | [microsoft/vscode#330683: Do not run a client tool twice when a tool call is readied twice](https://github.com/microsoft/vscode/pull/330683) | CLOSED | [Details](docs/patches/vscode-330683.md) |
 | [microsoft/agent-host-protocol#433: chat: make the turnStarted reducer case idempotent](https://github.com/microsoft/agent-host-protocol/pull/433) | OPEN | [Details](docs/patches/agent-host-protocol-433.md) |
 | [microsoft/agent-host-protocol#405: chat: report progress for a running tool call](https://github.com/microsoft/agent-host-protocol/pull/405) | OPEN | [Details](docs/patches/agent-host-protocol-405.md) |
+
+## Codex steering input proposal
+
+The [source proposal](source-patches/vscode/335547.patch) targets VS Code base `1efa8b317e0d479d189913feb2cd84e6f5d52cf6`. [Bundle maintenance details](docs/fixes/codex-steering-resolved-input.md) describe the independently guarded backport. Published as [microsoft/vscode#335547](https://github.com/microsoft/vscode/pull/335547), fixing [#335546](https://github.com/microsoft/vscode/issues/335546). [Source and validation details](docs/patches/vscode-335547.md).

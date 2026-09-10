@@ -5,7 +5,7 @@ a steering message is forgotten once it is queued.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L341).
+- [Current implementation](../../patch-vscode-fixes.mjs#L342).
 - [Full catalog](../../CATALOG.md#steering-buffer).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

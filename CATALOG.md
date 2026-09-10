@@ -1,6 +1,6 @@
 # Patcher catalog
 
-102 current bundle-patcher entries, plus the separate model-host-label installer. Entries are identified by their patcher ID; a matching upstream PR does not establish compatibility with a given installed build. Inspect `--status` before applying. Dependencies and tradeoffs remain documented alongside each entry in the script.
+103 current bundle-patcher entries, plus the separate model-host-label installer. Entries are identified by their patcher ID; a matching upstream PR does not establish compatibility with a given installed build. Inspect `--status` before applying. Dependencies and tradeoffs remain documented alongside each entry in the script.
 
 ## client-tool-input-schema
 
@@ -821,3 +821,11 @@ Target: **agenthost**. [Patcher source](patch-vscode-fixes.mjs#L3411). Upstream:
 ## model-host-labels
 
 Distinguish local and remote model registrations and provider error groups in Manage Language Models. Status-only groups retain host labels and session identity. [Build-specific installer, revision upgrade, and rollback](model-host-labels/README.md). [PR #335363](https://github.com/microsoft/vscode/pull/335363).
+
+## codex-steering-resolved-input
+
+[Maintenance details](docs/fixes/codex-steering-resolved-input.md).
+
+Steering with attached context remains pending after Codex consumes it. Match acknowledgements against the resolved input actually sent while preserving the original displayed message.
+
+Target: **agenthost**. Tested on VS Code 1.137.0 build `645f29cc31`; this does not establish compatibility of the other entries with that build. See [validation](VALIDATION.md).

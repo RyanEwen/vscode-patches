@@ -5,7 +5,7 @@ a client tool result is dropped when it arrives before the SDK asks for it.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L182).
+- [Current implementation](../../patch-vscode-fixes.mjs#L183).
 - [Full catalog](../../CATALOG.md#client-tool-buffer).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

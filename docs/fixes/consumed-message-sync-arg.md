@@ -5,7 +5,7 @@ reconciliation is not told which message the host consumed.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L720).
+- [Current implementation](../../patch-vscode-fixes.mjs#L721).
 - [Full catalog](../../CATALOG.md#consumed-message-sync-arg).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

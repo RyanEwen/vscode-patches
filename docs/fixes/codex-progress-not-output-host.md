@@ -5,7 +5,7 @@ MCP progress narration is persisted as the tool result.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2830).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2831).
 - [Full catalog](../../CATALOG.md#codex-progress-not-output-host).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

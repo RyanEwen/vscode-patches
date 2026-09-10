@@ -5,7 +5,7 @@ a duplicate tool_use_id orphans the first request, which then never settles.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3137).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3138).
 - [Full catalog](../../CATALOG.md#register-and-fire-reuses-parked).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

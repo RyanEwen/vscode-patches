@@ -5,7 +5,7 @@ a subagent client tool call no window can run is never failed.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2198).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2199).
 - [Full catalog](../../CATALOG.md#client-tool-ownerless-fail-subagent).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

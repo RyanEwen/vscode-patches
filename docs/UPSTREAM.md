@@ -13,6 +13,7 @@
 
 | Issue | State at snapshot | Related source proposals |
 |---|---|---|
+| [microsoft/vscode#335546: Agent Host: Codex steering with attached context stays pending after consumption](https://github.com/microsoft/vscode/issues/335546) | OPEN | [#335547](https://github.com/microsoft/vscode/pull/335547) |
 | [microsoft/vscode#334764: Forked Skill subagents are invisible: no correlation handle from the tool call to the agent id](https://github.com/microsoft/vscode/issues/334764) | OPEN |  |
 | [microsoft/vscode#334631: Agent host renders nothing for a skill that runs in a subagent](https://github.com/microsoft/vscode/issues/334631) | OPEN |  |
 | [microsoft/vscode#334575: Agent host: a local slash command's output is never shown, leaving an empty turn](https://github.com/microsoft/vscode/issues/334575) | OPEN |  |
@@ -35,4 +36,4 @@
 | [microsoft/vscode#330941: Session list change counts show the whole branch divergence, not the session's changes](https://github.com/microsoft/vscode/issues/330941) | OPEN | [#331345](https://github.com/microsoft/vscode/pull/331345), [#330942](https://github.com/microsoft/vscode/pull/330942) |
 | [microsoft/vscode#330899: Agent host: client tools execute off the stream-mapper ready rather than the SDK invocation](https://github.com/microsoft/vscode/issues/330899) | OPEN | [#330933](https://github.com/microsoft/vscode/pull/330933), [#330730](https://github.com/microsoft/vscode/pull/330730), [#330684](https://github.com/microsoft/vscode/pull/330684), [#330683](https://github.com/microsoft/vscode/pull/330683) |
 
-[All 61 PR source snapshots](../SOURCE-PATCHES.md) · [All patcher entries](fixes/README.md). Relationships reflect explicit references and documented topic mappings, not a promise that each workaround implements an entire PR.
+[All 62 PR source snapshots](../SOURCE-PATCHES.md) · [All patcher entries](fixes/README.md). Relationships reflect explicit references and documented topic mappings, not a promise that each workaround implements an entire PR.

@@ -5,7 +5,7 @@ session stashes the active turn id.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L256).
+- [Current implementation](../../patch-vscode-fixes.mjs#L257).
 - [Full catalog](../../CATALOG.md#replay-turnid).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

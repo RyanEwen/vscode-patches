@@ -5,7 +5,7 @@ client tool wiring routes through the replay-aware awaiter.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L247).
+- [Current implementation](../../patch-vscode-fixes.mjs#L248).
 - [Full catalog](../../CATALOG.md#replay-route).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

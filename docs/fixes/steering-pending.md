@@ -5,7 +5,7 @@ the pipeline only receives the steering id, not the message.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L332).
+- [Current implementation](../../patch-vscode-fixes.mjs#L333).
 - [Full catalog](../../CATALOG.md#steering-pending).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ one unresolvable subagent chat rejects every turn the session will ever start.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2777).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2778).
 - [Full catalog](../../CATALOG.md#peer-chat-unavailable-subagent).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

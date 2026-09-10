@@ -5,7 +5,7 @@ the per-chat projection drops the steering list.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3232).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3233).
 - [Full catalog](../../CATALOG.md#steering-list-merge).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 
