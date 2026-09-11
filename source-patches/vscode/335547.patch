@@ -1,7 +1,8 @@
 From 3d6d2c336fb65bb4db776bc237b1beabe87a9f49 Mon Sep 17 00:00:00 2001
 From: Ryan Ewen <ryan.ewen@gmail.com>
 Date: Thu, 10 Sep 2026 15:58:56 -0400
-Subject: [PATCH] Fix Codex steering acknowledgement with attachment context
+Subject: [PATCH 1/2] Fix Codex steering acknowledgement with attachment
+ context
 
 ---
  .../agentHost/node/codex/codexAgent.ts        |  28 +++--
@@ -9,7 +10,7 @@ Subject: [PATCH] Fix Codex steering acknowledgement with attachment context
  2 files changed, 121 insertions(+), 10 deletions(-)
 
 diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
-index 57cc1ef22d673..01fa865a91115 100644
+index 57cc1ef22d6..01fa865a911 100644
 --- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
 +++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
 @@ -519,6 +519,11 @@ interface ICodexTargetChat {
@@ -96,7 +97,7 @@ index 57cc1ef22d673..01fa865a91115 100644
  			threadId,
  			input: input.slice(),
 diff --git a/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
-index 6d4e7745a8a8b..d2a6e0fc3e463 100644
+index 6d4e7745a8a..d2a6e0fc3e4 100644
 --- a/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
 +++ b/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
 @@ -14,10 +14,12 @@ import { AgentChatMigrationDeferred, AgentSession, CODEX_AGENT_PROVIDER_ID, type
@@ -219,3 +220,32 @@ index 6d4e7745a8a8b..d2a6e0fc3e463 100644
  	ensureNoDisposablesAreLeakedInTestSuite();
  
  	test('ignores guardian review outcome warnings handled by structured events', () => {
+-- 
+2.43.0
+
+
+From 83d94dd0c872694948cb3d3aaf9d32f4d3ae644f Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Fri, 11 Sep 2026 14:54:57 -0400
+Subject: [PATCH 2/2] Fix steering test attachment parameter type
+
+---
+ src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
+index d2a6e0fc3e4..c281ee15c65 100644
+--- a/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
++++ b/src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts
+@@ -185,7 +185,7 @@ suite('CodexAgent', () => {
+ 			};
+ 		}
+ 
+-		function message(id: string, attachments?: readonly MessageAttachment[]): PendingMessage {
++		function message(id: string, attachments?: MessageAttachment[]): PendingMessage {
+ 			return { id, message: { text: 'Please check this', origin: { kind: MessageKind.User }, attachments } };
+ 		}
+ 
+-- 
+2.43.0
+

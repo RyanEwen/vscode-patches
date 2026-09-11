@@ -1164,7 +1164,7 @@
   "prs": [
     {
       "headRefName": "fix/codex-steering-resolved-input",
-      "headRefOid": "3d6d2c336fb65bb4db776bc237b1beabe87a9f49",
+      "headRefOid": "83d94dd0c872694948cb3d3aaf9d32f4d3ae644f",
       "number": 335547,
       "state": "OPEN",
       "title": "Fix Codex steering acknowledgement with attached context",
