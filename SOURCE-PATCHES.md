@@ -1,11 +1,12 @@
 # Source patches
 
-Snapshots of 62 RyanEwen PRs found in microsoft/vscode and microsoft/agent-host-protocol through 2026-09-10. Closed and merged proposals are retained for reference. These are separate proposals, **not a series to apply together**. Follow the upstream PR for current status and revisions.
+Snapshots of 63 RyanEwen PRs found in microsoft/vscode and microsoft/agent-host-protocol through 2026-09-14. Closed and merged proposals are retained for reference. These are separate proposals, **not a series to apply together**. Follow the upstream PR for current status and revisions.
 
 PR #335363 was refreshed after review to include host identity for provider error groups. Its detail page records the updated head.
 
 | PR | State at snapshot | Patch and installer mapping |
 |---|---|---|
+| [microsoft/vscode#336162: Fall back when the IPC runtime directory is unavailable](https://github.com/microsoft/vscode/pull/336162) | OPEN | [Details](docs/patches/vscode-336162.md) |
 | [microsoft/vscode#335547: Fix Codex steering acknowledgement with attached context](https://github.com/microsoft/vscode/pull/335547) | OPEN | [Details](docs/patches/vscode-335547.md) |
 | [microsoft/vscode#335363: Preserve agent host identity in Manage Language Models](https://github.com/microsoft/vscode/pull/335363) | OPEN | [Details](docs/patches/vscode-335363.md) |
 | [microsoft/vscode#334814: Seed new chat-input sessions from the remembered session-config picks](https://github.com/microsoft/vscode/pull/334814) | OPEN | [Details](docs/patches/vscode-334814.md) |

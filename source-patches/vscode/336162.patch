@@ -1,0 +1,111 @@
+From a5eab6ad66c3ecbd17f26b2528734ca778d5a60d Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Mon, 14 Sep 2026 11:28:33 -0400
+Subject: [PATCH] Fall back when the IPC runtime directory is unavailable
+
+---
+ src/vs/base/parts/ipc/node/ipc.net.ts         | 18 ++++++++--
+ .../base/parts/ipc/test/node/ipc.net.test.ts  | 36 ++++++++++++-------
+ 2 files changed, 39 insertions(+), 15 deletions(-)
+
+diff --git a/src/vs/base/parts/ipc/node/ipc.net.ts b/src/vs/base/parts/ipc/node/ipc.net.ts
+index d97410ac085..b0223399c8b 100644
+--- a/src/vs/base/parts/ipc/node/ipc.net.ts
++++ b/src/vs/base/parts/ipc/node/ipc.net.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { createHash } from 'crypto';
++import { accessSync, constants, statSync } from 'fs';
+ import type * as http from 'http';
+ import { Server as NetServer, Socket, createConnection, createServer } from 'net';
+ import { tmpdir } from 'os';
+@@ -741,7 +742,7 @@ const safeIpcPathLengths: { [platform: number]: number } = {
+ 	[Platform.Mac]: 103
+ };
+ 
+-export function createRandomIPCHandle(): string {
++export function createRandomIPCHandle(runtimeDir: string | undefined = XDG_RUNTIME_DIR): string {
+ 	const randomSuffix = generateUuid();
+ 
+ 	// Windows: use named pipe
+@@ -750,8 +751,19 @@ export function createRandomIPCHandle(): string {
+ 	}
+ 
+ 	// Mac & Unix: Use socket file
+-	// Unix: Prefer XDG_RUNTIME_DIR over user data path
+-	const basePath = process.platform !== 'darwin' && XDG_RUNTIME_DIR ? XDG_RUNTIME_DIR : tmpdir();
++	// Unix: Prefer XDG_RUNTIME_DIR when it is usable. WSL can preserve the variable
++	// across a restart without starting the user runtime directory first.
++	let basePath = tmpdir();
++	if (process.platform !== 'darwin' && runtimeDir) {
++		try {
++			if (statSync(runtimeDir).isDirectory()) {
++				accessSync(runtimeDir, constants.W_OK | constants.X_OK);
++				basePath = runtimeDir;
++			}
++		} catch {
++			// Fall back to the same temporary directory used when XDG_RUNTIME_DIR is unset.
++		}
++	}
+ 
+ 	// As of Node.js 24, socket paths that exceed the
+ 	// platform limit cause an `EINVAL` error at bind time instead of being silently
+diff --git a/src/vs/base/parts/ipc/test/node/ipc.net.test.ts b/src/vs/base/parts/ipc/test/node/ipc.net.test.ts
+index e0621d0900b..1d9e8c9ab1f 100644
+--- a/src/vs/base/parts/ipc/test/node/ipc.net.test.ts
++++ b/src/vs/base/parts/ipc/test/node/ipc.net.test.ts
+@@ -639,26 +639,38 @@ flakySuite('IPC, create handle', () => {
+ 		return testIPCHandle(createRandomIPCHandle());
+ 	});
+ 
++	test('createRandomIPCHandle falls back when the runtime directory is missing', () => {
++		if (process.platform !== 'linux') {
++			return;
++		}
++
++		const missingRuntimeDir = `${tmpdir()}/vscode-ipc-missing-${process.pid}-${Date.now()}`;
++		const handle = createRandomIPCHandle(missingRuntimeDir);
++		assert.ok(handle.startsWith(`${tmpdir()}/`));
++		return testIPCHandle(handle);
++	});
++
++	test('createRandomIPCHandle falls back when the runtime path is not a directory', () => {
++		if (process.platform !== 'linux') {
++			return;
++		}
++
++		const handle = createRandomIPCHandle(process.execPath);
++		assert.ok(handle.startsWith(`${tmpdir()}/`));
++		return testIPCHandle(handle);
++	});
++
+ 	test('createStaticIPCHandle', async () => {
+ 		return testIPCHandle(createStaticIPCHandle(tmpdir(), 'test', '1.64.0'));
+ 	});
+ 
+ 	function testIPCHandle(handle: string): Promise<void> {
+ 		return new Promise<void>((resolve, reject) => {
+-			const pipeName = createRandomIPCHandle();
+-
+ 			const server = createServer();
+-
+-			server.on('error', () => {
+-				return new Promise(() => server.close(() => reject()));
+-			});
+-
+-			server.listen(pipeName, () => {
++			server.once('error', reject);
++			server.listen(handle, () => {
+ 				server.removeListener('error', reject);
+-
+-				return new Promise(() => {
+-					server.close(() => resolve());
+-				});
++				server.close(error => error ? reject(error) : resolve());
+ 			});
+ 		});
+ 	}
+-- 
+2.43.0
+
