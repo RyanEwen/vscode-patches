@@ -1,7 +1,7 @@
 From 07ce4a54bfa9875f769056be4d672122b11e72b1 Mon Sep 17 00:00:00 2001
 From: Ryan Ewen <ryan.ewen@gmail.com>
 Date: Wed, 16 Sep 2026 10:40:06 -0400
-Subject: [PATCH] Fix agent feedback review commands in editor windows
+Subject: [PATCH 1/2] Fix agent feedback review commands in editor windows
 
 ---
  .../agentHost/agentHost.contribution.ts       |   2 +
@@ -504,3 +504,152 @@ index 0000000000000..b3b4e1a95000f
 +		assert.strictEqual(part.domNode.textContent, before);
 +	});
 +});
+
+From cc59706b4b6349329f7af86d159e654eb1864093 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 16 Sep 2026 10:59:26 -0400
+Subject: [PATCH 2/2] Dispose review operation listeners and announce loading
+ errors
+
+---
+ .../agentHostFeedbackReviewCommands.ts        |  4 ++-
+ ...tAgentFeedbackReviewConfirmationSubPart.ts |  5 +++-
+ .../agentHostFeedbackReviewCommands.test.ts   | 30 +++++++++++++++++++
+ ...hatAgentFeedbackReviewConfirmation.test.ts |  7 +++++
+ 4 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts
+index 5593598a678a0..a704b2d718756 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts
+@@ -148,12 +148,14 @@ class AgentHostFeedbackReviewOperations extends Disposable {
+ 		// Peer-chat fragments resolve to the owning session's shared annotations.
+ 		const channel = buildAnnotationsUri(resolved.backendSession.toString());
+ 		const ref = resolved.connection.getSubscription(StateComponents.Annotations, URI.parse(channel), AgentHostFeedbackReviewCommands.ID);
++		const cancellation = new CancellationTokenSource(this._cancellation.token);
+ 		try {
+ 			const subscription = ref.object;
+ 			const value = observableFromEvent(this, Event.any(subscription.onDidChange, subscription.onDidError ?? Event.None), () => subscription.value);
+-			const state = await waitForState(value, (state): state is AnnotationsState => !!state && !(state instanceof Error), state => state instanceof Error ? state : undefined, this._cancellation.token);
++			const state = await waitForState(value, (state): state is AnnotationsState => !!state && !(state instanceof Error), state => state instanceof Error ? state : undefined, cancellation.token);
+ 			return await run(state, resolved.connection, channel);
+ 		} finally {
++			cancellation.dispose(true);
+ 			ref.dispose();
+ 		}
+ 	}
+diff --git a/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts b/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts
+index b2447f0bd0b52..af2b3889b8c4f 100644
+--- a/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts
++++ b/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts
+@@ -3,6 +3,7 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
++import { alert } from '../../../../../../../base/browser/ui/aria/aria.js';
+ import * as dom from '../../../../../../../base/browser/dom.js';
+ import { ActionBar } from '../../../../../../../base/browser/ui/actionbar/actionbar.js';
+ import { getDefaultHoverDelegate } from '../../../../../../../base/browser/ui/hover/hoverDelegateFactory.js';
+@@ -141,7 +142,9 @@ export class ChatAgentFeedbackReviewConfirmationSubPart extends AbstractToolConf
+ 		} catch (error) {
+ 			this.logService.warn('[AgentFeedbackReview] Failed to fetch unreviewed comments', error);
+ 			if (!this._store.isDisposed) {
+-				listElement.append(dom.$('.chat-agent-feedback-review-empty', undefined, localize('agentFeedback.loadFailed', "Could not load review comments. Cancel this request and try again.")));
++				const message = localize('agentFeedback.loadFailed', "Could not load review comments. Cancel this request and try again.");
++				listElement.append(dom.$('.chat-agent-feedback-review-empty', undefined, message));
++				alert(message);
+ 			}
+ 			return;
+ 		}
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts
+index f2b6747b2e40d..91492145af103 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts
+@@ -4,6 +4,8 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import assert from 'assert';
++import { stub } from 'sinon';
++import { toDisposable } from '../../../../../../base/common/lifecycle.js';
+ import { Emitter, Event } from '../../../../../../base/common/event.js';
+ import { URI } from '../../../../../../base/common/uri.js';
+ import { mock } from '../../../../../../base/test/common/mock.js';
+@@ -148,6 +150,34 @@ suite('AgentHostFeedbackReviewCommands', () => {
+ 		assert.strictEqual(fixture.references, 0);
+ 	});
+ 
++	test('completed commands release their parent cancellation listeners before contribution disposal', async () => {
++		const fixture = setup({ annotations: [] });
++		await fixture.run(AgentFeedbackReviewCommandId.GetComments);
++		// eslint-disable-next-line local/code-no-bracket-notation-for-identifiers -- Inspect the lifetime token without adding a public test-only API.
++		const token = fixture.contribution['_commands'].value!['_cancellation'].token;
++		const subscribe = token.onCancellationRequested;
++		let listeners = 0;
++		const event: typeof subscribe = (listener, thisArgs, disposables) => {
++			const subscription = subscribe(listener, thisArgs, disposables);
++			listeners++;
++			return toDisposable(() => {
++				listeners--;
++				subscription.dispose();
++			});
++		};
++		const replacement = stub(token, 'onCancellationRequested').get(() => event);
++		try {
++			for (let i = 0; i < 3; i++) {
++				await fixture.run(AgentFeedbackReviewCommandId.GetComments);
++			}
++			fixture.fail(new Error('load failed'));
++			await assert.rejects(fixture.run(AgentFeedbackReviewCommandId.GetComments), /load failed/);
++			assert.strictEqual(listeners, 0);
++		} finally {
++			replacement.restore();
++		}
++	});
++
+ 	test('cancels pending hydration on disposal', async () => {
+ 		const fixture = setup(undefined);
+ 		const pending = fixture.run(AgentFeedbackReviewCommandId.GetComments);
+diff --git a/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts b/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts
+index b3b4e1a95000f..d14b49ea5b0e1 100644
+--- a/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts
++++ b/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts
+@@ -4,6 +4,7 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import assert from 'assert';
++import { setARIAContainer } from '../../../../../../../base/browser/ui/aria/aria.js';
+ import { DeferredPromise } from '../../../../../../../base/common/async.js';
+ import { Event } from '../../../../../../../base/common/event.js';
+ import { observableValue } from '../../../../../../../base/common/observable.js';
+@@ -48,6 +49,8 @@ suite('ChatAgentFeedbackReviewConfirmation', () => {
+ 
+ 	test('a command failure is not presented as no unreviewed comments', async () => {
+ 		const result = new DeferredPromise<IChatAgentFeedbackReviewComment[]>();
++		const aria = document.createElement('div');
++		setARIAContainer(aria);
+ 		const part = createPart(result.p);
+ 		await result.error(new Error('command not found'));
+ 		await Promise.resolve();
+@@ -55,6 +58,7 @@ suite('ChatAgentFeedbackReviewConfirmation', () => {
+ 			failed: part.domNode.textContent?.includes('Could not load review comments.'),
+ 			empty: part.domNode.textContent?.includes('No unreviewed comments.'),
+ 		}, { failed: true, empty: false });
++		assert.strictEqual(aria.querySelector('[role=alert]')?.textContent, 'Could not load review comments. Cancel this request and try again.');
+ 	});
+ 
+ 	test('a successful empty result remains distinguishable from a failure', async () => {
+@@ -70,11 +74,14 @@ suite('ChatAgentFeedbackReviewConfirmation', () => {
+ 
+ 	test('a late failure does not update a disposed confirmation', async () => {
+ 		const result = new DeferredPromise<IChatAgentFeedbackReviewComment[]>();
++		const aria = document.createElement('div');
++		setARIAContainer(aria);
+ 		const part = createPart(result.p);
+ 		part.dispose();
+ 		const before = part.domNode.textContent;
+ 		await result.error(new Error('disconnected'));
+ 		await Promise.resolve();
+ 		assert.strictEqual(part.domNode.textContent, before);
++		assert.strictEqual(aria.textContent, '');
+ 	});
+ });

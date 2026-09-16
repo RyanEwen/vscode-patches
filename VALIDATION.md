@@ -38,3 +38,7 @@ PR #335363 review follow-up:
 [PR #336430](docs/patches/vscode-336430.md): 15 focused Chromium tests passed; targeted diagnostics for all five changed TypeScript files were zero; targeted ESLint and Git whitespace checks passed. The GitHub source snapshot passed reverse-apply validation against the fixed worktree. Pre-submission review covered lazy host startup, layer separation, hydration and disposal, explicit selection, stale IDs, and interrupted reveals.
 
 The tests used freshly transpiled changed modules with existing compiled dependencies. Full transpilation was unavailable because the existing dependency installation lacked esbuild. The broader layer check was interrupted after WSL became unresponsive. No full build, installed-bundle deployment or live WSL UI verification is claimed. The combined installer is unchanged.
+
+### PR #336430 automated review follow-up
+
+Head `cc59706b4b6349329f7af86d159e654eb1864093` addresses cancellation-listener retention and asynchronous screen-reader error announcements. Sixteen focused Chromium tests passed, targeted TypeScript diagnostics were zero, and lint plus whitespace checks passed. The refreshed source snapshot passed reverse-apply validation. No installed-bundle, live screen-reader or WSL UI validation is claimed.
