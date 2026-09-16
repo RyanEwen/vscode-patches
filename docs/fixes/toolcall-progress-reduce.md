@@ -5,7 +5,7 @@ the client has nowhere to record tool call progress.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L805).
+- [Current implementation](../../patch-vscode-fixes.mjs#L806).
 - [Full catalog](../../CATALOG.md#toolcall-progress-reduce).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

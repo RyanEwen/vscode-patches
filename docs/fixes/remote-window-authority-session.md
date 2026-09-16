@@ -5,7 +5,7 @@ the session handler is told the host is local.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L915).
+- [Current implementation](../../patch-vscode-fixes.mjs#L916).
 - [Full catalog](../../CATALOG.md#remote-window-authority-session).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

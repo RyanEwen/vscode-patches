@@ -36,6 +36,7 @@
  * multi-megabyte bundle.
  */
 import fs from 'node:fs';
+import { transformAgentFeedbackReview } from './patchers/agent-feedback-review.mjs';
 import { transformCodexSteeringInput } from './patchers/codex-steering-input.mjs';
 import path from 'node:path';
 import os from 'node:os';
@@ -3458,6 +3459,20 @@ const FIXES = [
 		unpatched: /^(?=[\s\S]*pendingSteeringFlips\.set\()[\s\S]+$/,
 		patched: /__ahSteeringInputText/,
 		build: text => transformCodexSteeringInput(text),
+	},
+	{
+		id: 'agent-feedback-review-editor',
+		target: 'workbench',
+		title: 'review confirmations cannot load comments in regular editor windows',
+		// Backport of #336430, fixing #336428, including cancellation and ARIA review fixes.
+		// Editor-only commands read the owning host's annotations after hydration.
+		// Explicit selection precedes approval; failed loads are not empty results.
+		// Validated on Windows ARM64 1.137.0 build 645f29cc31; this same client
+		// renders Windows and WSL editor windows. No server bundle changes are needed.
+		// Strict structural guards exclude the dedicated Agents-window bundle.
+		unpatched: /^(?=[\s\S]*"workbench.contrib.chat.agentHostLegacyMigrationGate")[\s\S]+$/,
+		patched: /__ahFeedbackReviewV1/,
+		build: transformAgentFeedbackReview,
 	},
 ];
 

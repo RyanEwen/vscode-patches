@@ -5,7 +5,7 @@ the agent host does not know the progress action either.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L819).
+- [Current implementation](../../patch-vscode-fixes.mjs#L820).
 - [Full catalog](../../CATALOG.md#toolcall-progress-reduce-host).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

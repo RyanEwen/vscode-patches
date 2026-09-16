@@ -5,7 +5,7 @@ a client tool runs with empty input when its arguments never streamed.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L62).
+- [Current implementation](../../patch-vscode-fixes.mjs#L63).
 - [Full catalog](../../CATALOG.md#client-tool-input-schema).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

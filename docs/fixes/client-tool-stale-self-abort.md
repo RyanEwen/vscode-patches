@@ -5,7 +5,7 @@ a client tool abandons itself when only its label changes.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1690).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1691).
 - [Full catalog](../../CATALOG.md#client-tool-stale-self-abort).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

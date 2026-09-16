@@ -5,7 +5,7 @@ a client cancelling a subscribe is reported as a missing resource, at error leve
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2971).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2972).
 - [Full catalog](../../CATALOG.md#subscribe-cancelled-not-missing).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

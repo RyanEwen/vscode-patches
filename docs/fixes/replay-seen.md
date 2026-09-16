@@ -5,7 +5,7 @@ session records which tool calls actually streamed, and under which turn.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L267).
+- [Current implementation](../../patch-vscode-fixes.mjs#L268).
 - [Full catalog](../../CATALOG.md#replay-seen).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

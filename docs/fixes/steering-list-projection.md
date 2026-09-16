@@ -5,7 +5,7 @@ only one steering bubble is projected into the chat model.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3247).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3248).
 - [Full catalog](../../CATALOG.md#steering-list-projection).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

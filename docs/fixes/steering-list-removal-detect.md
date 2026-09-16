@@ -5,7 +5,7 @@ the sidebar retires the previous steering bubble whenever the id changes.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3260).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3261).
 - [Full catalog](../../CATALOG.md#steering-list-removal-detect).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

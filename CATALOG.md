@@ -1,10 +1,12 @@
 # Patcher catalog
 
-103 current bundle-patcher entries, plus the separate model-host-label installer. Entries are identified by their patcher ID; a matching upstream PR does not establish compatibility with a given installed build. Inspect `--status` before applying. Dependencies and tradeoffs remain documented alongside each entry in the script.
+104 current bundle-patcher entries, plus the separate model-host-label installer. Entries are identified by their patcher ID; a matching upstream PR does not establish compatibility with a given installed build. Inspect `--status` before applying. Dependencies and tradeoffs remain documented alongside each entry in the script.
 
-## Source-only review confirmation fix
+## agent-feedback-review-editor
 
-[PR #336430](docs/patches/vscode-336430.md) adds the missing review-comment commands in regular editor windows and distinguishes loading failures from an empty list. This source patch targets its recorded upstream base; it has no installed-bundle entry.
+[Maintenance details](docs/fixes/agent-feedback-review-editor.md). Target: **workbench**.
+
+Backports [PR #336430](docs/patches/vscode-336430.md), including its cancellation-listener and accessibility review fixes. Registers the missing editor-window comment commands and distinguishes loading failures from an empty list. Validated on Windows ARM64 VS Code 1.137.0 build `645f29cc31`; the Windows client also renders Ubuntu WSL editor windows. No WSL agent-host bundle change is needed. The dedicated Agents window is excluded by the structural guard.
 
 ## client-tool-input-schema
 

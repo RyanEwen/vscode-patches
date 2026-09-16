@@ -5,7 +5,7 @@ a message containing a slash command never submits in a remote window.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L488).
+- [Current implementation](../../patch-vscode-fixes.mjs#L489).
 - [Full catalog](../../CATALOG.md#slash-resolve-harness).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a rejected client-tool wait escapes the MCP handler as a bare "Canceled".
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3043).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3044).
 - [Full catalog](../../CATALOG.md#client-tool-handler-never-throws).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

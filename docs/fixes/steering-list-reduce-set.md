@@ -5,7 +5,7 @@ a second steering message evicts the first from the sidebar.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3163).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3164).
 - [Full catalog](../../CATALOG.md#steering-list-reduce-set).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

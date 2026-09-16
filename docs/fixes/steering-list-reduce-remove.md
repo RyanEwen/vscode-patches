@@ -5,7 +5,7 @@ removing one steering message must not drop the others.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3194).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3195).
 - [Full catalog](../../CATALOG.md#steering-list-reduce-remove).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

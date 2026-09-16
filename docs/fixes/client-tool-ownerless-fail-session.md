@@ -5,7 +5,7 @@ the SDK handler for a failed client tool call still parks forever.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2235).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2236).
 - [Full catalog](../../CATALOG.md#client-tool-ownerless-fail-session).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

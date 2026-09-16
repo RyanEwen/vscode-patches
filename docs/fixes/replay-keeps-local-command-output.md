@@ -5,7 +5,7 @@ a slash command's output is dropped on replay, so a restart empties the turn.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3346).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3347).
 - [Full catalog](../../CATALOG.md#replay-keeps-local-command-output).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ reconciliation cancels the consumed message and settles nothing.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L686).
+- [Current implementation](../../patch-vscode-fixes.mjs#L687).
 - [Full catalog](../../CATALOG.md#consumed-message-sync-reconcile).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

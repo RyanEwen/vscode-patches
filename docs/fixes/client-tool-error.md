@@ -5,7 +5,7 @@ a client tool error reaches the model as an empty result.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L205).
+- [Current implementation](../../patch-vscode-fixes.mjs#L206).
 - [Full catalog](../../CATALOG.md#client-tool-error).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

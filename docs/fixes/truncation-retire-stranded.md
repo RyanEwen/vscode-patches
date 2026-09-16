@@ -5,7 +5,7 @@ a stranded optimistic truncation is replayed forever and blanks the transcript.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1904).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1905).
 - [Full catalog](../../CATALOG.md#truncation-retire-stranded).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

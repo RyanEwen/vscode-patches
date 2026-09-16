@@ -5,7 +5,7 @@ a turn interrupted by a steer renders as failed.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L740).
+- [Current implementation](../../patch-vscode-fixes.mjs#L741).
 - [Full catalog](../../CATALOG.md#steer-preempt-not-error).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

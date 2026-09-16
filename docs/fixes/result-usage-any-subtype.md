@@ -5,7 +5,7 @@ a turn that stops at a cap reports none of the tokens it spent.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1329).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1330).
 - [Full catalog](../../CATALOG.md#result-usage-any-subtype).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

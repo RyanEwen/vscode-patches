@@ -5,7 +5,7 @@ the chat widget applies header metadata from an absent prompt file.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L570).
+- [Current implementation](../../patch-vscode-fixes.mjs#L571).
 - [Full catalog](../../CATALOG.md#slash-consumer-widget-header).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

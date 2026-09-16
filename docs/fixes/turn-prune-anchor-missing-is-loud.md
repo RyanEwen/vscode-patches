@@ -5,7 +5,7 @@ restoring a checkpoint at a turn with no database row silently prunes nothing.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1481).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1482).
 - [Full catalog](../../CATALOG.md#turn-prune-anchor-missing-is-loud).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

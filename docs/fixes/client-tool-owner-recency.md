@@ -5,7 +5,7 @@ a tool call is stamped with a client that has gone away.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L580).
+- [Current implementation](../../patch-vscode-fixes.mjs#L581).
 - [Full catalog](../../CATALOG.md#client-tool-owner-recency).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

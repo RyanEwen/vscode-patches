@@ -5,7 +5,7 @@ the prompts service resolver rejects on an unreadable slash command.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L517).
+- [Current implementation](../../patch-vscode-fixes.mjs#L518).
 - [Full catalog](../../CATALOG.md#slash-resolve-prompts).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

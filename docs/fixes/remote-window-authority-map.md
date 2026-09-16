@@ -5,7 +5,7 @@ agent host file paths are handed to the client unmapped.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L927).
+- [Current implementation](../../patch-vscode-fixes.mjs#L928).
 - [Full catalog](../../CATALOG.md#remote-window-authority-map).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

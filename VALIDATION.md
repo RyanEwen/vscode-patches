@@ -42,3 +42,9 @@ The tests used freshly transpiled changed modules with existing compiled depende
 ### PR #336430 automated review follow-up
 
 Head `cc59706b4b6349329f7af86d159e654eb1864093` addresses cancellation-listener retention and asynchronous screen-reader error announcements. Sixteen focused Chromium tests passed, targeted TypeScript diagnostics were zero, and lint plus whitespace checks passed. The refreshed source snapshot passed reverse-apply validation. No installed-bundle, live screen-reader or WSL UI validation is claimed.
+
+## Review confirmation installed-bundle deployment, 2026-09-16
+
+The `agent-feedback-review-editor` entry backports [PR #336430](docs/patches/vscode-336430.md), including both automated review fixes. Ten bundle tests passed against the candidate and installed Windows ARM64 1.137.0 workbench (`645f29cc31`). Staged apply/reapply, exact rollback, existing model-label preservation and checksum/manifest verification passed. The workbench hash is `750a7570d6ec2b269d2308e5efc2fa9d0a326f998d6359b44ce2981d60bbb5a3`. Exact installation and model-label rollback backups were retained privately.
+
+The shared Windows editor client also handles Ubuntu WSL windows, so no WSL server file changed. The dedicated Agents window and all other hosts were untouched. No window reload, full restart, live UI or live screen-reader verification was performed. New backport messages are English.

@@ -5,7 +5,7 @@ drive execution for a replayed (never-streamed) client tool call.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L283).
+- [Current implementation](../../patch-vscode-fixes.mjs#L284).
 - [Full catalog](../../CATALOG.md#replay-drive).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

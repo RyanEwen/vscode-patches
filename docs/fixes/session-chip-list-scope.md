@@ -5,7 +5,7 @@ the session list re-derives the chip from the branch for inactive sessions.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L450).
+- [Current implementation](../../patch-vscode-fixes.mjs#L451).
 - [Full catalog](../../CATALOG.md#session-chip-list-scope).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

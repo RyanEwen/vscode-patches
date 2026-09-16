@@ -5,7 +5,7 @@ sessions never list in remote windows.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L82).
+- [Current implementation](../../patch-vscode-fixes.mjs#L83).
 - [Full catalog](../../CATALOG.md#session-list).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

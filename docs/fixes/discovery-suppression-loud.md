@@ -5,7 +5,7 @@ discovery suppresses two thirds of sessions and never says which are which.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3383).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3384).
 - [Full catalog](../../CATALOG.md#discovery-suppression-loud).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ steering with attached context stays pending after Codex consumes it.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3449).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3450).
 - [Full catalog](../../CATALOG.md#codex-steering-resolved-input).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

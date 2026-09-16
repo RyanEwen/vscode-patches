@@ -5,7 +5,7 @@ hitting a turn, budget or retry cap renders as a successful empty turn.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1289).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1290).
 - [Full catalog](../../CATALOG.md#result-error-subtypes-surface).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

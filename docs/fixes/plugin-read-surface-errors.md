@@ -5,7 +5,7 @@ a filesystem the host cannot address looks exactly like an absent file.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1979).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1980).
 - [Full catalog](../../CATALOG.md#plugin-read-surface-errors).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

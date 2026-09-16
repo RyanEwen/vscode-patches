@@ -5,7 +5,7 @@ nothing records the turn a parent will resume into after a subagent.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1785).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1786).
 - [Full catalog](../../CATALOG.md#subagent-resume-anchor).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

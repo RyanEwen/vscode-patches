@@ -5,7 +5,7 @@ a steering message never becomes its own turn.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L373).
+- [Current implementation](../../patch-vscode-fixes.mjs#L374).
 - [Full catalog](../../CATALOG.md#steering-promote).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

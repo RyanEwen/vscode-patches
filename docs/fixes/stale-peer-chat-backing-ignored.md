@@ -5,7 +5,7 @@ a session that once had a peer chat is hidden from the list forever.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3412).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3413).
 - [Full catalog](../../CATALOG.md#stale-peer-chat-backing-ignored).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 
