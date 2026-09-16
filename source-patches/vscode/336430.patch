@@ -1,0 +1,506 @@
+From 07ce4a54bfa9875f769056be4d672122b11e72b1 Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 16 Sep 2026 10:40:06 -0400
+Subject: [PATCH] Fix agent feedback review commands in editor windows
+
+---
+ .../agentHost/agentHost.contribution.ts       |   2 +
+ .../agentHostFeedbackReviewCommands.ts        | 160 ++++++++++++++
+ ...tAgentFeedbackReviewConfirmationSubPart.ts |   4 +
+ .../agentHostFeedbackReviewCommands.test.ts   | 197 ++++++++++++++++++
+ ...hatAgentFeedbackReviewConfirmation.test.ts |  80 +++++++
+ 5 files changed, 443 insertions(+)
+ create mode 100644 src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts
+ create mode 100644 src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts
+ create mode 100644 src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts
+
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
+index 5efb25e21ee30..a141040d9a745 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
+@@ -21,6 +21,7 @@ import { IConfigurationService } from '../../../../../../platform/configuration/
+ import { registerWorkbenchContribution2, IWorkbenchContribution, WorkbenchPhase } from '../../../../../common/contributions.js';
+ import { AgentHostAllowSignedOutWhenUsableContribution } from './agentHostAllowSignedOutWhenUsableContribution.js';
+ import { AgentHostByokLmHandler } from './agentHostByokLmHandler.js';
++import { AgentHostFeedbackReviewCommands } from './agentHostFeedbackReviewCommands.js';
+ import { AgentHostContribution } from './agentHostChatContribution.js';
+ import { AgentHostCopilotCliSettingsContribution } from './agentHostCopilotCliSettingsContribution.js';
+ import { AgentHostExistingSessionHarnessPickerEnablement } from './agentHostExistingSessionHarnessPickerEnablement.js';
+@@ -46,6 +47,7 @@ class AgentHostLegacyMigrationGateContribution extends Disposable implements IWo
+ 	}
+ }
+ 
++registerWorkbenchContribution2(AgentHostFeedbackReviewCommands.ID, AgentHostFeedbackReviewCommands, WorkbenchPhase.BlockStartup);
+ registerWorkbenchContribution2(AgentHostContribution.ID, AgentHostContribution, WorkbenchPhase.AfterRestored);
+ registerWorkbenchContribution2(AgentHostExistingSessionHarnessPickerEnablement.ID, AgentHostExistingSessionHarnessPickerEnablement, WorkbenchPhase.BlockRestore);
+ registerWorkbenchContribution2(AgentHostLegacyMigrationGateContribution.ID, AgentHostLegacyMigrationGateContribution, WorkbenchPhase.BlockStartup);
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts
+new file mode 100644
+index 0000000000000..5593598a678a0
+--- /dev/null
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.ts
+@@ -0,0 +1,160 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { CancellationTokenSource } from '../../../../../../base/common/cancellation.js';
++import { Event } from '../../../../../../base/common/event.js';
++import { Disposable, MutableDisposable, toDisposable } from '../../../../../../base/common/lifecycle.js';
++import { observableFromEvent, waitForState } from '../../../../../../base/common/observable.js';
++import { URI, UriComponents } from '../../../../../../base/common/uri.js';
++import { localize } from '../../../../../../nls.js';
++import { IAgentHostConnectionsService } from '../../../../../../platform/agentHost/common/agentHostConnectionsService.js';
++import { IAgentConnection } from '../../../../../../platform/agentHost/common/agentService.js';
++import { buildAnnotationsUri } from '../../../../../../platform/agentHost/common/annotationsUri.js';
++import { FEEDBACK_ANNOTATION_META_KEY, readFeedbackAnnotationMeta } from '../../../../../../platform/agentHost/common/meta/agentFeedbackAnnotations.js';
++import { ActionType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
++import { Annotation, AnnotationsState, StateComponents } from '../../../../../../platform/agentHost/common/state/sessionState.js';
++import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
++import { CommandsRegistry } from '../../../../../../platform/commands/common/commands.js';
++import { IWorkbenchContribution } from '../../../../../common/contributions.js';
++import { IEditorService } from '../../../../../services/editor/common/editorService.js';
++import { AgentFeedbackReviewCommandId, IChatAgentFeedbackReviewComment } from '../../../common/chatService/chatService.js';
++
++/** Whether an annotation is review feedback that this confirmation can reveal. */
++function isReviewable(annotation: Annotation): boolean {
++	const meta = readFeedbackAnnotationMeta(annotation);
++	return !!meta && annotation.entries.length > 0
++		&& (meta.kind === 'codeReview' || meta.kind === 'prReview')
++		&& ((!annotation.resolved && meta.state === 'created') || meta.pendingAgentReveal === true);
++}
++
++/**
++ * Editor-window counterpart to the Agents window's feedback review commands.
++ * Reads the owning host's annotations rather than depending on sessions-window
++ * services. Registered only by the editor's agent-host contribution.
++ */
++export class AgentHostFeedbackReviewCommands extends Disposable implements IWorkbenchContribution {
++	static readonly ID = 'workbench.contrib.agentHostFeedbackReviewCommands';
++
++	private readonly _commands = this._register(new MutableDisposable<AgentHostFeedbackReviewOperations>());
++
++	constructor(@IInstantiationService instantiationService: IInstantiationService) {
++		super();
++		// Defer host startup until a feedback command is invoked.
++		const commands = () => this._commands.value ??= instantiationService.createInstance(AgentHostFeedbackReviewOperations);
++		this._register(CommandsRegistry.registerCommand(AgentFeedbackReviewCommandId.GetComments, (_accessor, resource: UriComponents) => commands().getComments(resource)));
++		this._register(CommandsRegistry.registerCommand(AgentFeedbackReviewCommandId.Reveal, (_accessor, resource: UriComponents, id: string) => commands().reveal(resource, id)));
++		this._register(CommandsRegistry.registerCommand(AgentFeedbackReviewCommandId.Delete, (_accessor, resource: UriComponents, id: string) => commands().delete(resource, id)));
++		this._register(CommandsRegistry.registerCommand(AgentFeedbackReviewCommandId.Accept, (_accessor, resource: UriComponents, ids: readonly string[]) => commands().accept(resource, ids)));
++	}
++}
++
++/** Lazily instantiated host operations, scoped to the editor contribution's lifetime. */
++class AgentHostFeedbackReviewOperations extends Disposable {
++	private readonly _cancellation = new CancellationTokenSource();
++
++	constructor(
++		@IAgentHostConnectionsService private readonly _connections: IAgentHostConnectionsService,
++		@IEditorService private readonly _editorService: IEditorService,
++	) {
++		super();
++		this._register(toDisposable(() => this._cancellation.dispose(true)));
++	}
++
++	/** Lists review feedback without accepting or revealing it to the agent. */
++	getComments(resource: UriComponents): Promise<IChatAgentFeedbackReviewComment[]> {
++		return this._withAnnotations(resource, (state, connection) => state.annotations.filter(isReviewable).map(annotation => ({
++			id: annotation.id,
++			text: annotation.entries.map(entry => typeof entry.text === 'string' ? entry.text : entry.text.markdown).join('\n\n'),
++			fileUri: connection.resourceUris.fromAgentHost(URI.parse(annotation.resource)),
++			kindLabel: readFeedbackAnnotationMeta(annotation)?.kind === 'prReview'
++				? localize('agentFeedbackReview.prReview', "PR Review")
++				: localize('agentFeedbackReview.agentReview', "Agent Review"),
++		})));
++	}
++
++	/** Opens the selected comment's file on its owning host, at the recorded range. */
++	reveal(resource: UriComponents, id: string): Promise<void> {
++		return this._withAnnotations(resource, async (state, connection) => {
++			const annotation = state.annotations.find(item => item.id === id && isReviewable(item));
++			if (!annotation) {
++				throw new Error('Review comment is no longer available');
++			}
++			const range = annotation.range;
++			await this._editorService.openEditor({
++				resource: connection.resourceUris.fromAgentHost(URI.parse(annotation.resource)),
++				options: {
++					selection: range ? {
++						startLineNumber: range.start.line + 1,
++						startColumn: range.start.character + 1,
++						endLineNumber: range.end.line + 1,
++						endColumn: range.end.character + 1,
++					} : undefined,
++				},
++			});
++		});
++	}
++
++	/** Deletes only review feedback, leaving unrelated annotations untouched. */
++	delete(resource: UriComponents, id: string): Promise<void> {
++		return this._withAnnotations(resource, (state, connection, channel) => {
++			if (state.annotations.some(item => item.id === id && isReviewable(item))) {
++				connection.dispatch(channel, { type: ActionType.AnnotationsRemoved, annotationId: id });
++			}
++		});
++	}
++
++	/** Records an explicit selection before the UI sends approval on the same connection. */
++	accept(resource: UriComponents, ids: readonly string[]): Promise<void> {
++		return this._withAnnotations(resource, (state, connection, channel) => {
++			// An empty/stale selection must not trigger the server's reveal-everything fallback.
++			const selected = new Set(ids);
++			const reviewable = state.annotations.filter(isReviewable);
++			if (!selected.size || [...selected].some(id => !reviewable.some(item => item.id === id))) {
++				throw new Error('Selected review comments are no longer available');
++			}
++			for (const annotation of reviewable) {
++				const meta = readFeedbackAnnotationMeta(annotation)!;
++				const reveal = selected.has(annotation.id);
++				if (!reveal && !meta.pendingAgentReveal) {
++					continue;
++				}
++				// Clear unchecked pending selections left by an interrupted reveal.
++				connection.dispatch(channel, {
++					type: ActionType.AnnotationsSet,
++					annotation: {
++						...annotation,
++						_meta: {
++							...annotation._meta,
++							[FEEDBACK_ANNOTATION_META_KEY]: { ...meta, state: reveal ? 'accepted' : meta.state, pendingAgentReveal: reveal },
++						},
++					},
++				});
++			}
++		});
++	}
++
++	/**
++	 * Waits for authoritative annotations before reading or mutating them.
++	 * Errors remain errors; an unhydrated subscription is never an empty list.
++	 * The reference is held through the operation and released even on failure.
++	 */
++	private async _withAnnotations<T>(resource: UriComponents, run: (state: AnnotationsState, connection: IAgentConnection, channel: string) => T | Promise<T>): Promise<T> {
++		const resolved = this._connections.resolveSessionResource(URI.revive(resource));
++		if (!resolved) {
++			throw new Error('The review comment host is not connected');
++		}
++		// Peer-chat fragments resolve to the owning session's shared annotations.
++		const channel = buildAnnotationsUri(resolved.backendSession.toString());
++		const ref = resolved.connection.getSubscription(StateComponents.Annotations, URI.parse(channel), AgentHostFeedbackReviewCommands.ID);
++		try {
++			const subscription = ref.object;
++			const value = observableFromEvent(this, Event.any(subscription.onDidChange, subscription.onDidError ?? Event.None), () => subscription.value);
++			const state = await waitForState(value, (state): state is AnnotationsState => !!state && !(state instanceof Error), state => state instanceof Error ? state : undefined, this._cancellation.token);
++			return await run(state, resolved.connection, channel);
++		} finally {
++			ref.dispose();
++		}
++	}
++}
+diff --git a/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts b/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts
+index 0c6232b1e7acc..b2447f0bd0b52 100644
+--- a/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts
++++ b/src/vs/workbench/contrib/chat/browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.ts
+@@ -140,6 +140,10 @@ export class ChatAgentFeedbackReviewConfirmationSubPart extends AbstractToolConf
+ 			) ?? [];
+ 		} catch (error) {
+ 			this.logService.warn('[AgentFeedbackReview] Failed to fetch unreviewed comments', error);
++			if (!this._store.isDisposed) {
++				listElement.append(dom.$('.chat-agent-feedback-review-empty', undefined, localize('agentFeedback.loadFailed', "Could not load review comments. Cancel this request and try again.")));
++			}
++			return;
+ 		}
+ 
+ 		if (this._store.isDisposed) {
+diff --git a/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts
+new file mode 100644
+index 0000000000000..f2b6747b2e40d
+--- /dev/null
++++ b/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostFeedbackReviewCommands.test.ts
+@@ -0,0 +1,197 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { Emitter, Event } from '../../../../../../base/common/event.js';
++import { URI } from '../../../../../../base/common/uri.js';
++import { mock } from '../../../../../../base/test/common/mock.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
++import { IAgentHostConnectionsService } from '../../../../../../platform/agentHost/common/agentHostConnectionsService.js';
++import { IAgentConnection } from '../../../../../../platform/agentHost/common/agentService.js';
++import { FEEDBACK_ANNOTATION_META_KEY, readFeedbackAnnotationMeta } from '../../../../../../platform/agentHost/common/meta/agentFeedbackAnnotations.js';
++import { IAgentSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
++import { ActionType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
++import { Annotation, AnnotationsState, ComponentToState, StateComponents } from '../../../../../../platform/agentHost/common/state/sessionState.js';
++import { CommandsRegistry } from '../../../../../../platform/commands/common/commands.js';
++import { TestInstantiationService } from '../../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
++import { EditorInput } from '../../../../../common/editor/editorInput.js';
++import { IUntypedEditorInput } from '../../../../../common/editor.js';
++import { IEditorService } from '../../../../../services/editor/common/editorService.js';
++import { AgentHostFeedbackReviewCommands } from '../../../browser/agentSessions/agentHost/agentHostFeedbackReviewCommands.js';
++import { AgentFeedbackReviewCommandId, IChatAgentFeedbackReviewComment } from '../../../common/chatService/chatService.js';
++
++suite('AgentHostFeedbackReviewCommands', () => {
++	const store = ensureNoDisposablesAreLeakedInTestSuite();
++	const resource = URI.parse('agent-host-codex:/session#peer-chat');
++	const backendSession = URI.parse('codex:/session');
++
++	function annotation(id: string, kind = 'codeReview', state = 'created', pendingAgentReveal = false): Annotation {
++		return {
++			id,
++			origin: { session: backendSession.toString() },
++			resource: 'file:///workspace/example.ts',
++			range: { start: { line: 2, character: 4 }, end: { line: 3, character: 5 } },
++			resolved: false,
++			entries: [{ id: id + ':0', text: 'Review ' + id }, { id: id + ':1', text: { markdown: 'Reply' } }],
++			_meta: { unrelated: 'preserve', [FEEDBACK_ANNOTATION_META_KEY]: { kind, state, pendingAgentReveal, sessionResource: backendSession.toString() } },
++		};
++	}
++
++	function setup(initial: AnnotationsState | Error | undefined) {
++		let value = initial;
++		let references = 0;
++		let connected = true;
++		const changes = store.add(new Emitter<AnnotationsState>());
++		const errors = store.add(new Emitter<Error>());
++		const requests: { kind: StateComponents; channel: string }[] = [];
++		const writes: { channel: string; action: Parameters<IAgentConnection['dispatch']>[1] }[] = [];
++		const opened: (EditorInput | IUntypedEditorInput)[] = [];
++		const resolved: string[] = [];
++		const subscription: IAgentSubscription<AnnotationsState> = {
++			get value() { return value; },
++			get verifiedValue() { return value instanceof Error ? undefined : value; },
++			onDidChange: changes.event,
++			onDidError: errors.event,
++			onWillApplyAction: Event.None,
++			onDidApplyAction: Event.None,
++		};
++		const connection = new class extends mock<IAgentConnection>() {
++			override readonly resourceUris = {
++				fromAgentHost: (uri: URI) => uri.with({ scheme: 'vscode-remote', authority: 'wsl+Ubuntu' }),
++				toAgentHost: (uri: URI) => uri.with({ scheme: 'file', authority: '' }),
++			};
++			override getSubscription<T extends StateComponents>(kind: T, channel: URI) {
++				assert.strictEqual(kind, StateComponents.Annotations);
++				requests.push({ kind, channel: channel.toString() });
++				references++;
++				return { object: subscription as IAgentSubscription<ComponentToState[T]>, dispose: () => { references--; } };
++			}
++			override dispatch(channel: string, action: Parameters<IAgentConnection['dispatch']>[1]): void {
++				writes.push({ channel, action });
++			}
++		};
++		const instantiation = store.add(new TestInstantiationService());
++		instantiation.stub(IAgentHostConnectionsService, {
++			resolveSessionResource: (uri: URI) => {
++				resolved.push(uri.toString());
++				return connected ? { connection, backendSession, connectionAuthority: 'local' } : undefined;
++			},
++		});
++		instantiation.stub(IEditorService, { openEditor: async input => { opened.push(input); return undefined; } });
++		const contribution = store.add(instantiation.createInstance(AgentHostFeedbackReviewCommands));
++		return {
++			writes, requests, opened, resolved, contribution,
++			get references() { return references; },
++			disconnect: () => { connected = false; },
++			setState: (next: AnnotationsState) => { value = next; changes.fire(next); },
++			fail: (error: Error) => { value = error; errors.fire(error); },
++			run: <T>(command: AgentFeedbackReviewCommandId, ...args: (string | readonly string[])[]): Promise<T> => instantiation.invokeFunction(accessor => CommandsRegistry.getCommand(command)!.handler(accessor, resource, ...args)) as unknown as Promise<T>,
++		};
++	}
++
++	test('registers commands without resolving an agent host or editor service', () => {
++		const instantiation = store.add(new TestInstantiationService());
++		store.add(instantiation.createInstance(AgentHostFeedbackReviewCommands));
++		assert.ok(CommandsRegistry.getCommand(AgentFeedbackReviewCommandId.GetComments));
++	});
++
++	test('editor commands load only reviewable comments from the owning WSL session', async () => {
++		const resolved = { ...annotation('resolved'), resolved: true };
++		const fixture = setup({ annotations: [annotation('new'), annotation('pr', 'prReview'), annotation('pending', 'prReview', 'accepted', true), annotation('user', 'user'), annotation('accepted', 'codeReview', 'accepted'), resolved] });
++		const comments = await fixture.run<IChatAgentFeedbackReviewComment[]>(AgentFeedbackReviewCommandId.GetComments);
++		assert.deepStrictEqual({
++			ids: comments.map(comment => comment.id),
++			text: comments[0].text,
++			file: URI.revive(comments[0].fileUri).toString(),
++			resolved: fixture.resolved,
++			channels: fixture.requests.map(request => request.channel),
++			references: fixture.references,
++		}, {
++			ids: ['new', 'pr', 'pending'], text: 'Review new\n\nReply',
++			file: URI.parse('vscode-remote://wsl+Ubuntu/workspace/example.ts').toString(),
++			resolved: [resource.toString()], channels: ['codex:/session/annotations'], references: 0,
++		});
++	});
++
++	test('waits for hydration instead of returning a transient empty list', async () => {
++		const fixture = setup(undefined);
++		let settled = false;
++		const pending = fixture.run<IChatAgentFeedbackReviewComment[]>(AgentFeedbackReviewCommandId.GetComments).then(value => { settled = true; return value; });
++		await Promise.resolve();
++		assert.strictEqual(settled, false);
++		fixture.setState({ annotations: [annotation('loaded')] });
++		assert.deepStrictEqual((await pending).map(comment => comment.id), ['loaded']);
++		assert.strictEqual(fixture.references, 0);
++	});
++
++	test('returns an authoritative empty list', async () => {
++		const fixture = setup({ annotations: [] });
++		assert.deepStrictEqual(await fixture.run(AgentFeedbackReviewCommandId.GetComments), []);
++	});
++
++	test('propagates initial and asynchronous subscription failures and releases references', async () => {
++		const fixture = setup(new Error('load failed'));
++		await assert.rejects(fixture.run(AgentFeedbackReviewCommandId.GetComments), /load failed/);
++		fixture.setState({ annotations: [] });
++		fixture.disconnect();
++		await assert.rejects(fixture.run(AgentFeedbackReviewCommandId.GetComments), /not connected/);
++		assert.strictEqual(fixture.references, 0);
++	});
++
++	test('rejects a later hydration failure', async () => {
++		const fixture = setup(undefined);
++		const pending = fixture.run(AgentFeedbackReviewCommandId.GetComments);
++		fixture.fail(new Error('remote failed'));
++		await assert.rejects(pending, /remote failed/);
++		assert.strictEqual(fixture.references, 0);
++	});
++
++	test('cancels pending hydration on disposal', async () => {
++		const fixture = setup(undefined);
++		const pending = fixture.run(AgentFeedbackReviewCommandId.GetComments);
++		fixture.contribution.dispose();
++		await assert.rejects(pending, /Canceled/);
++		assert.strictEqual(fixture.references, 0);
++	});
++
++	test('accepts only selected comments without losing entries or unrelated metadata', async () => {
++		const selected = annotation('selected');
++		const fixture = setup({ annotations: [selected, annotation('other')] });
++		await fixture.run(AgentFeedbackReviewCommandId.Accept, ['selected', 'selected']);
++		assert.deepStrictEqual(fixture.writes, [{ channel: 'codex:/session/annotations', action: {
++			type: ActionType.AnnotationsSet,
++			annotation: { ...selected, _meta: { ...selected._meta, [FEEDBACK_ANNOTATION_META_KEY]: { ...readFeedbackAnnotationMeta(selected), state: 'accepted', pendingAgentReveal: true } } },
++		} }]);
++	});
++
++	test('unchecking a pending reveal prevents it from leaking into the selection', async () => {
++		const fixture = setup({ annotations: [annotation('selected'), annotation('pending', 'prReview', 'accepted', true)] });
++		await fixture.run(AgentFeedbackReviewCommandId.Accept, ['selected']);
++		assert.deepStrictEqual(fixture.writes.map(({ action }) => {
++			assert.strictEqual(action.type, ActionType.AnnotationsSet);
++			return { id: action.annotation.id, pending: readFeedbackAnnotationMeta(action.annotation)?.pendingAgentReveal };
++		}), [{ id: 'selected', pending: true }, { id: 'pending', pending: false }]);
++	});
++
++	test('rejects empty or stale selections before any annotation write', async () => {
++		const fixture = setup({ annotations: [annotation('exists')] });
++		await assert.rejects(fixture.run(AgentFeedbackReviewCommandId.Accept, []), /no longer available/);
++		await assert.rejects(fixture.run(AgentFeedbackReviewCommandId.Accept, ['exists', 'missing']), /no longer available/);
++		assert.deepStrictEqual(fixture.writes, []);
++	});
++
++	test('opens the remote file at its annotation range', async () => {
++		const fixture = setup({ annotations: [annotation('open')] });
++		await fixture.run(AgentFeedbackReviewCommandId.Reveal, 'open');
++		assert.deepStrictEqual(fixture.opened, [{ resource: URI.parse('vscode-remote://wsl+Ubuntu/workspace/example.ts'), options: { selection: { startLineNumber: 3, startColumn: 5, endLineNumber: 4, endColumn: 6 } } }]);
++	});
++
++	test('deletes only reviewable feedback', async () => {
++		const fixture = setup({ annotations: [annotation('review'), annotation('user', 'user')] });
++		await fixture.run(AgentFeedbackReviewCommandId.Delete, 'user');
++		await fixture.run(AgentFeedbackReviewCommandId.Delete, 'review');
++		assert.deepStrictEqual(fixture.writes, [{ channel: 'codex:/session/annotations', action: { type: ActionType.AnnotationsRemoved, annotationId: 'review' } }]);
++	});
++});
+diff --git a/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts b/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts
+new file mode 100644
+index 0000000000000..b3b4e1a95000f
+--- /dev/null
++++ b/src/vs/workbench/contrib/chat/test/browser/widget/chatContentParts/chatAgentFeedbackReviewConfirmation.test.ts
+@@ -0,0 +1,80 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { DeferredPromise } from '../../../../../../../base/common/async.js';
++import { Event } from '../../../../../../../base/common/event.js';
++import { observableValue } from '../../../../../../../base/common/observable.js';
++import { URI } from '../../../../../../../base/common/uri.js';
++import { mock } from '../../../../../../../base/test/common/mock.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../../base/test/common/utils.js';
++import { ICommandService } from '../../../../../../../platform/commands/common/commands.js';
++import { workbenchInstantiationService } from '../../../../../../test/browser/workbenchTestServices.js';
++import { IChatWidgetService } from '../../../../browser/chat.js';
++import { IChatToolRiskAssessmentService } from '../../../../browser/tools/chatToolRiskAssessmentService.js';
++import { IChatContentPartRenderContext } from '../../../../browser/widget/chatContentParts/chatContentParts.js';
++import { ChatAgentFeedbackReviewConfirmationSubPart } from '../../../../browser/widget/chatContentParts/toolInvocationParts/chatAgentFeedbackReviewConfirmationSubPart.js';
++import { IChatAgentFeedbackReviewComment } from '../../../../common/chatService/chatService.js';
++import { ChatToolInvocation } from '../../../../common/model/chatProgressTypes/chatToolInvocation.js';
++import { IChatResponseViewModel } from '../../../../common/model/chatViewModel.js';
++import { ILanguageModelToolsService, ToolDataSource } from '../../../../common/tools/languageModelToolsService.js';
++
++suite('ChatAgentFeedbackReviewConfirmation', () => {
++	const store = ensureNoDisposablesAreLeakedInTestSuite();
++
++	function createPart(result: Promise<IChatAgentFeedbackReviewComment[]>) {
++		const instantiation = workbenchInstantiationService(undefined, store);
++		instantiation.stub(ICommandService, new class extends mock<ICommandService>() {
++			override async executeCommand<T>(): Promise<T> { return await result as T; }
++		});
++		instantiation.stub(IChatWidgetService, new class extends mock<IChatWidgetService>() {});
++		instantiation.stub(IChatToolRiskAssessmentService, new class extends mock<IChatToolRiskAssessmentService>() {});
++		instantiation.stub(ILanguageModelToolsService, new class extends mock<ILanguageModelToolsService>() {});
++		const invocation = new ChatToolInvocation({
++			confirmationMessages: { title: 'Reveal unreviewed comments?', message: 'Choose comments' },
++			toolSpecificData: { kind: 'agentFeedbackReviewConfirmation', options: ['Reveal Selected'] },
++		}, { id: 'viewUnreviewedComments', displayName: 'View Unreviewed Comments', modelDescription: '', source: ToolDataSource.Internal }, 'call', undefined, undefined);
++		const context = new class extends mock<IChatContentPartRenderContext>() {
++			override readonly element = new class extends mock<IChatResponseViewModel>() {
++				override readonly sessionResource = URI.parse('agent-host-codex:/session');
++			}();
++			override readonly currentWidth = observableValue('width', 480);
++			override readonly onDidChangeVisibility = Event.None;
++		}();
++		return store.add(instantiation.createInstance(ChatAgentFeedbackReviewConfirmationSubPart, invocation, context));
++	}
++
++	test('a command failure is not presented as no unreviewed comments', async () => {
++		const result = new DeferredPromise<IChatAgentFeedbackReviewComment[]>();
++		const part = createPart(result.p);
++		await result.error(new Error('command not found'));
++		await Promise.resolve();
++		assert.deepStrictEqual({
++			failed: part.domNode.textContent?.includes('Could not load review comments.'),
++			empty: part.domNode.textContent?.includes('No unreviewed comments.'),
++		}, { failed: true, empty: false });
++	});
++
++	test('a successful empty result remains distinguishable from a failure', async () => {
++		const result = new DeferredPromise<IChatAgentFeedbackReviewComment[]>();
++		const part = createPart(result.p);
++		await result.complete([]);
++		await Promise.resolve();
++		assert.deepStrictEqual({
++			failed: part.domNode.textContent?.includes('Could not load review comments.'),
++			empty: part.domNode.textContent?.includes('No unreviewed comments.'),
++		}, { failed: false, empty: true });
++	});
++
++	test('a late failure does not update a disposed confirmation', async () => {
++		const result = new DeferredPromise<IChatAgentFeedbackReviewComment[]>();
++		const part = createPart(result.p);
++		part.dispose();
++		const before = part.domNode.textContent;
++		await result.error(new Error('disconnected'));
++		await Promise.resolve();
++		assert.strictEqual(part.domNode.textContent, before);
++	});
++});

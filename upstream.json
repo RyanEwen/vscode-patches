@@ -10,6 +10,16 @@
   ],
   "issues": [
     {
+      "number": 336428,
+      "state": "OPEN",
+      "title": "Agent host: review confirmation cannot load comments in editor windows",
+      "url": "https://github.com/microsoft/vscode/issues/336428",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/336430"
+      ]
+    },
+    {
       "number": 335546,
       "state": "OPEN",
       "title": "Agent Host: Codex steering with attached context stays pending after consumption",

@@ -1163,6 +1163,15 @@
   ],
   "prs": [
     {
+      "headRefName": "codex/fix-feedback-review-editor",
+      "headRefOid": "07ce4a54bfa9875f769056be4d672122b11e72b1",
+      "number": 336430,
+      "state": "OPEN",
+      "title": "Fix agent feedback review commands in editor windows",
+      "url": "https://github.com/microsoft/vscode/pull/336430",
+      "repo": "microsoft/vscode"
+    },
+    {
       "headRefName": "fix/codex-steering-resolved-input",
       "headRefOid": "83d94dd0c872694948cb3d3aaf9d32f4d3ae644f",
       "number": 335547,

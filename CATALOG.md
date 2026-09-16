@@ -2,6 +2,10 @@
 
 103 current bundle-patcher entries, plus the separate model-host-label installer. Entries are identified by their patcher ID; a matching upstream PR does not establish compatibility with a given installed build. Inspect `--status` before applying. Dependencies and tradeoffs remain documented alongside each entry in the script.
 
+## Source-only review confirmation fix
+
+[PR #336430](docs/patches/vscode-336430.md) adds the missing review-comment commands in regular editor windows and distinguishes loading failures from an empty list. This source patch targets its recorded upstream base; it has no installed-bundle entry.
+
 ## client-tool-input-schema
 
 [Maintenance details and upstream references](docs/fixes/client-tool-input-schema.md).

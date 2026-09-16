@@ -32,3 +32,9 @@ PR #335363 review follow-up:
 - Seven extracted-bundle cases passed on Windows ARM64, Linux ARM64 and Linux x64 VS Code 1.137.0 build `645f29cc31`.
 - The backport is installed on Windows Stable, both WSL Stable layouts and a Linux x64 SSH server with verified hashes and exact backups. Installed Windows and WSL bundles passed all seven extracted tests. The SSH write preserved ownership and passed syntax and marker checks.
 - No application restart, full source build or live UI verification of this fix has been performed. This addition does not claim that the older catalog entries apply to 1.137.0.
+
+## Editor-window review confirmation source patch, 2026-09-16
+
+[PR #336430](docs/patches/vscode-336430.md): 15 focused Chromium tests passed; targeted diagnostics for all five changed TypeScript files were zero; targeted ESLint and Git whitespace checks passed. The GitHub source snapshot passed reverse-apply validation against the fixed worktree. Pre-submission review covered lazy host startup, layer separation, hydration and disposal, explicit selection, stale IDs, and interrupted reveals.
+
+The tests used freshly transpiled changed modules with existing compiled dependencies. Full transpilation was unavailable because the existing dependency installation lacked esbuild. The broader layer check was interrupted after WSL became unresponsive. No full build, installed-bundle deployment or live WSL UI verification is claimed. The combined installer is unchanged.
