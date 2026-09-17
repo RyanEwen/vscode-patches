@@ -5,7 +5,7 @@ a client tool the workbench already confirmed is confirmed again by the host.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2047).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2048).
 - [Full catalog](../../CATALOG.md#client-tool-no-host-confirm).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

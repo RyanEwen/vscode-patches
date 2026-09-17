@@ -5,7 +5,7 @@ a denied Agent call is still recorded as a subagent, creating a chat that can ne
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2811).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2812).
 - [Full catalog](../../CATALOG.md#denied-subagent-no-phantom-chat).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a subagent turn hangs forever when its chat outlives the turn that spawned it.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2431).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2432).
 - [Full catalog](../../CATALOG.md#subagent-observation-lifetime).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

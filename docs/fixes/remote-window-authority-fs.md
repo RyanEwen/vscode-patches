@@ -5,7 +5,7 @@ the agent host filesystem registers under the local authority.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L905).
+- [Current implementation](../../patch-vscode-fixes.mjs#L906).
 - [Full catalog](../../CATALOG.md#remote-window-authority-fs).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ the Claude provider never reports chat activity, so a silent turn looks dead.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1384).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1385).
 - [Full catalog](../../CATALOG.md#claude-turn-reports-activity).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

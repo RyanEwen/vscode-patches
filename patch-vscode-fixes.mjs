@@ -36,6 +36,7 @@
  * multi-megabyte bundle.
  */
 import fs from 'node:fs';
+import { transformCodexAsyncQuestions } from './patchers/codex-async-questions.mjs';
 import { transformAgentFeedbackReview } from './patchers/agent-feedback-review.mjs';
 import { transformCodexSteeringInput } from './patchers/codex-steering-input.mjs';
 import path from 'node:path';
@@ -3460,6 +3461,21 @@ const FIXES = [
 		patched: /__ahSteeringInputText/,
 		build: text => transformCodexSteeringInput(text),
 	},
+	{
+		id: 'codex-async-questions',
+		target: 'agenthost',
+		title: 'Codex asynchronous questions display as text without answer controls',
+		// Upstream: #336512 fixes #336509.
+		// Structured async agent messages need the existing interactive question carousel.
+		// Native work continues; host completion waits until questions are answered or skipped.
+		// Explicit answers use native start-or-steer with the thread's existing settings.
+		// Stop waits for answer RPCs before interrupting their actual continuation turn.
+		// Validated on Windows ARM64 and Ubuntu ARM64 VS Code 1.137.0 build 645f29cc31.
+		unpatched: /^(?=[\s\S]*_handleItemStarted\()[\s\S]+$/,
+		patched: /__codexAsyncQuestionsV1/,
+		build: transformCodexAsyncQuestions,
+	},
+
 	{
 		id: 'agent-feedback-review-editor',
 		target: 'workbench',

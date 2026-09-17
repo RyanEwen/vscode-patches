@@ -5,7 +5,7 @@ a running MCP call shows no progress, and a stale one becomes its past-tense lab
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2890).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2891).
 - [Full catalog](../../CATALOG.md#codex-progress-not-output-client).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

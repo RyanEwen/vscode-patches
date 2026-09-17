@@ -5,7 +5,7 @@ the chat widget dereferences a prompt file that may be absent.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L554).
+- [Current implementation](../../patch-vscode-fixes.mjs#L555).
 - [Full catalog](../../CATALOG.md#slash-consumer-widget).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a session is credited with every uncommitted change in the folder.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1615).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1616).
 - [Full catalog](../../CATALOG.md#session-scope-counts-other-sessions-work).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

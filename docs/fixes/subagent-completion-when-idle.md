@@ -5,7 +5,7 @@ a background subagent that finishes after its turn stays running.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1031).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1032).
 - [Full catalog](../../CATALOG.md#subagent-completion-when-idle).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

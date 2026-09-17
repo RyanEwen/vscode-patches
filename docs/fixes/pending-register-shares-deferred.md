@@ -5,7 +5,7 @@ a second wait on one pending request cancels the first waiter.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3097).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3098).
 - [Full catalog](../../CATALOG.md#pending-register-shares-deferred).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

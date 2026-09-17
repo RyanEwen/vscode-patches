@@ -1,0 +1,485 @@
+From 5affa3489b496454ffcc3e90e87bbbe05b49656c Mon Sep 17 00:00:00 2001
+From: Ryan Ewen <ryan.ewen@gmail.com>
+Date: Wed, 16 Sep 2026 22:16:55 -0400
+Subject: [PATCH] Render Codex asynchronous questions with interactive answers
+
+---
+ .../agentHost/node/codex/codexAgent.ts        |  56 +++++-
+ .../node/codex/codexAsyncQuestions.ts         | 137 +++++++++++++++
+ .../node/codex/codexAsyncQuestions.test.ts    | 159 ++++++++++++++++++
+ 3 files changed, 351 insertions(+), 1 deletion(-)
+ create mode 100644 src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts
+ create mode 100644 src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
+
+diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+index b44a166d8e64a..b6ff3f999e28b 100644
+--- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
++++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
+@@ -51,6 +51,8 @@ import { CodexClientCustomizationStore, codexAgentRoleToml, codexCustomizationCo
+ import { IAgentHostCustomizationEnablementService, targetForUnownedMcpServer } from '../agentHostCustomizationEnablementService.js';
+ import { isCustomizationSdkEligible, resolveCustomizationEnablement, targetForMcpServer } from '../shared/customizationEnablementGate.js';
+ import { isCustomizationEnabled } from '../../common/customizationEnablement.js';
++import type { TurnStartResponse } from './protocol/generated/v2/TurnStartResponse.js';
++import { CodexAsyncQuestions } from './codexAsyncQuestions.js';
+ import { buildElicitationRequest, cancelledElicitationResponse, declinedElicitationResponse, elicitationResponseFromAnswers } from './codexElicitationMapper.js';
+ import { McpAuthRequiredReason, McpServerStatus, type AhpMcpUiHostCapabilities, type Customization, type McpServerState } from '../../common/state/protocol/channels-session/state.js';
+ import { IAgentConfigurationService } from '../agentConfigurationService.js';
+@@ -734,6 +736,7 @@ interface ICodexSession {
+ 	 * {@link CodexAgent.respondToUserInputRequest}.
+ 	 */
+ 	readonly pendingUserInputs: PendingRequestRegistry<ICodexUserInputResult>;
++	asyncQuestions?: CodexAsyncQuestions;
+ 	/**
+ 	 * Signature of the {@link clientTools} the codex thread was started
+ 	 * with. Codex only accepts `dynamicTools` at `thread/start`, so if the
+@@ -3036,6 +3039,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		// The workbench already dispatched the canonical turn start before sendMessage.
+ 		// Codex's event only establishes app-server turn id correlation for later items.
+ 		const appTurnId = params.turn.id;
++		session.asyncQuestions?.turnStarted(appTurnId);
+ 		const mapped = this._withHostTurn(session, params);
+ 		this._persistTurnEventId(session, mapped.turn.id, appTurnId);
+ 		mapTurnStarted(session.mapState, mapped, session.lastPromptText);
+@@ -3055,6 +3059,9 @@ export class CodexAgent extends Disposable implements IAgent {
+ 	}
+ 
+ 	private _handleTurnCompletedNotification(session: ICodexSession, params: TurnCompletedNotification): (SessionAction | ChatAction)[] {
++		if (session.asyncQuestions?.holdCompletion(params)) {
++			return [];
++		}
+ 		const appTurnId = params.turn.id;
+ 		const hostTurnId = this._hostTurnId(session, appTurnId);
+ 		const out = mapTurnCompleted(session.mapState, this._withHostTurn(session, params), this._clearTurnStopWatch(session));
+@@ -3094,12 +3101,43 @@ export class CodexAgent extends Disposable implements IAgent {
+ 	 * other item kinds defer to {@link mapItemStarted}.
+ 	 */
+ 	private _handleItemStarted(session: ICodexSession, params: ItemStartedNotification): (SessionAction | ChatAction)[] {
++		if (params.item.type === 'agentMessage' && params.item.delivery === 'async' && params.item.questions?.length) {
++			this._getAsyncQuestions(session).ask(params.item.id, params.item.questions);
++			return [];
++		}
+ 		if (params.item.type === 'userMessage') {
+ 			return this._handleSteeredUserMessage(session, params.item.content);
+ 		}
+ 		return mapItemStarted(session.mapState, this._withHostTurnId(session, params));
+ 	}
+ 
++	/** Adapts asynchronous questions to the existing carousel and native start-or-steer input. */
++	private _getAsyncQuestions(session: ICodexSession): CodexAsyncQuestions {
++		return session.asyncQuestions ??= new CodexAsyncQuestions({
++			show: request => this._fire(session.sessionUri, { type: ActionType.ChatInputRequested, request }),
++			cancel: requestId => this._fire(session.sessionUri, { type: ActionType.ChatInputCompleted, requestId, response: ChatInputResponseKind.Cancel }),
++			send: async text => {
++				const connection = this._connection;
++				if (connection.kind !== 'ready' || !session.threadId) {
++					throw new Error('Codex connection is unavailable');
++				}
++				// Native turn/start steers an active turn or starts a continuation with sticky thread settings.
++				const result = await connection.client.request<'turn/start', TurnStartResponse>('turn/start', {
++					threadId: session.threadId,
++					input: [{ type: 'text', text, text_elements: [] }],
++				}, this._traceContext(session));
++				// The RPC response may arrive before the turn/started notification.
++				session.asyncQuestions?.turnStarted(result.turn.id);
++			},
++			finish: completion => {
++				for (const action of this._handleTurnCompletedNotification(session, completion)) {
++					this._fire(session.sessionUri, action);
++				}
++			},
++			reportError: error => this._logService.warn('[Codex] Failed to deliver asynchronous question answer; reopening questions', error),
++		});
++	}
++
+ 	/**
+ 	 * Codex echoes every user message — the turn opener (already shown by
+ 	 * the workbench before `sendMessage`) and any steered input — as a
+@@ -3113,6 +3151,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		if (!steering) {
+ 			return [];
+ 		}
++		session.asyncQuestions?.clear();
+ 		return this._beginSteeringTurn(session, steering);
+ 	}
+ 
+@@ -4070,6 +4109,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			session.pendingCommandApprovals.denyAll('decline');
+ 			// Reject in-flight client tool calls so their handlers unwind.
+ 			session.pendingClientToolCalls.rejectAll(new CancellationError());
++			session.asyncQuestions?.clear();
+ 			session.pendingUserInputs.rejectAll(new CancellationError());
+ 			// Clear any buffered steering so its pending bubble doesn't leak.
+ 			this._drainPendingSteering(session);
+@@ -4095,6 +4135,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		for (const subagent of this._subagentsByThreadId.values()) {
+ 			subagent.session.pendingCommandApprovals.denyAll('decline');
+ 			subagent.session.pendingClientToolCalls.rejectAll(new CancellationError());
++			subagent.session.asyncQuestions?.clear();
+ 			subagent.session.pendingUserInputs.rejectAll(new CancellationError());
+ 			subagent.session.currentTurnId = undefined;
+ 			subagent.session.currentAppTurnId = undefined;
+@@ -5785,6 +5826,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		if (!session) {
+ 			throw new Error(`Codex session not found: ${sessionUri.toString()} (chat=${chat.toString()}, binding=${this._sessionIdByChatUri.get(chat.toString()) ?? 'none'}, sessions=${[...this._sessions.keys()].join(',') || 'none'})`);
+ 		}
++		session.asyncQuestions?.clear();
+ 		const configResource = operationContext?.configurationResource ?? sessionUri;
+ 		session.agentMergeTurn = operationContext?.agentMergeTurn === true;
+ 		this._ensureModelProviderAuthenticated(session.model);
+@@ -6134,6 +6176,15 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		if (!session) {
+ 			return;
+ 		}
++		const completion = session.asyncQuestions?.clear();
++		await session.asyncQuestions?.whenIdle();
++		session.asyncQuestions?.clear();
++		if (completion && session.currentAppTurnId === completion.turn.id) {
++			for (const action of this._handleTurnCompletedNotification(session, { ...completion, turn: { ...completion.turn, status: 'interrupted' } })) {
++				this._fire(session.sessionUri, action);
++			}
++			return;
++		}
+ 		// Clear any steering buffered for the turn we're aborting so its
+ 		// pending bubble doesn't outlive the turn.
+ 		this._drainPendingSteering(session);
+@@ -6306,6 +6357,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		// Reject any in-flight client tool calls so their `item/tool/call`
+ 		// handlers unwind instead of awaiting a response that won't arrive.
+ 		session.pendingClientToolCalls.rejectAll(new CancellationError());
++		session.asyncQuestions?.clear();
+ 		session.pendingUserInputs.rejectAll(new CancellationError());
+ 		// Clear any buffered steering so its pending bubble doesn't leak.
+ 		this._drainPendingSteering(session);
+@@ -6486,7 +6538,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 		// `requestId` was minted per request; find the owning session and
+ 		// resolve its parked deferred. Mirrors respondToPermissionRequest.
+ 		for (const session of this._sessions.values()) {
+-			if (session.pendingUserInputs.respond(requestId, { response, answers })) {
++			if (session.asyncQuestions?.respond(requestId, response, answers) || session.pendingUserInputs.respond(requestId, { response, answers })) {
+ 				return;
+ 			}
+ 		}
+@@ -8197,6 +8249,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			}
+ 			s.pendingCommandApprovals.denyAll('decline');
+ 			s.pendingClientToolCalls.rejectAll(new CancellationError());
++			s.asyncQuestions?.clear();
+ 			s.pendingUserInputs.rejectAll(new CancellationError());
+ 			s.mcpController?.dispose();
+ 		}
+@@ -8208,6 +8261,7 @@ export class CodexAgent extends Disposable implements IAgent {
+ 			}
+ 			subagent.session.pendingCommandApprovals.denyAll('decline');
+ 			subagent.session.pendingClientToolCalls.rejectAll(new CancellationError());
++			subagent.session.asyncQuestions?.clear();
+ 			subagent.session.pendingUserInputs.rejectAll(new CancellationError());
+ 		}
+ 		for (const entry of this._sessionMcpDiscoveries.values()) {
+diff --git a/src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts b/src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts
+new file mode 100644
+index 0000000000000..8af94ac606132
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts
+@@ -0,0 +1,137 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { generateUuid } from '../../../../base/common/uuid.js';
++import { ChatInputResponseKind, type ChatInputAnswer, type ChatInputRequest } from '../../common/state/sessionState.js';
++import { answerStrings, buildUserInputRequest } from './codexUserInputMapper.js';
++import type { AsyncUserInputQuestion } from './protocol/generated/v2/AsyncUserInputQuestion.js';
++import type { TurnCompletedNotification } from './protocol/generated/v2/TurnCompletedNotification.js';
++
++interface IAsyncQuestionsHost {
++	show(request: ChatInputRequest): void;
++	cancel(requestId: string): void;
++	send(text: string): Promise<void>;
++	finish(completion: TurnCompletedNotification): void;
++	reportError(error: unknown): void;
++}
++
++/** Keeps question controls alive until answered without blocking Codex's native turn. */
++export class CodexAsyncQuestions {
++	private readonly requests = new Map<string, readonly AsyncUserInputQuestion[]>();
++	private readonly seen = new Set<string>();
++	private completion: TurnCompletedNotification | undefined;
++	private sending = 0;
++	private readonly deliveries = new Set<Promise<void>>();
++	private generation = 0;
++
++	constructor(private readonly host: IAsyncQuestionsHost) { }
++
++	/** Publishes one carousel per item; replayed start events cannot ask twice. */
++	ask(itemId: string, questions: readonly AsyncUserInputQuestion[]): void {
++		if (!questions.length || this.seen.has(itemId)) {
++			return;
++		}
++		this.seen.add(itemId);
++		this.show(questions);
++	}
++
++	private show(questions: readonly AsyncUserInputQuestion[]): void {
++		const id = generateUuid();
++		this.requests.set(id, questions);
++		this.host.show(buildUserInputRequest(id, questions.map((question, index) => ({
++			id: String(index), header: '', question: question.title, isOther: true, isSecret: false,
++			options: question.options?.map(label => ({ label, description: '' })) ?? null,
++		}))));
++	}
++
++	/** A new native turn supersedes a held completion, retaining outstanding questions. */
++	turnStarted(turnId: string): void {
++		if (this.completion?.turn.id !== turnId) {
++			this.completion = undefined;
++		}
++	}
++
++	/** Hold only successful completion so the existing active-turn carousel stays usable. */
++	holdCompletion(completion: TurnCompletedNotification): boolean {
++		if (completion.turn.status === 'completed' && (this.requests.size > 0 || this.sending > 0)) {
++			this.completion = completion;
++			return true;
++		}
++		this.clear();
++		return false;
++	}
++
++	/** Consumes explicit answers; skipping never submits a suggested option. */
++	respond(id: string, response: ChatInputResponseKind, answers?: Record<string, ChatInputAnswer>): boolean {
++		const questions = this.requests.get(id);
++		if (!questions) {
++			return false;
++		}
++		this.requests.delete(id);
++		const text = questions.flatMap((question, index) => {
++			const values = answerStrings(answers?.[String(index)], response);
++			if (!values.length) {
++				return [];
++			}
++			const title = Array.from(question.title).slice(0, 512).join('').replace(/[\r\n]/g, ' ');
++			return [`> ${title}\n\n${values.join('\n')}`];
++		}).join('\n\n');
++		if (text) {
++			const delivery = this.deliver(questions, text);
++			this.deliveries.add(delivery);
++			void delivery.finally(() => this.deliveries.delete(delivery));
++		} else {
++			this.flush();
++		}
++		return true;
++	}
++
++	/** Failed delivery reopens the questions instead of silently losing an accepted answer. */
++	private async deliver(questions: readonly AsyncUserInputQuestion[], text: string): Promise<void> {
++		const generation = this.generation;
++		this.sending++;
++		try {
++			await this.host.send(text);
++		} catch (error) {
++			if (generation === this.generation) {
++				this.host.reportError(error);
++				this.show(questions);
++			}
++		} finally {
++			if (generation === this.generation) {
++				this.sending--;
++				this.flush();
++			}
++		}
++	}
++
++	private flush(): void {
++		if (this.requests.size === 0 && this.sending === 0 && this.completion) {
++			const completion = this.completion;
++			this.completion = undefined;
++			this.host.finish(completion);
++		}
++	}
++
++	/** Waits for already-sent RPCs so Stop can interrupt the actual continuation turn. */
++	async whenIdle(): Promise<void> {
++		await Promise.all(this.deliveries);
++	}
++
++	/** Cancels stale controls and invalidates in-flight callbacks on stop, replacement or disposal. */
++	clear(): TurnCompletedNotification | undefined {
++		const completion = this.completion;
++		this.completion = undefined;
++		this.generation++;
++		this.sending = 0;
++		const ids = [...this.requests.keys()];
++		this.requests.clear();
++		this.seen.clear();
++		for (const id of ids) {
++			this.host.cancel(id);
++		}
++		return completion;
++	}
++}
+diff --git a/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
+new file mode 100644
+index 0000000000000..5f27c3f29d3dd
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
+@@ -0,0 +1,159 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { DeferredPromise } from '../../../../../base/common/async.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, type ChatInputRequest } from '../../../common/state/sessionState.js';
++import { CodexAsyncQuestions } from '../../../node/codex/codexAsyncQuestions.js';
++import type { TurnCompletedNotification } from '../../../node/codex/protocol/generated/v2/TurnCompletedNotification.js';
++
++suite('CodexAsyncQuestions', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	function setup(send?: (text: string) => Promise<void>) {
++		const shown: ChatInputRequest[] = [];
++		const sent: string[] = [];
++		const finished: TurnCompletedNotification[] = [];
++		const cancelled: string[] = [];
++		const errors: unknown[] = [];
++		const controller = new CodexAsyncQuestions({
++			show: request => shown.push(request),
++			cancel: id => cancelled.push(id),
++			send: async text => { sent.push(text); await send?.(text); },
++			finish: completion => finished.push(completion),
++			reportError: error => errors.push(error),
++		});
++		return { controller, shown, sent, finished, cancelled, errors };
++	}
++
++	const questions = [{ title: 'Which format?', options: ['PDF', 'Text'] }];
++	const answers = { '0': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: 'PDF' } } } as const;
++	const completed = (id = 'native-1'): TurnCompletedNotification => ({ threadId: 'thread', turn: { id, items: [], status: 'completed', error: null, itemsView: 'full', startedAt: null, completedAt: null, durationMs: null } });
++	const tick = async () => { await new Promise(resolve => setTimeout(resolve, 0)); };
++
++	test('renders choices with freeform and deduplicates item events', () => {
++		const h = setup();
++		h.controller.ask('item', questions);
++		h.controller.ask('item', questions);
++		assert.deepStrictEqual(h.shown.map(r => r.questions), [[{ kind: ChatInputQuestionKind.SingleSelect, id: '0', title: '', message: 'Which format?', required: true, options: [{ id: 'PDF', label: 'PDF', description: undefined }, { id: 'Text', label: 'Text', description: undefined }], allowFreeformInput: true }]]);
++	});
++
++	test('supports multiple questions and free text', () => {
++		const h = setup();
++		h.controller.ask('item', [...questions, { title: 'Details?', options: null }]);
++		assert.deepStrictEqual(h.shown[0].questions?.map(q => [q.id, q.kind]), [['0', ChatInputQuestionKind.SingleSelect], ['1', ChatInputQuestionKind.Text]]);
++	});
++
++	test('asking does not send or wait for a native response', () => {
++		const h = setup();
++		h.controller.ask('item', questions);
++		assert.deepStrictEqual([h.sent, h.finished], [[], []]);
++	});
++
++	test('explicit answer is delivered with its question', async () => {
++		const h = setup();
++		h.controller.ask('item', questions);
++		assert.strictEqual(h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers), true);
++		await tick();
++		assert.deepStrictEqual(h.sent, ['> Which format?\n\nPDF']);
++	});
++
++	test('skip never submits the default option and releases held completion', () => {
++		const h = setup();
++		h.controller.ask('item', questions);
++		assert.strictEqual(h.controller.holdCompletion(completed()), true);
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Cancel);
++		assert.deepStrictEqual([h.sent, h.finished], [[], [completed()]]);
++	});
++
++	test('late answer starts continuation without completing the host turn', async () => {
++		const h = setup(async () => h.controller.turnStarted('native-2'));
++		h.controller.ask('item', questions);
++		h.controller.holdCompletion(completed());
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		await tick();
++		assert.deepStrictEqual(h.finished, []);
++		assert.strictEqual(h.controller.holdCompletion(completed('native-2')), false);
++	});
++
++	test('completion racing an answer waits for accepted delivery', async () => {
++		const gate = new DeferredPromise<void>();
++		const h = setup(() => gate.p);
++		h.controller.ask('item', questions);
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		assert.strictEqual(h.controller.holdCompletion(completed()), true);
++		await gate.complete();
++		await tick();
++		assert.deepStrictEqual(h.finished, [completed()]);
++	});
++
++	test('failed delivery reopens questions and preserves held completion', async () => {
++		const h = setup(async () => { throw new Error('disconnected'); });
++		h.controller.ask('item', questions);
++		h.controller.holdCompletion(completed());
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		await tick();
++		assert.deepStrictEqual([h.shown.length, h.errors.length, h.finished.length], [2, 1, 0]);
++		assert.notStrictEqual(h.shown[0].id, h.shown[1].id);
++	});
++
++	test('stop prevents an in-flight failure from reopening questions', async () => {
++		const gate = new DeferredPromise<void>();
++		const h = setup(() => gate.p);
++		h.controller.ask('item', questions);
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		h.controller.clear();
++		await gate.error(new Error('stopped'));
++		await tick();
++		assert.deepStrictEqual([h.shown.length, h.errors.length, h.finished.length], [1, 0, 0]);
++	});
++
++	test('failure or interruption cancels pending controls without holding the turn', () => {
++		const h = setup();
++		h.controller.ask('item', questions);
++		const notification = completed();
++		notification.turn.status = 'interrupted';
++		assert.strictEqual(h.controller.holdCompletion(notification), false);
++		assert.deepStrictEqual(h.cancelled, [h.shown[0].id]);
++	});
++
++	test('duplicate answers and unknown request ids cannot send input', async () => {
++		const h = setup();
++		h.controller.ask('item', questions);
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		assert.strictEqual(h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers), false);
++		assert.strictEqual(h.controller.respond('unknown', ChatInputResponseKind.Accept, answers), false);
++		await tick();
++		assert.strictEqual(h.sent.length, 1);
++	});
++
++	test('Stop can await an in-flight continuation before interrupting', async () => {
++		const gate = new DeferredPromise<void>();
++		const h = setup(() => gate.p);
++		h.controller.ask('item', questions);
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		h.controller.clear();
++		let idle = false;
++		const waiting = h.controller.whenIdle().then(() => { idle = true; });
++		await tick();
++		assert.strictEqual(idle, false);
++		await gate.complete();
++		await waiting;
++		assert.strictEqual(idle, true);
++	});
++
++	test('multiple outstanding requests all remain answerable after native completion', () => {
++		const h = setup();
++		h.controller.ask('first', questions);
++		h.controller.ask('second', [{ title: 'Any details?', options: null }]);
++		h.controller.holdCompletion(completed());
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Cancel);
++		assert.deepStrictEqual(h.finished, []);
++		h.controller.respond(h.shown[1].id, ChatInputResponseKind.Cancel);
++		assert.deepStrictEqual(h.finished, [completed()]);
++	});
++
++});

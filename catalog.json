@@ -1,11 +1,11 @@
 {
-  "updated": "2026-09-09",
+  "updated": "2026-09-16",
   "fixes": [
     {
       "id": "client-tool-input-schema",
       "target": "workbench",
       "title": "a client tool runs with empty input when its arguments never streamed",
-      "line": 63,
+      "line": 64,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -16,7 +16,7 @@
       "id": "session-list",
       "target": "workbench",
       "title": "sessions never list in remote windows",
-      "line": 83,
+      "line": 84,
       "references": [
         330979,
         331349
@@ -30,7 +30,7 @@
       "id": "session-list-remote-project-root",
       "target": "workbench",
       "title": "a legacy session whose project root is on the remote is dropped from the list",
-      "line": 135,
+      "line": 136,
       "references": [
         334145
       ],
@@ -43,7 +43,7 @@
       "id": "embedded-attachment-content-type",
       "target": "workbench",
       "title": "a pasted image renders as a broken thumbnail",
-      "line": 155,
+      "line": 156,
       "references": [
         331569
       ],
@@ -56,7 +56,7 @@
       "id": "client-tool-buffer",
       "target": "agenthost",
       "title": "a client tool result is dropped when it arrives before the SDK asks for it",
-      "line": 184,
+      "line": 185,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -67,7 +67,7 @@
       "id": "client-tool-error",
       "target": "agenthost",
       "title": "a client tool error reaches the model as an empty result",
-      "line": 206,
+      "line": 207,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -78,7 +78,7 @@
       "id": "replay-args",
       "target": "agenthost",
       "title": "client tool MCP handler forwards tool name and args",
-      "line": 231,
+      "line": 232,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -89,7 +89,7 @@
       "id": "replay-route",
       "target": "agenthost",
       "title": "client tool wiring routes through the replay-aware awaiter",
-      "line": 249,
+      "line": 250,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -100,7 +100,7 @@
       "id": "replay-turnid",
       "target": "agenthost",
       "title": "session stashes the active turn id",
-      "line": 258,
+      "line": 259,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -111,7 +111,7 @@
       "id": "replay-seen",
       "target": "agenthost",
       "title": "session records which tool calls actually streamed, and under which turn",
-      "line": 268,
+      "line": 269,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -122,7 +122,7 @@
       "id": "replay-drive",
       "target": "agenthost",
       "title": "drive execution for a replayed (never-streamed) client tool call",
-      "line": 284,
+      "line": 285,
       "references": [
         318456
       ],
@@ -135,7 +135,7 @@
       "id": "steering-pending",
       "target": "agenthost",
       "title": "the pipeline only receives the steering id, not the message",
-      "line": 334,
+      "line": 335,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -144,7 +144,7 @@
       "id": "steering-buffer",
       "target": "agenthost",
       "title": "a steering message is forgotten once it is queued",
-      "line": 343,
+      "line": 344,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -153,7 +153,7 @@
       "id": "steering-hold",
       "target": "agenthost",
       "title": "the pending bubble is cleared when the queue hands the message over",
-      "line": 364,
+      "line": 365,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -162,7 +162,7 @@
       "id": "steering-promote",
       "target": "agenthost",
       "title": "a steering message never becomes its own turn",
-      "line": 374,
+      "line": 375,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -171,7 +171,7 @@
       "id": "steering-drain",
       "target": "agenthost",
       "title": "a steering message the SDK never echoes leaves its bubble behind on abort",
-      "line": 417,
+      "line": 418,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -180,7 +180,7 @@
       "id": "client-tool-single-trigger",
       "target": "agenthost",
       "title": "a client tool executes off the streamed ready rather than the runtime invocation",
-      "line": 433,
+      "line": 434,
       "references": [
         330933
       ],
@@ -196,7 +196,7 @@
       "id": "session-chip-list-scope",
       "target": "agenthost",
       "title": "the session list re-derives the chip from the branch for inactive sessions",
-      "line": 451,
+      "line": 452,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -207,7 +207,7 @@
       "id": "slash-resolve-harness",
       "target": "workbench",
       "title": "a message containing a slash command never submits in a remote window",
-      "line": 489,
+      "line": 490,
       "references": [
         331138,
         331145
@@ -221,7 +221,7 @@
       "id": "slash-resolve-prompts",
       "target": "workbench",
       "title": "the prompts service resolver rejects on an unreadable slash command",
-      "line": 518,
+      "line": 519,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -230,7 +230,7 @@
       "id": "slash-consumer-sessions",
       "target": "workbench",
       "title": "the session send path dereferences a prompt file that may be absent",
-      "line": 538,
+      "line": 539,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -239,7 +239,7 @@
       "id": "slash-consumer-widget",
       "target": "workbench",
       "title": "the chat widget dereferences a prompt file that may be absent",
-      "line": 554,
+      "line": 555,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -248,7 +248,7 @@
       "id": "slash-consumer-widget-header",
       "target": "workbench",
       "title": "the chat widget applies header metadata from an absent prompt file",
-      "line": 571,
+      "line": 572,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -257,7 +257,7 @@
       "id": "client-tool-owner-recency",
       "target": "agenthost",
       "title": "a tool call is stamped with a client that has gone away",
-      "line": 581,
+      "line": 582,
       "references": [
         331300
       ],
@@ -270,7 +270,7 @@
       "id": "native-model-vision",
       "target": "agenthost",
       "title": "a pasted image is labelled unsupported though the model receives it",
-      "line": 605,
+      "line": 606,
       "references": [
         331396
       ],
@@ -285,7 +285,7 @@
       "id": "consumed-message-not-removed",
       "target": "workbench",
       "title": "a queued message the host consumed is retired as cancelled",
-      "line": 620,
+      "line": 621,
       "references": [
         331408,
         332461
@@ -299,7 +299,7 @@
       "id": "consumed-message-settles-sent",
       "target": "workbench",
       "title": "a consumed queued message never resolves its send promise",
-      "line": 646,
+      "line": 647,
       "references": [
         331408,
         332461
@@ -313,7 +313,7 @@
       "id": "consumed-message-sync-reconcile",
       "target": "workbench",
       "title": "reconciliation cancels the consumed message and settles nothing",
-      "line": 687,
+      "line": 688,
       "references": [
         334002,
         331408
@@ -328,7 +328,7 @@
       "id": "consumed-message-sync-arg",
       "target": "workbench",
       "title": "reconciliation is not told which message the host consumed",
-      "line": 722,
+      "line": 723,
       "references": [
         331408
       ],
@@ -341,7 +341,7 @@
       "id": "steer-preempt-not-error",
       "target": "agenthost",
       "title": "a turn interrupted by a steer renders as failed",
-      "line": 741,
+      "line": 742,
       "references": [
         330785
       ],
@@ -354,7 +354,7 @@
       "id": "toolcall-progress-emit",
       "target": "agenthost",
       "title": "a long tool call reports nothing while it runs",
-      "line": 772,
+      "line": 773,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -366,7 +366,7 @@
       "id": "toolcall-progress-reduce",
       "target": "workbench",
       "title": "the client has nowhere to record tool call progress",
-      "line": 806,
+      "line": 807,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -378,7 +378,7 @@
       "id": "toolcall-progress-reduce-host",
       "target": "agenthost",
       "title": "the agent host does not know the progress action either",
-      "line": 820,
+      "line": 821,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -390,7 +390,7 @@
       "id": "toolcall-progress-render",
       "target": "workbench",
       "title": "a running tool call renders no progress",
-      "line": 834,
+      "line": 835,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -402,7 +402,7 @@
       "id": "session-delete",
       "target": "agenthost",
       "title": "deleting a Claude session does not delete the transcript",
-      "line": 854,
+      "line": 855,
       "references": [
         330698
       ],
@@ -415,7 +415,7 @@
       "id": "remote-window-authority-init",
       "target": "workbench",
       "title": "the in-window agent host claims to be local in a remote window",
-      "line": 886,
+      "line": 887,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -424,7 +424,7 @@
       "id": "remote-window-authority-fs",
       "target": "workbench",
       "title": "the agent host filesystem registers under the local authority",
-      "line": 905,
+      "line": 906,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -433,7 +433,7 @@
       "id": "remote-window-authority-session",
       "target": "workbench",
       "title": "the session handler is told the host is local",
-      "line": 916,
+      "line": 917,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -442,7 +442,7 @@
       "id": "remote-window-authority-map",
       "target": "workbench",
       "title": "agent host file paths are handed to the client unmapped",
-      "line": 928,
+      "line": 929,
       "references": [
         332791
       ],
@@ -453,7 +453,7 @@
       "id": "workspace-folder-uses-real-remote",
       "target": "workbench",
       "title": "opening a session folder yields a window that can resolve nothing",
-      "line": 953,
+      "line": 954,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -462,7 +462,7 @@
       "id": "session-workspace-folder-real-remote",
       "target": "workbench",
       "title": "a session workspace keeps the agent host authority its folders cannot resolve",
-      "line": 995,
+      "line": 996,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -471,7 +471,7 @@
       "id": "subagent-completion-when-idle",
       "target": "agenthost",
       "title": "a background subagent that finishes after its turn stays running",
-      "line": 1031,
+      "line": 1032,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -482,7 +482,7 @@
       "id": "sdk-initiated-turn",
       "target": "agenthost",
       "title": "the SDK starts a turn the host never queued, so everything in it is discarded",
-      "line": 1057,
+      "line": 1058,
       "references": [
         332073
       ],
@@ -493,7 +493,7 @@
       "id": "subagent-inactive-resume",
       "target": "agenthost",
       "title": "a running subagent produces output that is discarded once its chat has no active turn",
-      "line": 1117,
+      "line": 1118,
       "references": [
         332073
       ],
@@ -504,7 +504,7 @@
       "id": "replay-user-prompt-only",
       "target": "agenthost",
       "title": "restored messages show context the user never typed",
-      "line": 1154,
+      "line": 1155,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -515,7 +515,7 @@
       "id": "local-command-output-visible",
       "target": "agenthost",
       "title": "a local slash command runs, produces output, and the turn renders empty",
-      "line": 1172,
+      "line": 1173,
       "references": [
         334575
       ],
@@ -526,7 +526,7 @@
       "id": "agenthost-require-global",
       "target": "agenthost",
       "title": "the bundle is ESM, so later entries have no require for node builtins",
-      "line": 1212,
+      "line": 1213,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -535,7 +535,7 @@
       "id": "resume-missing-conversation-starts-fresh",
       "target": "agenthost",
       "title": "cancelling a skill-subagent turn bricks a new chat permanently",
-      "line": 1229,
+      "line": 1230,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -544,7 +544,7 @@
       "id": "result-error-subtypes-surface",
       "target": "agenthost",
       "title": "hitting a turn, budget or retry cap renders as a successful empty turn",
-      "line": 1290,
+      "line": 1291,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -553,7 +553,7 @@
       "id": "result-usage-any-subtype",
       "target": "agenthost",
       "title": "a turn that stops at a cap reports none of the tokens it spent",
-      "line": 1330,
+      "line": 1331,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -562,7 +562,7 @@
       "id": "toolcall-hidden-respects-liveness",
       "target": "workbench",
       "title": "a tool card is hidden when its call completes, even when its work is still running",
-      "line": 1346,
+      "line": 1347,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -571,7 +571,7 @@
       "id": "claude-turn-reports-activity",
       "target": "agenthost",
       "title": "the Claude provider never reports chat activity, so a silent turn looks dead",
-      "line": 1384,
+      "line": 1385,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -582,7 +582,7 @@
       "id": "activity-clears-when-the-turn-results",
       "target": "agenthost",
       "title": "the liveness row needs a real end signal, not an empty queue",
-      "line": 1463,
+      "line": 1464,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -593,7 +593,7 @@
       "id": "turn-prune-anchor-missing-is-loud",
       "target": "agenthost",
       "title": "restoring a checkpoint at a turn with no database row silently prunes nothing",
-      "line": 1482,
+      "line": 1483,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -602,7 +602,7 @@
       "id": "router-drop-is-loud",
       "target": "agenthost",
       "title": "every SDK message with no resolvable turn id is discarded with no log at all",
-      "line": 1521,
+      "line": 1522,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -611,7 +611,7 @@
       "id": "slash-command-single-block",
       "target": "agenthost",
       "title": "a slash command is never expanded because the host appends context as a second block",
-      "line": 1550,
+      "line": 1551,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -620,7 +620,7 @@
       "id": "session-chip-scope-v2",
       "target": "agenthost",
       "title": "the session list chip counts the whole branch, not the session",
-      "line": 1589,
+      "line": 1590,
       "references": [
         331345
       ],
@@ -633,7 +633,7 @@
       "id": "session-scope-counts-other-sessions-work",
       "target": "agenthost",
       "title": "a session is credited with every uncommitted change in the folder",
-      "line": 1615,
+      "line": 1616,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -642,7 +642,7 @@
       "id": "keyed-item-transient-empty",
       "target": "workbench",
       "title": "a momentarily empty collection tears down live keyed items",
-      "line": 1668,
+      "line": 1669,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -651,7 +651,7 @@
       "id": "client-tool-stale-self-abort",
       "target": "workbench",
       "title": "a client tool abandons itself when only its label changes",
-      "line": 1691,
+      "line": 1692,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -660,7 +660,7 @@
       "id": "cold-chat-customizations",
       "target": "agenthost",
       "title": "a restored session has no slash commands until its next message",
-      "line": 1722,
+      "line": 1723,
       "references": [
         332047
       ],
@@ -673,7 +673,7 @@
       "id": "subagent-spawn-turn",
       "target": "agenthost",
       "title": "a spawned subagent does not record the turn that spawned it",
-      "line": 1767,
+      "line": 1768,
       "references": [
         332075
       ],
@@ -686,7 +686,7 @@
       "id": "subagent-resume-anchor",
       "target": "agenthost",
       "title": "nothing records the turn a parent will resume into after a subagent",
-      "line": 1786,
+      "line": 1787,
       "references": [
         332075
       ],
@@ -699,7 +699,7 @@
       "id": "subagent-resumed-output",
       "target": "agenthost",
       "title": "everything the parent says after a background subagent finishes is dropped",
-      "line": 1801,
+      "line": 1802,
       "references": [
         332075
       ],
@@ -712,7 +712,7 @@
       "id": "optimistic-turn-start-masks-streaming",
       "target": "workbench",
       "title": "responses appear only when the turn ends, never streaming",
-      "line": 1825,
+      "line": 1826,
       "references": [
         332087
       ],
@@ -725,7 +725,7 @@
       "id": "chat-turnstarted-idempotent",
       "target": "workbench",
       "title": "a replayed turn start keeps rebuilding the turn empty, so the response never streams",
-      "line": 1857,
+      "line": 1858,
       "references": [
         332087
       ],
@@ -739,7 +739,7 @@
       "id": "truncation-retire-stranded",
       "target": "workbench",
       "title": "a stranded optimistic truncation is replayed forever and blanks the transcript",
-      "line": 1905,
+      "line": 1906,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -750,7 +750,7 @@
       "id": "plugin-read-surface-errors",
       "target": "agenthost",
       "title": "a filesystem the host cannot address looks exactly like an absent file",
-      "line": 1980,
+      "line": 1981,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -761,7 +761,7 @@
       "id": "client-tool-no-host-confirm",
       "target": "agenthost",
       "title": "a client tool the workbench already confirmed is confirmed again by the host",
-      "line": 2047,
+      "line": 2048,
       "references": [
         330683,
         334037
@@ -776,7 +776,7 @@
       "id": "client-tool-ownerless-fail-map-start",
       "target": "agenthost",
       "title": "the stream mapper does not record that a client tool call has no owner",
-      "line": 2099,
+      "line": 2100,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -787,7 +787,7 @@
       "id": "nested-subagent-spawn-recorded",
       "target": "agenthost",
       "title": "a subagent spawned by another subagent never gets a chat, so its work never renders",
-      "line": 2140,
+      "line": 2141,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -796,7 +796,7 @@
       "id": "client-tool-ownerless-fail-map-stop",
       "target": "agenthost",
       "title": "a client tool call no window can run is never failed",
-      "line": 2166,
+      "line": 2167,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -807,7 +807,7 @@
       "id": "client-tool-ownerless-fail-subagent",
       "target": "agenthost",
       "title": "a subagent client tool call no window can run is never failed",
-      "line": 2200,
+      "line": 2201,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -818,7 +818,7 @@
       "id": "client-tool-ownerless-fail-session",
       "target": "agenthost",
       "title": "the SDK handler for a failed client tool call still parks forever",
-      "line": 2236,
+      "line": 2237,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -829,7 +829,7 @@
       "id": "client-tool-ownerless-fail-permission",
       "target": "agenthost",
       "title": "the SDK still asks permission for a client tool call already failed",
-      "line": 2286,
+      "line": 2287,
       "references": [
         334037
       ],
@@ -844,7 +844,7 @@
       "id": "remote-working-directory-actions",
       "target": "agenthost",
       "title": "adding or removing a workspace folder from a container window is rejected by the host",
-      "line": 2322,
+      "line": 2323,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -855,7 +855,7 @@
       "id": "remote-folders-at-session-create",
       "target": "workbench",
       "title": "a session created from the chat handler in a container window gets no working directories at all",
-      "line": 2377,
+      "line": 2378,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -866,7 +866,7 @@
       "id": "subagent-observation-lifetime",
       "target": "workbench",
       "title": "a subagent turn hangs forever when its chat outlives the turn that spawned it",
-      "line": 2431,
+      "line": 2432,
       "references": [
         333931
       ],
@@ -879,7 +879,7 @@
       "id": "steer-keeps-tool-attribution",
       "target": "agenthost",
       "title": "a tool still running when a steer lands never completes",
-      "line": 2515,
+      "line": 2516,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -890,7 +890,7 @@
       "id": "skill-subagent-result-visible",
       "target": "agenthost",
       "title": "a skill that runs in a subagent works for minutes and the turn renders empty",
-      "line": 2577,
+      "line": 2578,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -899,7 +899,7 @@
       "id": "queue-settles-by-correlation",
       "target": "agenthost",
       "title": "the queue drifts because one result settles one entry, however many it consumed",
-      "line": 2658,
+      "line": 2659,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -908,7 +908,7 @@
       "id": "clearpending-spares-background-subagent",
       "target": "agenthost",
       "title": "a background subagent loses its tool attribution at every parent turn end",
-      "line": 2712,
+      "line": 2713,
       "references": [
         334559
       ],
@@ -923,7 +923,7 @@
       "id": "reap-orphaned-session-data",
       "target": "agenthost",
       "title": "a pruned external session leaves its data directory behind forever",
-      "line": 2740,
+      "line": 2741,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -934,7 +934,7 @@
       "id": "peer-chat-unavailable-subagent",
       "target": "agenthost",
       "title": "one unresolvable subagent chat rejects every turn the session will ever start",
-      "line": 2779,
+      "line": 2780,
       "references": [
         334312
       ],
@@ -945,7 +945,7 @@
       "id": "denied-subagent-no-phantom-chat",
       "target": "agenthost",
       "title": "a denied Agent call is still recorded as a subagent, creating a chat that can never exist",
-      "line": 2811,
+      "line": 2812,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -956,7 +956,7 @@
       "id": "codex-progress-not-output-host",
       "target": "agenthost",
       "title": "MCP progress narration is persisted as the tool result",
-      "line": 2832,
+      "line": 2833,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -967,7 +967,7 @@
       "id": "codex-progress-not-output-client",
       "target": "workbench",
       "title": "a running MCP call shows no progress, and a stale one becomes its past-tense label",
-      "line": 2890,
+      "line": 2891,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -978,7 +978,7 @@
       "id": "subscribe-cancelled-not-missing",
       "target": "agenthost",
       "title": "a client cancelling a subscribe is reported as a missing resource, at error level",
-      "line": 2972,
+      "line": 2973,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -989,7 +989,7 @@
       "id": "client-tool-handler-never-throws",
       "target": "agenthost",
       "title": "a rejected client-tool wait escapes the MCP handler as a bare \"Canceled\"",
-      "line": 3044,
+      "line": 3045,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1000,7 +1000,7 @@
       "id": "pending-register-shares-deferred",
       "target": "agenthost",
       "title": "a second wait on one pending request cancels the first waiter",
-      "line": 3097,
+      "line": 3098,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1011,7 +1011,7 @@
       "id": "register-and-fire-reuses-parked",
       "target": "agenthost",
       "title": "a duplicate tool_use_id orphans the first request, which then never settles",
-      "line": 3139,
+      "line": 3140,
       "references": [
         334146
       ],
@@ -1026,7 +1026,7 @@
       "id": "steering-list-reduce-set",
       "target": "workbench",
       "title": "a second steering message evicts the first from the sidebar",
-      "line": 3164,
+      "line": 3165,
       "references": [
         334743
       ],
@@ -1041,7 +1041,7 @@
       "id": "steering-list-reduce-remove",
       "target": "workbench",
       "title": "removing one steering message must not drop the others",
-      "line": 3195,
+      "line": 3196,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1052,7 +1052,7 @@
       "id": "steering-list-turnstarted",
       "target": "workbench",
       "title": "a steering message auto-started as a turn must leave the list",
-      "line": 3214,
+      "line": 3215,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1063,7 +1063,7 @@
       "id": "steering-list-merge",
       "target": "workbench",
       "title": "the per-chat projection drops the steering list",
-      "line": 3234,
+      "line": 3235,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1074,7 +1074,7 @@
       "id": "steering-list-projection",
       "target": "workbench",
       "title": "only one steering bubble is projected into the chat model",
-      "line": 3248,
+      "line": 3249,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1085,7 +1085,7 @@
       "id": "steering-list-removal-detect",
       "target": "workbench",
       "title": "the sidebar retires the previous steering bubble whenever the id changes",
-      "line": 3261,
+      "line": 3262,
       "references": [],
       "prs": [],
       "relatedPullRequests": [
@@ -1096,7 +1096,7 @@
       "id": "activity-row-survives-content",
       "target": "workbench",
       "title": "the liveness row disappears the moment a turn produces anything",
-      "line": 3279,
+      "line": 3280,
       "references": [
         334742
       ],
@@ -1109,7 +1109,7 @@
       "id": "chat-input-default-permission-mode",
       "target": "workbench",
       "title": "every new chat-input session starts on Default approvals",
-      "line": 3309,
+      "line": 3310,
       "references": [
         334814,
         334087
@@ -1124,7 +1124,7 @@
       "id": "replay-keeps-local-command-output",
       "target": "agenthost",
       "title": "a slash command's output is dropped on replay, so a restart empties the turn",
-      "line": 3347,
+      "line": 3348,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -1133,7 +1133,7 @@
       "id": "discovery-suppression-loud",
       "target": "agenthost",
       "title": "discovery suppresses two thirds of sessions and never says which are which",
-      "line": 3384,
+      "line": 3385,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -1142,7 +1142,7 @@
       "id": "stale-peer-chat-backing-ignored",
       "target": "agenthost",
       "title": "a session that once had a peer chat is hidden from the list forever",
-      "line": 3413,
+      "line": 3414,
       "references": [],
       "prs": [],
       "relatedPullRequests": []
@@ -1151,7 +1151,7 @@
       "id": "codex-steering-resolved-input",
       "target": "agenthost",
       "title": "steering with attached context stays pending after Codex consumes it",
-      "line": 3450,
+      "line": 3451,
       "references": [
         335547,
         335546
@@ -1161,10 +1161,23 @@
       ]
     },
     {
+      "id": "codex-async-questions",
+      "target": "agenthost",
+      "title": "Codex asynchronous questions display as text without answer controls",
+      "line": 3464,
+      "references": [
+        336512,
+        336509
+      ],
+      "prs": [
+        "https://github.com/microsoft/vscode/pull/336512"
+      ]
+    },
+    {
       "id": "agent-feedback-review-editor",
       "target": "workbench",
       "title": "review confirmations cannot load comments in regular editor windows",
-      "line": 3463,
+      "line": 3479,
       "references": [
         336430,
         336428
@@ -1175,6 +1188,15 @@
     }
   ],
   "prs": [
+    {
+      "headRefName": "codex/fix-async-questions",
+      "headRefOid": "5affa3489b496454ffcc3e90e87bbbe05b49656c",
+      "number": 336512,
+      "state": "OPEN",
+      "title": "Render Codex asynchronous questions with interactive answers",
+      "url": "https://github.com/microsoft/vscode/pull/336512",
+      "repo": "microsoft/vscode"
+    },
     {
       "headRefName": "codex/fix-feedback-review-editor",
       "headRefOid": "cc59706b4b6349329f7af86d159e654eb1864093",

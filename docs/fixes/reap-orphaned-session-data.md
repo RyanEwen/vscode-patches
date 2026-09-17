@@ -5,7 +5,7 @@ a pruned external session leaves its data directory behind forever.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2740).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2741).
 - [Full catalog](../../CATALOG.md#reap-orphaned-session-data).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

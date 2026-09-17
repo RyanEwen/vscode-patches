@@ -5,7 +5,7 @@ everything the parent says after a background subagent finishes is dropped.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1801).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1802).
 - [Full catalog](../../CATALOG.md#subagent-resumed-output).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

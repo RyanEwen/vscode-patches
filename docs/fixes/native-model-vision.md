@@ -5,7 +5,7 @@ a pasted image is labelled unsupported though the model receives it.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L605).
+- [Current implementation](../../patch-vscode-fixes.mjs#L606).
 - [Full catalog](../../CATALOG.md#native-model-vision).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a steering message the SDK never echoes leaves its bubble behind on abort.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L417).
+- [Current implementation](../../patch-vscode-fixes.mjs#L418).
 - [Full catalog](../../CATALOG.md#steering-drain).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

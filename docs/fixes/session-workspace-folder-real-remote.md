@@ -5,7 +5,7 @@ a session workspace keeps the agent host authority its folders cannot resolve.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L995).
+- [Current implementation](../../patch-vscode-fixes.mjs#L996).
 - [Full catalog](../../CATALOG.md#session-workspace-folder-real-remote).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

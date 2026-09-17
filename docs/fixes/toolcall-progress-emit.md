@@ -5,7 +5,7 @@ a long tool call reports nothing while it runs.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L772).
+- [Current implementation](../../patch-vscode-fixes.mjs#L773).
 - [Full catalog](../../CATALOG.md#toolcall-progress-emit).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

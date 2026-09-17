@@ -5,7 +5,7 @@ a consumed queued message never resolves its send promise.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L646).
+- [Current implementation](../../patch-vscode-fixes.mjs#L647).
 - [Full catalog](../../CATALOG.md#consumed-message-settles-sent).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

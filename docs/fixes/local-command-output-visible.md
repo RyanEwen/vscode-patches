@@ -5,7 +5,7 @@ a local slash command runs, produces output, and the turn renders empty.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1172).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1173).
 - [Full catalog](../../CATALOG.md#local-command-output-visible).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

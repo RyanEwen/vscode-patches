@@ -5,7 +5,7 @@ client tool MCP handler forwards tool name and args.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L231).
+- [Current implementation](../../patch-vscode-fixes.mjs#L232).
 - [Full catalog](../../CATALOG.md#replay-args).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

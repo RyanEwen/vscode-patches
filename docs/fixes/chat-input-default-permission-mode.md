@@ -5,7 +5,7 @@ every new chat-input session starts on Default approvals.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L3309).
+- [Current implementation](../../patch-vscode-fixes.mjs#L3310).
 - [Full catalog](../../CATALOG.md#chat-input-default-permission-mode).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

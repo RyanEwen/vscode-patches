@@ -5,7 +5,7 @@ every SDK message with no resolvable turn id is discarded with no log at all.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1521).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1522).
 - [Full catalog](../../CATALOG.md#router-drop-is-loud).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

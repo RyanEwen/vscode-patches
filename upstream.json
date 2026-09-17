@@ -10,6 +10,16 @@
   ],
   "issues": [
     {
+      "number": 336509,
+      "state": "OPEN",
+      "title": "Codex asynchronous questions render as Markdown without answer controls",
+      "url": "https://github.com/microsoft/vscode/issues/336509",
+      "repo": "microsoft/vscode",
+      "relatedPullRequests": [
+        "https://github.com/microsoft/vscode/pull/336512"
+      ]
+    },
+    {
       "number": 336428,
       "state": "OPEN",
       "title": "Agent host: review confirmation cannot load comments in editor windows",

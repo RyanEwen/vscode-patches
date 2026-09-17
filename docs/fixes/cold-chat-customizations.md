@@ -5,7 +5,7 @@ a restored session has no slash commands until its next message.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1722).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1723).
 - [Full catalog](../../CATALOG.md#cold-chat-customizations).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a tool still running when a steer lands never completes.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2515).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2516).
 - [Full catalog](../../CATALOG.md#steer-keeps-tool-attribution).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

@@ -5,7 +5,7 @@ a subagent spawned by another subagent never gets a chat, so its work never rend
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2140).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2141).
 - [Full catalog](../../CATALOG.md#nested-subagent-spawn-recorded).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

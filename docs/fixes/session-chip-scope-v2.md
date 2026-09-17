@@ -5,7 +5,7 @@ the session list chip counts the whole branch, not the session.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1589).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1590).
 - [Full catalog](../../CATALOG.md#session-chip-scope-v2).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

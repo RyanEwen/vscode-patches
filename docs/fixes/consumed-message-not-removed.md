@@ -5,7 +5,7 @@ a queued message the host consumed is retired as cancelled.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L620).
+- [Current implementation](../../patch-vscode-fixes.mjs#L621).
 - [Full catalog](../../CATALOG.md#consumed-message-not-removed).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

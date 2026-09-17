@@ -5,7 +5,7 @@ the SDK starts a turn the host never queued, so everything in it is discarded.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1057).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1058).
 - [Full catalog](../../CATALOG.md#sdk-initiated-turn).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

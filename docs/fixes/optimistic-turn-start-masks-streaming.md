@@ -5,7 +5,7 @@ responses appear only when the turn ends, never streaming.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1825).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1826).
 - [Full catalog](../../CATALOG.md#optimistic-turn-start-masks-streaming).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

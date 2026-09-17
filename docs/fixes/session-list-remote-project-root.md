@@ -5,7 +5,7 @@ a legacy session whose project root is on the remote is dropped from the list.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L135).
+- [Current implementation](../../patch-vscode-fixes.mjs#L136).
 - [Full catalog](../../CATALOG.md#session-list-remote-project-root).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

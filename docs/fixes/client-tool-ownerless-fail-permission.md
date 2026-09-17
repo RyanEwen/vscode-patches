@@ -5,7 +5,7 @@ the SDK still asks permission for a client tool call already failed.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2286).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2287).
 - [Full catalog](../../CATALOG.md#client-tool-ownerless-fail-permission).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

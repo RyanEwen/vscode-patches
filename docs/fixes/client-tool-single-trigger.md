@@ -5,7 +5,7 @@ a client tool executes off the streamed ready rather than the runtime invocation
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L433).
+- [Current implementation](../../patch-vscode-fixes.mjs#L434).
 - [Full catalog](../../CATALOG.md#client-tool-single-trigger).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

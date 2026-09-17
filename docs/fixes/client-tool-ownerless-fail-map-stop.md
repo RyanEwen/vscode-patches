@@ -5,7 +5,7 @@ a client tool call no window can run is never failed.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2166).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2167).
 - [Full catalog](../../CATALOG.md#client-tool-ownerless-fail-map-stop).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

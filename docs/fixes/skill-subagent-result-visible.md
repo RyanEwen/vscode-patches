@@ -5,7 +5,7 @@ a skill that runs in a subagent works for minutes and the turn renders empty.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2577).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2578).
 - [Full catalog](../../CATALOG.md#skill-subagent-result-visible).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

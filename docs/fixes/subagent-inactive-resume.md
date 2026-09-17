@@ -5,7 +5,7 @@ a running subagent produces output that is discarded once its chat has no active
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1117).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1118).
 - [Full catalog](../../CATALOG.md#subagent-inactive-resume).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

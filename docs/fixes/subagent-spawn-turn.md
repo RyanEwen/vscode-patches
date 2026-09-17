@@ -5,7 +5,7 @@ a spawned subagent does not record the turn that spawned it.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1767).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1768).
 - [Full catalog](../../CATALOG.md#subagent-spawn-turn).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

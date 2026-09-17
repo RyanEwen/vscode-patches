@@ -107,4 +107,5 @@ One page per maintained patcher entry. The tracker is [microsoft/vscode#333174](
 | [`discovery-suppression-loud`](discovery-suppression-loud.md) | agenthost | discovery suppresses two thirds of sessions and never says which are which |
 | [`stale-peer-chat-backing-ignored`](stale-peer-chat-backing-ignored.md) | agenthost | a session that once had a peer chat is hidden from the list forever |
 | [`codex-steering-resolved-input`](codex-steering-resolved-input.md) | agenthost | steering with attached context stays pending after Codex consumes it |
+| [`codex-async-questions`](codex-async-questions.md) | agenthost | Codex asynchronous questions display as text without answer controls |
 | [`agent-feedback-review-editor`](agent-feedback-review-editor.md) | workbench | review confirmations cannot load comments in regular editor windows |

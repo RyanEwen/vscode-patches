@@ -5,7 +5,7 @@ a slash command is never expanded because the host appends context as a second b
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1550).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1551).
 - [Full catalog](../../CATALOG.md#slash-command-single-block).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

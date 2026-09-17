@@ -5,7 +5,7 @@ a background subagent loses its tool attribution at every parent turn end.
 ## Implementation
 
 - Target: **agenthost** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L2712).
+- [Current implementation](../../patch-vscode-fixes.mjs#L2713).
 - [Full catalog](../../CATALOG.md#clearpending-spares-background-subagent).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 

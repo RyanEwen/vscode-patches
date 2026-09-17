@@ -5,7 +5,7 @@ a momentarily empty collection tears down live keyed items.
 ## Implementation
 
 - Target: **workbench** bundle.
-- [Current implementation](../../patch-vscode-fixes.mjs#L1668).
+- [Current implementation](../../patch-vscode-fixes.mjs#L1669).
 - [Full catalog](../../CATALOG.md#keyed-item-transient-empty).
 - Status: local installed-bundle workaround; upstream proposal status is tracked separately.
 
