@@ -1190,7 +1190,7 @@
   "prs": [
     {
       "headRefName": "codex/fix-async-questions",
-      "headRefOid": "5affa3489b496454ffcc3e90e87bbbe05b49656c",
+      "headRefOid": "39de844a1d650c65e5b9e3b286fa2aaf7f2d580e",
       "number": 336512,
       "state": "OPEN",
       "title": "Render Codex asynchronous questions with interactive answers",

@@ -1,18 +1,5 @@
-From 5affa3489b496454ffcc3e90e87bbbe05b49656c Mon Sep 17 00:00:00 2001
-From: Ryan Ewen <ryan.ewen@gmail.com>
-Date: Wed, 16 Sep 2026 22:16:55 -0400
-Subject: [PATCH] Render Codex asynchronous questions with interactive answers
-
----
- .../agentHost/node/codex/codexAgent.ts        |  56 +++++-
- .../node/codex/codexAsyncQuestions.ts         | 137 +++++++++++++++
- .../node/codex/codexAsyncQuestions.test.ts    | 159 ++++++++++++++++++
- 3 files changed, 351 insertions(+), 1 deletion(-)
- create mode 100644 src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts
- create mode 100644 src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
-
 diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
-index b44a166d8e64a..b6ff3f999e28b 100644
+index b44a166d8e64a..08b3a3a1882e7 100644
 --- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
 +++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
 @@ -51,6 +51,8 @@ import { CodexClientCustomizationStore, codexAgentRoleToml, codexCustomizationCo
@@ -80,7 +67,7 @@ index b44a166d8e64a..b6ff3f999e28b 100644
 +					input: [{ type: 'text', text, text_elements: [] }],
 +				}, this._traceContext(session));
 +				// The RPC response may arrive before the turn/started notification.
-+				session.asyncQuestions?.turnStarted(result.turn.id);
++				return result.turn.id;
 +			},
 +			finish: completion => {
 +				for (const action of this._handleTurnCompletedNotification(session, completion)) {
@@ -177,10 +164,10 @@ index b44a166d8e64a..b6ff3f999e28b 100644
  		for (const entry of this._sessionMcpDiscoveries.values()) {
 diff --git a/src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts b/src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts
 new file mode 100644
-index 0000000000000..8af94ac606132
+index 0000000000000..809c874eedc54
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/codex/codexAsyncQuestions.ts
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,140 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -195,7 +182,7 @@ index 0000000000000..8af94ac606132
 +interface IAsyncQuestionsHost {
 +	show(request: ChatInputRequest): void;
 +	cancel(requestId: string): void;
-+	send(text: string): Promise<void>;
++	send(text: string): Promise<string>;
 +	finish(completion: TurnCompletedNotification): void;
 +	reportError(error: unknown): void;
 +}
@@ -276,7 +263,10 @@ index 0000000000000..8af94ac606132
 +		const generation = this.generation;
 +		this.sending++;
 +		try {
-+			await this.host.send(text);
++			const turnId = await this.host.send(text);
++			if (generation === this.generation) {
++				this.turnStarted(turnId);
++			}
 +		} catch (error) {
 +			if (generation === this.generation) {
 +				this.host.reportError(error);
@@ -320,10 +310,10 @@ index 0000000000000..8af94ac606132
 +}
 diff --git a/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
 new file mode 100644
-index 0000000000000..5f27c3f29d3dd
+index 0000000000000..7853bf07d5d35
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,174 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -339,7 +329,7 @@ index 0000000000000..5f27c3f29d3dd
 +suite('CodexAsyncQuestions', () => {
 +	ensureNoDisposablesAreLeakedInTestSuite();
 +
-+	function setup(send?: (text: string) => Promise<void>) {
++	function setup(send?: (text: string) => Promise<string | void>) {
 +		const shown: ChatInputRequest[] = [];
 +		const sent: string[] = [];
 +		const finished: TurnCompletedNotification[] = [];
@@ -348,7 +338,7 @@ index 0000000000000..5f27c3f29d3dd
 +		const controller = new CodexAsyncQuestions({
 +			show: request => shown.push(request),
 +			cancel: id => cancelled.push(id),
-+			send: async text => { sent.push(text); await send?.(text); },
++			send: async text => { sent.push(text); return await send?.(text) ?? 'native-1'; },
 +			finish: completion => finished.push(completion),
 +			reportError: error => errors.push(error),
 +		});
@@ -396,7 +386,7 @@ index 0000000000000..5f27c3f29d3dd
 +	});
 +
 +	test('late answer starts continuation without completing the host turn', async () => {
-+		const h = setup(async () => h.controller.turnStarted('native-2'));
++		const h = setup(async () => { h.controller.turnStarted('native-2'); return 'native-2'; });
 +		h.controller.ask('item', questions);
 +		h.controller.holdCompletion(completed());
 +		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
@@ -480,6 +470,21 @@ index 0000000000000..5f27c3f29d3dd
 +		assert.deepStrictEqual(h.finished, []);
 +		h.controller.respond(h.shown[1].id, ChatInputResponseKind.Cancel);
 +		assert.deepStrictEqual(h.finished, [completed()]);
++	});
++
++
++	test('stale answer acknowledgement cannot clear replacement question completion', async () => {
++		const gate = new DeferredPromise<string>();
++		const h = setup(() => gate.p);
++		h.controller.ask('old', questions);
++		h.controller.respond(h.shown[0].id, ChatInputResponseKind.Accept, answers);
++		h.controller.clear();
++		h.controller.ask('replacement', questions);
++		h.controller.holdCompletion(completed('replacement-turn'));
++		await gate.complete('old-turn');
++		await h.controller.whenIdle();
++		h.controller.respond(h.shown[1].id, ChatInputResponseKind.Cancel);
++		assert.deepStrictEqual(h.finished, [completed('replacement-turn')]);
 +	});
 +
 +});

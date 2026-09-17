@@ -31,7 +31,7 @@ test('strict guards reject missing anchors and duplicate patch markers', () => {
 	assert.throws(() => transformCodexAsyncQuestions(patched + `\nfunction ${marker}(){}`));
 });
 
-test('unpatched dispatcher reproduces the missing-controls regression', { skip: original.includes(marker) }, () => {
+test('unpatched dispatcher reproduces the missing-controls regression', { skip: /__codexAsyncQuestionsV[12]/.test(original) }, () => {
 	const result = itemHandler(original).call({ _withHostTurnId: (_s, p) => p }, {}, { item: { type: 'agentMessage', delivery: 'async', questions: [{ title: 'Format?', options: ['PDF', 'Text'] }] } });
 	assert.equal(result[0].kind, 'markdown');
 });
@@ -56,7 +56,7 @@ function setup(send = async () => {}) {
 		answerStrings: (answer, response) => response === 'accept' && answer && answer.state !== 'skipped' ? [answer.value.value] : [],
 	});
 	const shown = [], sent = [], finished = [], cancelled = [], errors = [];
-	const controller = new Controller({ show: q => shown.push(q), cancel: id => cancelled.push(id), send: async text => { sent.push(text); await send(text); }, finish: c => finished.push(c), reportError: e => errors.push(e) });
+	const controller = new Controller({ show: q => shown.push(q), cancel: id => cancelled.push(id), send: async text => { sent.push(text); return await send(text) ?? 'one'; }, finish: c => finished.push(c), reportError: e => errors.push(e) });
 	return { controller, shown, sent, finished, cancelled, errors };
 }
 const questions = [{ title: 'Format?', options: ['PDF', 'Text'] }];
@@ -84,7 +84,7 @@ test('completed native turn remains answerable, skip does not send a default', (
 });
 
 test('late answer continuation supersedes old completion', async () => {
-	const h = setup(async () => h.controller.turnStarted('two'));
+	const h = setup(async () => { h.controller.turnStarted('two'); return 'two'; });
 	h.controller.ask('call', questions);
 	h.controller.holdCompletion(completion('one'));
 	h.controller.respond(h.shown[0].id, 'accept', answers);
@@ -149,4 +149,30 @@ test('native reply routing preserves settings and handles response before notifi
 	await controller.whenIdle();
 	assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['turn/start', { threadId: 'native-thread', input: [{ type: 'text', text: '> Format?\n\nPDF', text_elements: [] }] }, null]]);
 	assert.equal(finishes.length, 0);
+});
+
+
+test('late acknowledgements cannot modify replacement questions', async () => {
+	let resolve;
+	const gate = new Promise(r => { resolve = r; });
+	const h = setup(() => gate);
+	h.controller.ask('old', questions);
+	h.controller.respond(h.shown[0].id, 'accept', answers);
+	h.controller.clear();
+	h.controller.ask('new', questions);
+	h.controller.holdCompletion(completion('replacement'));
+	resolve('old-turn');
+	await h.controller.whenIdle();
+	h.controller.respond(h.shown[1].id, 'cancel');
+	assert.deepEqual(h.finished, [completion('replacement')]);
+});
+
+test('upgrades the archived first revision without losing other bundle edits', { skip: original.includes(marker) }, async () => {
+	const { transformCodexAsyncQuestions: legacy } = await import('../archive/patcher-snapshots/codex-async-questions-v1.mjs');
+	const first = legacy(original);
+	const upgraded = transformCodexAsyncQuestions(first);
+	assert.ok(upgraded.includes(`function ${marker}(`));
+	assert.ok(!upgraded.includes('__codexAsyncQuestionsV1'));
+	assert.ok(upgraded.endsWith(first.slice(-10000)));
+	assert.equal(transformCodexAsyncQuestions(upgraded), upgraded);
 });

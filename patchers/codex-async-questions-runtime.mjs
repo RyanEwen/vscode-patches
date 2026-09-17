@@ -77,7 +77,10 @@ return class CodexAsyncQuestions {
         const generation = this.generation;
         this.sending++;
         try {
-            await this.host.send(text);
+            const turnId = await this.host.send(text);
+            if (generation === this.generation) {
+                this.turnStarted(turnId);
+            }
         }
         catch (error) {
             if (generation === this.generation) {

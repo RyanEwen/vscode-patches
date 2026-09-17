@@ -1,6 +1,6 @@
 import { createAsyncQuestionsController } from './codex-async-questions-runtime.mjs';
 
-export const marker = '__codexAsyncQuestionsV1';
+export const marker = '__codexAsyncQuestionsV2';
 
 /** Requires each build-specific anchor exactly once before modifying any bytes. */
 function unique(text, expression, label) {
@@ -13,6 +13,17 @@ function unique(text, expression, label) {
 
 /** Backports the source controller to inspected VS Code 1.137.0 agent-host bundles. */
 export function transformCodexAsyncQuestions(text) {
+	if (text.includes('__codexAsyncQuestionsV1')) {
+		if (text.includes(marker)) {
+			throw new Error('Async questions: mixed revision markers');
+		}
+		unique(text, /function __codexAsyncQuestionsV1\(/, 'previous revision');
+		unique(text, /await this\.host\.send\(text\);/, 'previous delivery');
+		unique(text, /session\.asyncQuestions\?\.turnStarted\(result\.turn\.id\);/, 'previous acknowledgement');
+		text = text.replace('await this.host.send(text);', 'const turnId = await this.host.send(text); if (generation === this.generation) { this.turnStarted(turnId); }');
+		text = text.replace('session.asyncQuestions?.turnStarted(result.turn.id);', 'return result.turn.id;');
+		return transformCodexAsyncQuestions(text.replaceAll('__codexAsyncQuestionsV1', marker));
+	}
 	if (text.includes(marker)) {
 		if (text.split(`function ${marker}(`).length !== 2 || !text.includes('_getAsyncQuestions(session)') || !text.includes('asyncQuestions?.whenIdle()')) {
 			throw new Error('Async questions: incomplete or duplicate patch marker');
@@ -54,4 +65,4 @@ export function transformCodexAsyncQuestions(text) {
 	return `${createAsyncQuestionsController.toString().replace('createAsyncQuestionsController', marker)}\n${text}`;
 }
 
-const GETTER = "\n    _getAsyncQuestions(session) {\n        return session.asyncQuestions ??= new (__codexAsyncQuestionsV1({ generateUuid: $uuid, buildUserInputRequest: $builder, answerStrings: $answers }))({\n            show: request => this._fire(session.sessionUri, { type: \"chat/inputRequested\", request }),\n            cancel: requestId => this._fire(session.sessionUri, { type: \"chat/inputCompleted\", requestId, response: \"cancel\" }),\n            send: async (text) => {\n                const connection = this._connection;\n                if (connection.kind !== 'ready' || !session.threadId) {\n                    throw new Error('Codex connection is unavailable');\n                }\n                // Native turn/start steers an active turn or starts a continuation with sticky thread settings.\n                const result = await connection.client.request('turn/start', {\n                    threadId: session.threadId,\n                    input: [{ type: 'text', text, text_elements: [] }],\n                }, this._traceContext(session));\n                // The RPC response may arrive before the turn/started notification.\n                session.asyncQuestions?.turnStarted(result.turn.id);\n            },\n            finish: completion => {\n                for (const action of this._handleTurnCompletedNotification(session, completion)) {\n                    this._fire(session.sessionUri, action);\n                }\n            },\n            reportError: error => this._logService.warn('[Codex] Failed to deliver asynchronous question answer; reopening questions', error),\n        });\n    }\n";
+const GETTER = "\n    _getAsyncQuestions(session) {\n        return session.asyncQuestions ??= new (__codexAsyncQuestionsV2({ generateUuid: $uuid, buildUserInputRequest: $builder, answerStrings: $answers }))({\n            show: request => this._fire(session.sessionUri, { type: \"chat/inputRequested\", request }),\n            cancel: requestId => this._fire(session.sessionUri, { type: \"chat/inputCompleted\", requestId, response: \"cancel\" }),\n            send: async (text) => {\n                const connection = this._connection;\n                if (connection.kind !== 'ready' || !session.threadId) {\n                    throw new Error('Codex connection is unavailable');\n                }\n                // Native turn/start steers an active turn or starts a continuation with sticky thread settings.\n                const result = await connection.client.request('turn/start', {\n                    threadId: session.threadId,\n                    input: [{ type: 'text', text, text_elements: [] }],\n                }, this._traceContext(session));\n                // The RPC response may arrive before the turn/started notification.\n                return result.turn.id;\n            },\n            finish: completion => {\n                for (const action of this._handleTurnCompletedNotification(session, completion)) {\n                    this._fire(session.sessionUri, action);\n                }\n            },\n            reportError: error => this._logService.warn('[Codex] Failed to deliver asynchronous question answer; reopening questions', error),\n        });\n    }\n";
