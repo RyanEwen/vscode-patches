@@ -1,5 +1,5 @@
 diff --git a/src/vs/platform/agentHost/node/codex/codexAgent.ts b/src/vs/platform/agentHost/node/codex/codexAgent.ts
-index b44a166d8e64a..08b3a3a1882e7 100644
+index b44a166d8e64a..28cff3f67153a 100644
 --- a/src/vs/platform/agentHost/node/codex/codexAgent.ts
 +++ b/src/vs/platform/agentHost/node/codex/codexAgent.ts
 @@ -51,6 +51,8 @@ import { CodexClientCustomizationStore, codexAgentRoleToml, codexCustomizationCo
@@ -37,11 +37,12 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  		const appTurnId = params.turn.id;
  		const hostTurnId = this._hostTurnId(session, appTurnId);
  		const out = mapTurnCompleted(session.mapState, this._withHostTurn(session, params), this._clearTurnStopWatch(session));
-@@ -3094,12 +3101,43 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -3094,12 +3101,51 @@ export class CodexAgent extends Disposable implements IAgent {
  	 * other item kinds defer to {@link mapItemStarted}.
  	 */
  	private _handleItemStarted(session: ICodexSession, params: ItemStartedNotification): (SessionAction | ChatAction)[] {
-+		if (params.item.type === 'agentMessage' && params.item.delivery === 'async' && params.item.questions?.length) {
++		// Isolated subagents have no answer-routing entry or independently retained input lifecycle.
++		if (this._sessions.get(session.sessionId) === session && params.item.type === 'agentMessage' && params.item.delivery === 'async' && params.item.questions?.length) {
 +			this._getAsyncQuestions(session).ask(params.item.id, params.item.questions);
 +			return [];
 +		}
@@ -62,11 +63,18 @@ index b44a166d8e64a..08b3a3a1882e7 100644
 +					throw new Error('Codex connection is unavailable');
 +				}
 +				// Native turn/start steers an active turn or starts a continuation with sticky thread settings.
++				const hostTurnId = session.currentTurnId;
++				const appTurnId = session.currentAppTurnId;
 +				const result = await connection.client.request<'turn/start', TurnStartResponse>('turn/start', {
 +					threadId: session.threadId,
 +					input: [{ type: 'text', text, text_elements: [] }],
 +				}, this._traceContext(session));
-+				// The RPC response may arrive before the turn/started notification.
++				// Stop needs the acknowledged native id even before turn/started, but a stale response must not replace newer ownership.
++				if (hostTurnId && this._sessions.get(session.sessionId) === session
++					&& session.currentTurnId === hostTurnId && session.currentAppTurnId === appTurnId) {
++					session.currentAppTurnId = result.turn.id;
++					session.hostTurnIdByAppTurnId.set(result.turn.id, hostTurnId);
++				}
 +				return result.turn.id;
 +			},
 +			finish: completion => {
@@ -81,7 +89,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  	/**
  	 * Codex echoes every user message — the turn opener (already shown by
  	 * the workbench before `sendMessage`) and any steered input — as a
-@@ -3113,6 +3151,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -3113,6 +3159,7 @@ export class CodexAgent extends Disposable implements IAgent {
  		if (!steering) {
  			return [];
  		}
@@ -89,7 +97,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  		return this._beginSteeringTurn(session, steering);
  	}
  
-@@ -4070,6 +4109,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -4070,6 +4117,7 @@ export class CodexAgent extends Disposable implements IAgent {
  			session.pendingCommandApprovals.denyAll('decline');
  			// Reject in-flight client tool calls so their handlers unwind.
  			session.pendingClientToolCalls.rejectAll(new CancellationError());
@@ -97,7 +105,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  			session.pendingUserInputs.rejectAll(new CancellationError());
  			// Clear any buffered steering so its pending bubble doesn't leak.
  			this._drainPendingSteering(session);
-@@ -4095,6 +4135,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -4095,6 +4143,7 @@ export class CodexAgent extends Disposable implements IAgent {
  		for (const subagent of this._subagentsByThreadId.values()) {
  			subagent.session.pendingCommandApprovals.denyAll('decline');
  			subagent.session.pendingClientToolCalls.rejectAll(new CancellationError());
@@ -105,7 +113,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  			subagent.session.pendingUserInputs.rejectAll(new CancellationError());
  			subagent.session.currentTurnId = undefined;
  			subagent.session.currentAppTurnId = undefined;
-@@ -5785,6 +5826,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -5785,6 +5834,7 @@ export class CodexAgent extends Disposable implements IAgent {
  		if (!session) {
  			throw new Error(`Codex session not found: ${sessionUri.toString()} (chat=${chat.toString()}, binding=${this._sessionIdByChatUri.get(chat.toString()) ?? 'none'}, sessions=${[...this._sessions.keys()].join(',') || 'none'})`);
  		}
@@ -113,7 +121,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  		const configResource = operationContext?.configurationResource ?? sessionUri;
  		session.agentMergeTurn = operationContext?.agentMergeTurn === true;
  		this._ensureModelProviderAuthenticated(session.model);
-@@ -6134,6 +6176,15 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -6134,6 +6184,15 @@ export class CodexAgent extends Disposable implements IAgent {
  		if (!session) {
  			return;
  		}
@@ -129,7 +137,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  		// Clear any steering buffered for the turn we're aborting so its
  		// pending bubble doesn't outlive the turn.
  		this._drainPendingSteering(session);
-@@ -6306,6 +6357,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -6306,6 +6365,7 @@ export class CodexAgent extends Disposable implements IAgent {
  		// Reject any in-flight client tool calls so their `item/tool/call`
  		// handlers unwind instead of awaiting a response that won't arrive.
  		session.pendingClientToolCalls.rejectAll(new CancellationError());
@@ -137,7 +145,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  		session.pendingUserInputs.rejectAll(new CancellationError());
  		// Clear any buffered steering so its pending bubble doesn't leak.
  		this._drainPendingSteering(session);
-@@ -6486,7 +6538,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -6486,7 +6546,7 @@ export class CodexAgent extends Disposable implements IAgent {
  		// `requestId` was minted per request; find the owning session and
  		// resolve its parked deferred. Mirrors respondToPermissionRequest.
  		for (const session of this._sessions.values()) {
@@ -146,7 +154,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  				return;
  			}
  		}
-@@ -8197,6 +8249,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -8197,6 +8257,7 @@ export class CodexAgent extends Disposable implements IAgent {
  			}
  			s.pendingCommandApprovals.denyAll('decline');
  			s.pendingClientToolCalls.rejectAll(new CancellationError());
@@ -154,7 +162,7 @@ index b44a166d8e64a..08b3a3a1882e7 100644
  			s.pendingUserInputs.rejectAll(new CancellationError());
  			s.mcpController?.dispose();
  		}
-@@ -8208,6 +8261,7 @@ export class CodexAgent extends Disposable implements IAgent {
+@@ -8208,6 +8269,7 @@ export class CodexAgent extends Disposable implements IAgent {
  			}
  			subagent.session.pendingCommandApprovals.denyAll('decline');
  			subagent.session.pendingClientToolCalls.rejectAll(new CancellationError());
@@ -308,6 +316,135 @@ index 0000000000000..809c874eedc54
 +		return completion;
 +	}
 +}
+diff --git a/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestionRouting.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestionRouting.test.ts
+new file mode 100644
+index 0000000000000..24654fa098d76
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestionRouting.test.ts
+@@ -0,0 +1,123 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { DeferredPromise } from '../../../../../base/common/async.js';
++import { URI } from '../../../../../base/common/uri.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { NullLogService } from '../../../../log/common/log.js';
++import { ActionType, type ChatAction } from '../../../common/state/sessionActions.js';
++import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputResponseKind, ResponsePartKind } from '../../../common/state/sessionState.js';
++import { CodexAgent } from '../../../node/codex/codexAgent.js';
++import type { CodexAsyncQuestions } from '../../../node/codex/codexAsyncQuestions.js';
++import { createCodexSessionMapState } from '../../../node/codex/codexMapAppServerEvents.js';
++import type { ItemStartedNotification } from '../../../node/codex/protocol/generated/v2/ItemStartedNotification.js';
++import type { Turn } from '../../../node/codex/protocol/generated/v2/Turn.js';
++
++interface IQuestionSession {
++	readonly sessionId: string;
++	readonly sessionUri: URI;
++	readonly threadId: string;
++	currentTurnId: string | undefined;
++	currentAppTurnId: string | undefined;
++	readonly hostTurnIdByAppTurnId: Map<string, string>;
++	readonly mapState: ReturnType<typeof createCodexSessionMapState>;
++	asyncQuestions?: CodexAsyncQuestions;
++}
++
++interface IQuestionHarness {
++	_getAsyncQuestions(session: IQuestionSession): CodexAsyncQuestions;
++	_handleItemStarted(session: IQuestionSession, notification: ItemStartedNotification): ChatAction[];
++	_abort(chat: URI, context: URI): Promise<void>;
++}
++
++/** Reuses the actual agent methods, controlling only transport and unrelated service effects. */
++function setup() {
++	const session: IQuestionSession = {
++		sessionId: 'root', sessionUri: URI.parse('codex:/root'), threadId: 'thread',
++		currentTurnId: 'host', currentAppTurnId: 'original', hostTurnIdByAppTurnId: new Map(),
++		mapState: createCodexSessionMapState(),
++	};
++	const sessions = new Map([['root', session]]);
++	const reply = new DeferredPromise<{ turn: Turn }>();
++	const calls: { method: string; params: { threadId: string; turnId?: string } }[] = [];
++	const events: ChatAction[] = [];
++	const harness: IQuestionHarness = Object.assign(Object.create(CodexAgent.prototype), {
++		_sessions: sessions,
++		_connection: { kind: 'ready', client: { request: async (method: string, params: { threadId: string; turnId?: string }) => {
++			calls.push({ method, params });
++			return method === 'turn/start' ? reply.p : undefined;
++		} } },
++		_traceContext: () => undefined,
++		_fire: (_uri: URI, action: ChatAction) => events.push(action),
++		_handleTurnCompletedNotification: () => { throw new Error('Completed the old turn instead of interrupting the continuation'); },
++		_logService: new NullLogService(),
++		_resolveConversationSession: () => session.sessionUri,
++		_drainPendingSteering: () => undefined,
++		_withHostTurnId: (_session: IQuestionSession, notification: ItemStartedNotification) => notification,
++	});
++	const controller = harness._getAsyncQuestions(session);
++	return { session, sessions, reply, calls, events, harness, controller };
++}
++
++suite('Codex asynchronous question routing', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	const turn = (id: string): Turn => ({ id, items: [], itemsView: 'full', status: 'completed', error: null, startedAt: null, completedAt: null, durationMs: null });
++	const notification: ItemStartedNotification = {
++		threadId: 'thread', turnId: 'original', startedAtMs: 0,
++		item: { type: 'agentMessage', id: 'question', text: 'Format?', phase: 'final_answer', memoryCitation: null, delivery: 'async', questions: [{ title: 'Format?', options: ['PDF', 'Text'] }] },
++	};
++
++	function answer(h: ReturnType<typeof setup>): void {
++		h.harness._handleItemStarted(h.session, notification);
++		const event = h.events.find(action => action.type === ActionType.ChatInputRequested);
++		assert.ok(event?.type === ActionType.ChatInputRequested);
++		h.controller.respond(event.request.id, ChatInputResponseKind.Accept, {
++			'0': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: 'PDF' } },
++		});
++	}
++
++	test('Stop interrupts the acknowledged continuation before its notification arrives', async () => {
++		const h = setup();
++		answer(h);
++		h.controller.holdCompletion({ threadId: 'thread', turn: turn('original') });
++		const stopping = h.harness._abort(URI.parse('chat:/root'), h.session.sessionUri);
++		await h.reply.complete({ turn: turn('continuation') });
++		await stopping;
++		assert.deepStrictEqual(h.calls[1], { method: 'turn/interrupt', params: { threadId: 'thread', turnId: 'continuation' } });
++		assert.strictEqual(h.session.hostTurnIdByAppTurnId.get('continuation'), 'host');
++	});
++
++	test('isolated subagents do not create unreachable interactive controls', () => {
++		const h = setup();
++		const child = { ...h.session, asyncQuestions: undefined, mapState: createCodexSessionMapState() };
++		const actions = h.harness._handleItemStarted(child, notification);
++		assert.deepStrictEqual(actions.map(action => action.type === ActionType.ChatResponsePart ? action.part.kind : action.type), [ResponsePartKind.Markdown]);
++		assert.strictEqual(child.asyncQuestions, undefined);
++		assert.deepStrictEqual(h.events, []);
++	});
++
++	for (const scenario of ['newer native turn', 'replacement host turn', 'disposed session', 'completed host turn']) {
++		test(`late acknowledgement preserves ${scenario}`, async () => {
++			const h = setup();
++			answer(h);
++			if (scenario === 'newer native turn') {
++				h.session.currentAppTurnId = 'newer';
++			} else if (scenario === 'replacement host turn') {
++				h.session.currentTurnId = 'replacement';
++			} else if (scenario === 'disposed session') {
++				h.sessions.clear();
++			} else {
++				h.session.currentTurnId = undefined;
++			}
++			const expected = h.session.currentAppTurnId;
++			await h.reply.complete({ turn: turn('late') });
++			await h.controller.whenIdle();
++			assert.strictEqual(h.session.currentAppTurnId, expected);
++			assert.strictEqual(h.session.hostTurnIdByAppTurnId.has('late'), false);
++		});
++	}
++});
 diff --git a/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts b/src/vs/platform/agentHost/test/node/codex/codexAsyncQuestions.test.ts
 new file mode 100644
 index 0000000000000..7853bf07d5d35

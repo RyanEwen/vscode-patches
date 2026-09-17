@@ -52,3 +52,7 @@ The shared Windows editor client also handles Ubuntu WSL windows, so no WSL serv
 ### Codex asynchronous questions
 
 [PR #336512](docs/patches/vscode-336512.md): 15 focused source tests passed, zero targeted TypeScript diagnostics, targeted lint and whitespace checks passed. Twelve pre-install bundle tests passed, including pristine vendor-bundle reproduction; ten post-install tests passed per target with two pre-install-only checks skipped. Staged exact rollback and installed hash checks passed. The patch is installed in Windows ARM64 and both Ubuntu ARM64 1.137.0 server locations. Processes were not restarted; live UI validation remains outstanding.
+
+### PR #336512 automated review follow-up
+
+Head `4ca6e6cafafad832b0c63dfd389f45a80dc40fc1`: 21 focused source tests pass, zero targeted TypeScript diagnostics, targeted lint and whitespace checks pass. Nineteen pristine-bundle tests pass; sixteen applicable tests pass per installed Windows/Ubuntu target. Three pre-install-only tests are skipped on installed bundles. Tests exercise actual Stop and item-dispatch methods, stale acknowledgement ownership, both retired upgrade paths, syntax and idempotence. Upgrade/exact rollback and installed-byte verification pass. Live UI validation and process restart remain outstanding.

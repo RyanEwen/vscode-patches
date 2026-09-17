@@ -52,3 +52,5 @@ When changing this fix, record the tested build, update related references, run 
 ## Verified build and installation
 
 See [PR #336512 validation and deployment](../patches/vscode-336512.md) for the original-bundle regression reproduction, Windows/Ubuntu ARM64 1.137.0 restriction, lifecycle tests, exact rollback and activation requirements. No live UI result is claimed.
+
+The V3 revision includes the automated review fixes for session ownership and Stop routing. It upgrades the earlier V1/V2 revisions with strict guards; isolated subagent questions retain their existing text presentation.

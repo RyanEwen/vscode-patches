@@ -3472,7 +3472,7 @@ const FIXES = [
 		// Stop waits for answer RPCs before interrupting their actual continuation turn.
 		// Validated on Windows ARM64 and Ubuntu ARM64 VS Code 1.137.0 build 645f29cc31.
 		unpatched: /^(?=[\s\S]*_handleItemStarted\()[\s\S]+$/,
-		patched: /__codexAsyncQuestionsV2/,
+		patched: /__codexAsyncQuestionsV3/,
 		build: transformCodexAsyncQuestions,
 	},
 

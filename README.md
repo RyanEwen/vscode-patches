@@ -6,7 +6,7 @@ Public source patches, installed-bundle patchers, and regression scripts for Rya
 - **[Patcher catalog](CATALOG.md):** 105 current bundle-patcher entries, plus the model-host-label installer.
 - **[Source patch index](SOURCE-PATCHES.md):** snapshots and upstream links for 64 PRs, including closed and merged proposals.
 - **[Model host labels](model-host-labels/README.md):** Windows VS Code 1.136.1 workaround for duplicate-looking model groups.
-- **[Historical revisions](archive/README.md):** 15 patcher snapshots.
+- **[Historical revisions](archive/README.md):** 16 patcher snapshots.
 - **[Standalone legacy patchers](legacy/README.md)** and **[live-bundle regression scripts](tests/live/README.md)**.
 
 The tracking epic is [microsoft/vscode#333174](https://github.com/microsoft/vscode/issues/333174). Each source patch has a detail page suitable for linking from an issue or PR.

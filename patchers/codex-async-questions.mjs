@@ -1,6 +1,6 @@
 import { createAsyncQuestionsController } from './codex-async-questions-runtime.mjs';
 
-export const marker = '__codexAsyncQuestionsV2';
+export const marker = '__codexAsyncQuestionsV3';
 
 /** Requires each build-specific anchor exactly once before modifying any bytes. */
 function unique(text, expression, label) {
@@ -22,8 +22,24 @@ export function transformCodexAsyncQuestions(text) {
 		unique(text, /session\.asyncQuestions\?\.turnStarted\(result\.turn\.id\);/, 'previous acknowledgement');
 		text = text.replace('await this.host.send(text);', 'const turnId = await this.host.send(text); if (generation === this.generation) { this.turnStarted(turnId); }');
 		text = text.replace('session.asyncQuestions?.turnStarted(result.turn.id);', 'return result.turn.id;');
-		return transformCodexAsyncQuestions(text.replaceAll('__codexAsyncQuestionsV1', marker));
+		return transformCodexAsyncQuestions(text.replaceAll('__codexAsyncQuestionsV1', '__codexAsyncQuestionsV2'));
 	}
+	if (text.includes('__codexAsyncQuestionsV2')) {
+		if (text.includes(marker)) {
+			throw new Error('Async questions: mixed revision markers');
+		}
+		unique(text, /function __codexAsyncQuestionsV2\(/, 'second revision');
+		const oldGetter = unique(text, /_getAsyncQuestions\(session\) \{[\s\S]*?(?=_handleItemStarted\()/, 'second-revision answer routing');
+		const names = oldGetter[0].match(/generateUuid: (\w+), buildUserInputRequest: (\w+), answerStrings: (\w+)/);
+		if (!names) {
+			throw new Error('Async questions: missing previous helper bindings');
+		}
+		const oldHandler = unique(text, /_handleItemStarted\((\w+),(\w+)\)\{if\(\2\.item\.type==="agentMessage"/, 'second-revision item dispatch');
+		text = text.replace(oldGetter[0], GETTER.replaceAll('$uuid', names[1]).replaceAll('$builder', names[2]).replaceAll('$answers', names[3]));
+		text = text.replace(oldHandler[0], oldHandler[0].replace('{if(', '{if(this._sessions.get('+oldHandler[1]+'.sessionId)==='+oldHandler[1]+'&&'));
+		return transformCodexAsyncQuestions(text.replaceAll('__codexAsyncQuestionsV2', marker));
+	}
+
 	if (text.includes(marker)) {
 		if (text.split(`function ${marker}(`).length !== 2 || !text.includes('_getAsyncQuestions(session)') || !text.includes('asyncQuestions?.whenIdle()')) {
 			throw new Error('Async questions: incomplete or duplicate patch marker');
@@ -53,7 +69,7 @@ export function transformCodexAsyncQuestions(text) {
 		throw new Error(`Async questions: expected five disposal paths, found ${cleanup.length}`);
 	}
 	let getter = GETTER.replaceAll('$uuid', rpc[2]).replaceAll('$builder', rpc[4]).replaceAll('$answers', flatten[1]);
-	text = text.replace(started[0], `${getter}${started[0].replace('{return ', `{if(${started[2]}.item.type==="agentMessage"&&${started[2]}.item.delivery==="async"&&${started[2]}.item.questions?.length){this._getAsyncQuestions(${started[1]}).ask(${started[2]}.item.id,${started[2]}.item.questions);return []}return `)}`);
+	text = text.replace(started[0], `${getter}${started[0].replace('{return ', `{if(this._sessions.get(${started[1]}.sessionId)===${started[1]}&&${started[2]}.item.type==="agentMessage"&&${started[2]}.item.delivery==="async"&&${started[2]}.item.questions?.length){this._getAsyncQuestions(${started[1]}).ask(${started[2]}.item.id,${started[2]}.item.questions);return []}return `)}`);
 	text = text.replace(turnStarted[0], `${turnStarted[0]}${turnStarted[1]}.asyncQuestions?.turnStarted(${turnStarted[2]}.turn.id);`);
 	text = text.replace(completed[0], `${completed[0]}if(${completed[1]}.asyncQuestions?.holdCompletion(${completed[2]}))return [];`);
 	text = text.replace(respond[0], respond[0].replace(`if(${respond[4]}.pendingUserInputs`, `if(${respond[4]}.asyncQuestions?.respond(${respond[1]},${respond[2]},${respond[3]})||${respond[4]}.pendingUserInputs`));
@@ -65,4 +81,4 @@ export function transformCodexAsyncQuestions(text) {
 	return `${createAsyncQuestionsController.toString().replace('createAsyncQuestionsController', marker)}\n${text}`;
 }
 
-const GETTER = "\n    _getAsyncQuestions(session) {\n        return session.asyncQuestions ??= new (__codexAsyncQuestionsV2({ generateUuid: $uuid, buildUserInputRequest: $builder, answerStrings: $answers }))({\n            show: request => this._fire(session.sessionUri, { type: \"chat/inputRequested\", request }),\n            cancel: requestId => this._fire(session.sessionUri, { type: \"chat/inputCompleted\", requestId, response: \"cancel\" }),\n            send: async (text) => {\n                const connection = this._connection;\n                if (connection.kind !== 'ready' || !session.threadId) {\n                    throw new Error('Codex connection is unavailable');\n                }\n                // Native turn/start steers an active turn or starts a continuation with sticky thread settings.\n                const result = await connection.client.request('turn/start', {\n                    threadId: session.threadId,\n                    input: [{ type: 'text', text, text_elements: [] }],\n                }, this._traceContext(session));\n                // The RPC response may arrive before the turn/started notification.\n                return result.turn.id;\n            },\n            finish: completion => {\n                for (const action of this._handleTurnCompletedNotification(session, completion)) {\n                    this._fire(session.sessionUri, action);\n                }\n            },\n            reportError: error => this._logService.warn('[Codex] Failed to deliver asynchronous question answer; reopening questions', error),\n        });\n    }\n";
+const GETTER = "\n    _getAsyncQuestions(session) {\n        return session.asyncQuestions ??= new (__codexAsyncQuestionsV3({ generateUuid: $uuid, buildUserInputRequest: $builder, answerStrings: $answers }))({\n            show: request => this._fire(session.sessionUri, { type: \"chat/inputRequested\", request }),\n            cancel: requestId => this._fire(session.sessionUri, { type: \"chat/inputCompleted\", requestId, response: \"cancel\" }),\n            send: async (text) => {\n                const connection = this._connection;\n                if (connection.kind !== 'ready' || !session.threadId) {\n                    throw new Error('Codex connection is unavailable');\n                }\n                // Native turn/start steers an active turn or starts a continuation with sticky thread settings.\n                const hostTurnId = session.currentTurnId;\n                const appTurnId = session.currentAppTurnId;\n                const result = await connection.client.request('turn/start', {\n                    threadId: session.threadId,\n                    input: [{ type: 'text', text, text_elements: [] }],\n                }, this._traceContext(session));\n                // Stop needs the acknowledged native id even before turn/started, but a stale response must not replace newer ownership.\n                if (hostTurnId && this._sessions.get(session.sessionId) === session\n                    && session.currentTurnId === hostTurnId && session.currentAppTurnId === appTurnId) {\n                    session.currentAppTurnId = result.turn.id;\n                    session.hostTurnIdByAppTurnId.set(result.turn.id, hostTurnId);\n                }\n                return result.turn.id;\n            },\n            finish: completion => {\n                for (const action of this._handleTurnCompletedNotification(session, completion)) {\n                    this._fire(session.sessionUri, action);\n                }\n            },\n            reportError: error => this._logService.warn('[Codex] Failed to deliver asynchronous question answer; reopening questions', error),\n        });\n    }\n";
